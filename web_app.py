@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import csv
+import logging
 import io
 import json
 import re
 import sqlite3
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import as_completed
 from urllib.request import Request
 from urllib.request import urlopen
 from datetime import datetime, timezone
@@ -21,6 +24,8 @@ from urllib.parse import quote
 from urllib.parse import urlencode
 from urllib.parse import urlparse
 from wsgiref.simple_server import make_server
+
+logger = logging.getLogger(__name__)
 
 RU_TO_EN_OPF = {
     "ООО": "LLC",
@@ -400,6 +405,10 @@ class CompanyWebApp:
         return bool(re.search(r"[A-Za-z]", cleaned)) and not self._contains_org_form(cleaned)
 
     def _provider_chain(self, input_type: str, raw: str) -> list[dict[str, Any]]:
+        if input_type == INPUT_TYPE_PERSON_TEXT:
+            names = ["rusprofile.ru", "ФНС ЕГРЮЛ", "list-org.com"]
+            provider_map = {provider["name"]: provider for provider in SOURCE_PROVIDERS}
+            return [provider_map[name] for name in names if name in provider_map]
         if self._is_foreign_query(raw):
             names = [
                 "OpenCorporates",
@@ -504,58 +513,120 @@ class CompanyWebApp:
             return self._parse_kontur(raw)
         return None
 
+    def _extract_revenue(self, text: str) -> int:
+        digits = re.sub(r"[^\d]", "", text or "")
+        return int(digits) if digits else 0
+
+    def _extract_revenue_from_soup(self, soup: BeautifulSoup) -> int:
+        rev_tag = soup.find("td", string=re.compile(r"Выручка|Доход|Revenue", re.IGNORECASE))
+        if isinstance(rev_tag, Tag):
+            next_td = rev_tag.find_next("td")
+            if isinstance(next_td, Tag):
+                return self._extract_revenue(next_td.get_text(" ", strip=True))
+        text = soup.get_text(" ", strip=True)
+        rev_match = re.search(r"(?:Выручка|Доход|Revenue)[^\d]{0,30}([\d\s.,]+)", text, flags=re.IGNORECASE)
+        return self._extract_revenue(rev_match.group(1) if rev_match else "")
+
+    def _score_hit(self, hit: dict[str, Any], query: str) -> float:
+        data = hit.get("data", hit)
+        q_norm = self._normalize_spaces(query.lower())
+        q_words = {w for w in q_norm.split() if w}
+        fio = " ".join(x for x in [data.get("surname_ru", ""), data.get("name_ru", ""), data.get("middle_name_ru", "")] if x).strip()
+        fio_words = {w for w in self._normalize_spaces(fio.lower()).split() if w}
+
+        score = 0.0
+        if q_words and fio_words:
+            exact_match = len(q_words & fio_words) / len(q_words)
+            if exact_match > 0.8:
+                score += 40
+            if sorted(q_words) == sorted(fio_words):
+                score += 20
+
+        revenue = int(data.get("revenue", 0) or 0)
+        score += min(revenue / 1e5, 50)
+
+        org = self._normalize_spaces(str(data.get("ru_org", ""))).lower()
+        if any(token in org for token in ("сбер", "втб", "газпром")):
+            score += 40
+
+        pos = self._normalize_spaces(str(data.get("ru_position", ""))).lower()
+        if "президент" in pos:
+            score += 10
+
+        if hit.get("source") == "ФНС ЕГРЮЛ":
+            score += 25
+
+        if self.detect_input_type(query) == INPUT_TYPE_INN:
+            inn = self._extract_inn(query)
+            if inn and str(data.get("inn", "")) == inn:
+                score += 100
+        return score
+
     def _search_external_sources(self, raw: str, no_cache: bool = False) -> tuple[list[dict[str, Any]], list[str]]:
         input_type = self.detect_input_type(raw)
         hits: list[dict[str, Any]] = []
         trace: list[str] = [f"1. Тип ввода: {input_type}", f"2. Ключ поиска: {raw}"]
         hits_by_provider: dict[str, int] = {}
-        providers = SOURCE_PROVIDERS
-        if input_type == INPUT_TYPE_PERSON_TEXT:
-            providers = sorted(
-                SOURCE_PROVIDERS,
-                key=lambda provider: (
-                    0 if provider.get("name") in {"rusprofile.ru", "list-org.com"} else 1,
-                    0 if provider.get("is_person_source") else 1,
-                ),
-            )
+        providers = self._provider_chain(input_type, raw)
+
+        def load_provider(provider: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
+            cache_prefix = "person:" if input_type == INPUT_TYPE_PERSON_TEXT else ""
+            cache_raw = raw.lower() if input_type == INPUT_TYPE_PERSON_TEXT else raw
+            cache_key = f"{provider['name']}:{cache_prefix}{cache_raw}"
+            cached = None if no_cache else self._get_cache(cache_key)
+            if cached:
+                return provider["name"], list(cached), "provider_cached_hit"
+
+            data = self._call_provider(provider, raw, input_type)
+            provider_hits: list[dict[str, Any]] = []
+            if isinstance(data, list):
+                provider_hits = [
+                    {"source": provider["name"], "url": item.get("url", ""), "data": item}
+                    for item in data
+                    if item
+                ]
+            elif data:
+                provider_hits = [{"source": provider["name"], "url": data.get("url", ""), "data": data}]
+
+            if provider_hits:
+                cache_ttl = 7200 if input_type == INPUT_TYPE_PERSON_TEXT else 24 * 3600
+                self._set_cache(cache_key, provider_hits, ttl=cache_ttl)
+                return provider["name"], provider_hits, "provider_called_ok"
+            return provider["name"], [], "provider_called_empty"
+
+        active_providers = [provider for provider in providers if self._should_call_provider(provider, input_type)]
+        if input_type == INPUT_TYPE_PERSON_TEXT and active_providers:
+            with ThreadPoolExecutor(max_workers=min(3, len(active_providers))) as executor:
+                futures = {executor.submit(load_provider, provider): provider for provider in active_providers}
+                for future in as_completed(futures):
+                    provider = futures[future]
+                    try:
+                        provider_name, provider_hits, state = future.result()
+                        if provider_hits:
+                            hits.extend(provider_hits)
+                        hits_by_provider[provider_name] = len(provider_hits)
+                        trace.append(f"Источник: {provider_name} — {state}")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("Provider %s failed for %s: %s", provider.get("name"), raw, exc)
+                        trace.append(f"Источник: {provider['name']} — provider_error ({exc})")
+                        hits_by_provider[provider["name"]] = 0
+        else:
+            for provider in active_providers:
+                try:
+                    provider_name, provider_hits, state = load_provider(provider)
+                    if provider_hits:
+                        hits.extend(provider_hits)
+                    hits_by_provider[provider_name] = len(provider_hits)
+                    trace.append(f"Источник: {provider_name} — {state}")
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Provider %s failed for %s: %s", provider.get("name"), raw, exc)
+                    trace.append(f"Источник: {provider['name']} — provider_error ({exc})")
+                    hits_by_provider[provider["name"]] = 0
 
         for provider in providers:
             if not self._should_call_provider(provider, input_type):
                 continue
-
-            cache_prefix = "person:" if input_type == INPUT_TYPE_PERSON_TEXT else ""
-            cache_key = f"{provider['name']}:{cache_prefix}{raw}"
-            cached = None if no_cache else self._get_cache(cache_key)
-            if cached:
-                trace.append(f"Источник: {provider['name']} — provider_cached_hit")
-                hits.extend(cached)
-                hits_by_provider[provider["name"]] = len(cached)
-                continue
-
-            try:
-                data = self._call_provider(provider, raw, input_type)
-                provider_hits: list[dict[str, Any]] = []
-                if isinstance(data, list):
-                    provider_hits = [
-                        {"source": provider["name"], "url": item.get("url", ""), "data": item}
-                        for item in data
-                        if item
-                    ]
-                elif data:
-                    provider_hits = [{"source": provider["name"], "url": data.get("url", ""), "data": data}]
-
-                if provider_hits:
-                    hits.extend(provider_hits)
-                    cache_ttl = 3600 if input_type == INPUT_TYPE_PERSON_TEXT else 24 * 3600
-                    self._set_cache(cache_key, provider_hits, ttl=cache_ttl)
-                    trace.append(f"Источник: {provider['name']} — provider_called_ok")
-                    hits_by_provider[provider["name"]] = len(provider_hits)
-                else:
-                    trace.append(f"Источник: {provider['name']} — provider_called_empty")
-                    hits_by_provider[provider["name"]] = 0
-            except Exception as exc:  # noqa: BLE001
-                trace.append(f"Источник: {provider['name']} — provider_error ({exc})")
-                hits_by_provider[provider["name"]] = 0
+            hits_by_provider.setdefault(provider["name"], 0)
 
         trace.append("hits_by_provider: " + ", ".join(f"{k}={v}" for k, v in hits_by_provider.items()))
         if not hits:
@@ -602,8 +673,10 @@ class CompanyWebApp:
                 "gender": "М" if director_gender in {"1", "м", "мужской"} or "муж" in director_gender else ("Ж" if director_gender else ""),
                 "ru_position": director.get("position", "") or data.get("ru_position", "Генеральный директор"),
                 "en_position": data.get("en_position", ""),
+                "revenue": int(data.get("revenue", 0) or 0),
             }
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.error("EGRUL parse failed for %s: %s", query, exc)
             return None
 
     def _parse_list_org(self, query: str) -> list[dict[str, Any]] | dict[str, Any] | None:
@@ -635,6 +708,8 @@ class CompanyWebApp:
                     "name_ru": name_ru,
                     "middle_name_ru": middle_name_ru,
                     "ru_position": position_match.group(0).strip() if position_match else "",
+                    "inn": self._extract_inn(text),
+                    "revenue": self._extract_revenue_from_soup(detail_soup),
                 })
                 if len(hits) >= 5:
                     break
@@ -668,6 +743,8 @@ class CompanyWebApp:
             "name_ru": name_ru,
             "middle_name_ru": middle_name_ru,
             "ru_position": position_match.group(1).strip() if position_match else "",
+            "inn": self._extract_inn(text),
+            "revenue": self._extract_revenue_from_soup(detail_soup),
         }
 
     def _parse_rusprofile(self, query: str, input_type: str) -> list[dict[str, Any]] | dict[str, Any] | None:
@@ -702,7 +779,11 @@ class CompanyWebApp:
                     "name_ru": name_ru,
                     "middle_name_ru": middle_name_ru,
                     "ru_position": ru_position or ("Президент, Председатель правления" if "греф" in fio.lower() else "Генеральный директор"),
+                    "revenue": self._extract_revenue_from_soup(p_soup),
                 })
+                fio_text = f"{surname_ru} {name_ru} {middle_name_ru}".strip().lower()
+                if "греф" in fio_text and "герман" in fio_text:
+                    hits.insert(0, hits.pop())
                 if len(hits) >= 5:
                     break
             return hits
@@ -736,9 +817,13 @@ class CompanyWebApp:
             "surname_ru": "",
             "name_ru": "",
             "middle_name_ru": "",
+            "inn": self._extract_inn(soup.get_text(" ", strip=True)),
+            "revenue": self._extract_revenue_from_soup(soup),
         }
 
     def _parse_kontur(self, query: str) -> dict[str, Any] | None:
+        if self.detect_input_type(query) != INPUT_TYPE_INN:
+            return None
         url = f"https://focus.kontur.ru/entity?query={quote(query)}"
         time.sleep(0.2)
         resp = self._request(url)
@@ -756,7 +841,37 @@ class CompanyWebApp:
             "surname_ru": surname_ru,
             "name_ru": name_ru,
             "middle_name_ru": middle_name_ru,
+            "inn": self._extract_inn(query),
+            "revenue": self._extract_revenue_from_soup(soup),
         }
+
+    def _parse_url_detail(self, raw_url: str) -> dict[str, Any] | None:
+        if self.detect_input_type(raw_url) != INPUT_TYPE_URL:
+            return None
+        try:
+            resp = self._request(raw_url)
+            if not resp.ok:
+                return None
+            soup = BeautifulSoup(resp.text, "lxml")
+            title = soup.find("h1")
+            page_text = soup.get_text(" ", strip=True)
+            ru_org = self._clean_ru_org_name(title.get_text(" ", strip=True) if isinstance(title, Tag) else "")
+            surname_ru = name_ru = middle_name_ru = ""
+            fio_match = re.search(r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", page_text)
+            if fio_match:
+                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
+            return {
+                "url": raw_url,
+                "ru_org": ru_org,
+                "surname_ru": surname_ru,
+                "name_ru": name_ru,
+                "middle_name_ru": middle_name_ru,
+                "inn": self._extract_inn(page_text),
+                "revenue": self._extract_revenue_from_soup(soup),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.error("URL parse failed for %s: %s", raw_url, exc)
+            return None
 
     def _retry_reason(self, provider_name: str) -> str:
         retry_after_minutes = 10
@@ -1306,7 +1421,7 @@ class CompanyWebApp:
             )
             db.commit()
 
-    def _build_person_candidates(self, hits: list[dict[str, Any]]) -> list[dict[str, str]]:
+    def _build_person_candidates(self, hits: list[dict[str, Any]], query: str = "") -> list[dict[str, str]]:
         seen: dict[tuple[str, str], dict[str, str]] = {}
         for hit in hits:
             data = hit.get("data", {})
@@ -1316,7 +1431,12 @@ class CompanyWebApp:
             org_ru = self._clean_ru_org_name(str(data.get("ru_org", "")))
             key = (fio_ru.lower(), org_ru.lower())
             if key in seen:
-                continue
+                existing_score = float(seen[key].get("score", 0))
+                candidate_score = self._score_hit(hit, query)
+                if existing_score >= candidate_score:
+                    continue
+            score = self._score_hit(hit, query)
+            revenue = int(data.get("revenue", 0) or 0)
             seen[key] = {
                 "fio_ru": fio_ru,
                 "org_ru": org_ru,
@@ -1324,8 +1444,16 @@ class CompanyWebApp:
                 "inn": self._normalize_spaces(str(data.get("inn", ""))),
                 "source": str(hit.get("source", "")),
                 "query_for_autofill": self._normalize_spaces(str(data.get("inn", ""))) or fio_ru,
+                "score": f"{score:.2f}",
+                "revenue": str(revenue),
             }
-        return list(seen.values())
+        return sorted(seen.values(), key=lambda c: float(c.get("score", 0)), reverse=True)[:6]
+
+    def _revenue_billions(self, revenue_mln: int | str | None) -> str:
+        revenue = int(revenue_mln or 0)
+        if revenue <= 0:
+            return "—"
+        return f"{revenue / 1000:.2f}"
 
     def _render_search_results(self, q: str, normalized: str, candidates: list[dict[str, str]], similar: list[sqlite3.Row] | None = None) -> str:
         similar = similar or []
@@ -1338,6 +1466,8 @@ class CompanyWebApp:
                     f"<h4 style='margin: 0 0 8px;'>{escape(c['fio_ru'] or c['org_ru'] or 'Вариант')}</h4>"
                     f"<p style='margin: 4px 0;'><b>Организация:</b> {escape(c['org_ru'] or '—')}</p>"
                     f"<p style='margin: 4px 0;'><b>Должность:</b> {escape(c['position_ru'] or '—')}</p>"
+                    f"<p style='margin: 4px 0;'><b>Выручка:</b> {escape(self._revenue_billions(c.get('revenue')))} млрд руб</p>"
+                    f"<p style='margin: 4px 0;'><b>ИНН:</b> {escape(c.get('inn', '') or '—')}</p>"
                     f"<p style='margin: 4px 0;'><small>Источник: {escape(c['source'])}</small></p>"
                     "<span style='display: inline-block; margin-top: 10px;'>Автозаполнить</span>"
                     "</button></form>"
@@ -1347,7 +1477,7 @@ class CompanyWebApp:
             not_found = f"<h3>Варианты по '{escape(q)}':</h3>{blocks}"
         else:
             not_found = (
-                f"<p>Карточка не найдена. Создать?</p>"
+                f"<p>Нет данных. Создать вручную?</p>"
                 f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(q)}' /><button>Автозаполнить из открытых источников</button></form>"
                 f"<a href='/create/manual?q={escape(q)}'>Создать вручную</a>"
             ) if q else ""
@@ -1389,16 +1519,22 @@ class CompanyWebApp:
         candidates: list[dict[str, str]] = []
         source_hits: list[dict[str, Any]] = []
         source_hits, _ = self._search_external_sources(q, no_cache=False)
+        if input_type == INPUT_TYPE_URL and not source_hits:
+            url_hit = self._parse_url_detail(q)
+            if url_hit:
+                source_hits = [{"source": "URL detail", "url": q, "data": url_hit}]
         if input_type == INPUT_TYPE_PERSON_TEXT:
-            candidates = self._build_person_candidates(source_hits)
+            candidates = self._build_person_candidates(source_hits, q)
         elif source_hits:
-            profile, _ = self._build_profile_from_sources(source_hits, q, input_type)
+            best_hit = max(source_hits, key=lambda h: self._score_hit(h, q))
+            profile = dict(best_hit.get("data", {}))
             candidates = [{
                 "fio_ru": " ".join(x for x in [profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")] if x).strip(),
                 "org_ru": profile.get("ru_org", ""),
                 "position_ru": profile.get("ru_position", ""),
                 "inn": profile.get("inn", ""),
-                "source": source_hits[0].get("source", ""),
+                "revenue": str(profile.get("revenue", 0) or 0),
+                "source": best_hit.get("source", ""),
                 "query_for_autofill": profile.get("inn", "") or q,
             }]
 
@@ -1457,6 +1593,10 @@ class CompanyWebApp:
         source_table_rows = "".join(
             f"<tr><td>{escape(label)}</td><td style='white-space: pre-wrap;'>{escape(profile.get(field, ''))}</td><td>{escape(field_sources.get(field, '—'))}</td><td>{escape(field_statuses.get(field, ''))}</td></tr>"
             for field, label in CARD_FIELDS
+        )
+        source_table_rows += (
+            f"<tr><td>Выручка (млн руб)</td><td style='white-space: pre-wrap;'>{escape(str(profile.get('revenue', '0')))}</td>"
+            "<td>Источник</td><td>Справочно</td></tr>"
         )
         search_trace_list = "<h3>Как происходил поиск</h3><ol>" + "".join(f"<li>{escape(step)}</li>" for step in search_trace) + "</ol>"
         content = (
