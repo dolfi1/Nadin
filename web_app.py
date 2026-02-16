@@ -13,6 +13,9 @@ from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any, Callable
+import requests
+from bs4 import BeautifulSoup
+from bs4 import Tag
 from urllib.parse import parse_qs
 from urllib.parse import urlencode
 from urllib.parse import urlparse
@@ -44,269 +47,6 @@ PASSPORT_MAP = {
     "Ч": "CH", "Ш": "SH", "Щ": "SHCH", "Ъ": "", "Ы": "Y", "Ь": "", "Э": "E", "Ю": "YU", "Я": "YA",
 }
 
-SOURCE_CATALOG: dict[str, dict[str, list[dict[str, Any]]]] = {
-    "name": {
-        "СБЕРБАНК ПАО": [
-            {
-                "source": "ФНС ЕГРЮЛ",
-                "url": "https://egrul.nalog.ru/",
-                "data": {
-                    "title": "",
-                    "salutation": "Г-н",
-                    "family_name": "Gref",
-                    "first_name": "Herman",
-                    "middle_name": "",
-                    "surname_ru": "Греф",
-                    "name_ru": "Герман",
-                    "middle_name_ru": "Оскарович",
-                    "gender": "М",
-                    "ru_org": "Сбербанк ПАО",
-                    "en_org": "Sberbank PJSC",
-                    "ru_position": "Президент, Председатель правления",
-                    "en_position": "President, Chairman of the Board",
-                    "inn": "7707083893",
-                    "ogrn": "1027700132195",
-                },
-            },
-            {
-                "source": "Федресурс",
-                "url": "https://fedresurs.ru/",
-                "data": {"ru_org": "Сбербанк ПАО", "en_org": "Sberbank PJSC"},
-            },
-        ],
-        "РОМАШКА ООО": [
-            {
-                "source": "ФНС ЕГРЮЛ",
-                "url": "https://egrul.nalog.ru/",
-                "data": {"ru_org": "Ромашка ООО", "en_org": "Romashka LLC"},
-            }
-        ],
-        "GOOGLE LLC": [
-            {
-                "source": "OpenCorporates",
-                "url": "https://opencorporates.com/",
-                "data": {"ru_org": "Google LLC", "en_org": "Google LLC"},
-            }
-        ],
-    },
-    "inn": {
-        "1102054991": [
-            {
-                "source": "ФНС ЕГРЮЛ",
-                "url": "https://egrul.nalog.ru/",
-                "data": {
-                    "inn": "1102054991",
-                    "ogrn": "1071102001651",
-                    "ru_org": "Газпром Переработка ООО",
-                    "en_org": "Gazprom Pererabotka LLC",
-                },
-            },
-            {
-                "source": "rusprofile.ru",
-                "url": "https://www.rusprofile.ru/id/2345002",
-                "data": {
-                    "inn": "1102054991",
-                    "ogrn": "1071102001651",
-                    "surname_ru": "Ишмурзин",
-                    "name_ru": "Айрат",
-                    "middle_name_ru": "Вильсурович",
-                    "gender": "М",
-                    "ru_position": "Генеральный директор",
-                    "en_position": "General Director",
-                },
-            },
-            {
-                "source": "list-org.com",
-                "url": "https://www.list-org.com/company/4616028",
-                "data": {
-                    "inn": "1102054991",
-                    "ogrn": "1071102001651",
-                    "ru_org": "Газпром Переработка ООО",
-                    "en_org": "Gazprom Pererabotka LLC",
-                },
-            },
-            {
-                "source": "OpenCorporates",
-                "url": "https://opencorporates.com/companies/ru/1071102001651",
-                "data": {
-                    "inn": "1102054991",
-                    "ogrn": "1071102001651",
-                    "ru_org": "Газпром Переработка ООО",
-                    "en_org": "Gazprom Pererabotka LLC",
-                },
-            },
-            {
-                "source": "OffshoreLeaks",
-                "url": "https://offshoreleaks.icij.org/search?q=Gazprom",
-                "data": {
-                    "ru_org": "Газпром Переработка ООО",
-                    "en_org": "Gazprom Pererabotka LLC",
-                },
-            },
-            {
-                "source": "zachestnyibiznes.ru",
-                "url": "https://zachestnyibiznes.ru/company/ul/1071102001651_1102054991_OOO-GAZPROM-PERERABOTKA",
-                "data": {
-                    "inn": "1102054991",
-                    "ogrn": "1071102001651",
-                },
-            },
-        ],
-        "5003021311": [
-            {
-                "source": "ФНС ЕГРЮЛ",
-                "url": "https://egrul.nalog.ru/",
-                "data": {
-                    "inn": "5003021311",
-                    "ogrn": "1025000653930",
-                    "ru_org": "Газпром Межрегионгаз ООО",
-                    "en_org": "Gazprom Mezhregiongaz LLC",
-                },
-            },
-            {
-                "source": "list-org.com",
-                "url": "https://www.list-org.com/company/134905",
-                "data": {
-                    "inn": "5003021311",
-                    "ogrn": "1025000653930",
-                    "ru_org": "Газпром Межрегионгаз ООО",
-                    "en_org": "Gazprom Mezhregiongaz LLC",
-                    "surname_ru": "Густов",
-                    "name_ru": "Сергей",
-                    "middle_name_ru": "Вадимович",
-                    "ru_position": "Генеральный директор",
-                    "en_position": "General Director",
-                    "gender": "М",
-                },
-            },
-            {
-                "source": "OpenCorporates",
-                "url": "https://opencorporates.com/companies/ru/1025000653930",
-                "data": {
-                    "inn": "5003021311",
-                    "ogrn": "1025000653930",
-                    "ru_org": "Газпром Межрегионгаз ООО",
-                    "en_org": "Gazprom Mezhregiongaz LLC",
-                },
-            },
-            {
-                "source": "OffshoreLeaks",
-                "url": "https://offshoreleaks.icij.org/search?q=Mezhregiongaz",
-                "data": {
-                    "ru_org": "Газпром Межрегионгаз ООО",
-                    "en_org": "Gazprom Mezhregiongaz LLC",
-                },
-            },
-        ],
-        "7707083893": [
-            {
-                "source": "ФНС ЕГРЮЛ",
-                "url": "https://egrul.nalog.ru/",
-                "data": {
-                    "ru_org": "Сбербанк ПАО",
-                    "en_org": "Sberbank PJSC",
-                    "inn": "7707083893",
-                    "ogrn": "1027700132195",
-                    "surname_ru": "Греф",
-                    "name_ru": "Герман",
-                    "middle_name_ru": "Оскарович",
-                    "ru_position": "Президент, Председатель правления",
-                    "en_position": "President, Chairman of the Board",
-                    "gender": "М",
-                },
-            },
-            {
-                "source": "list-org.com",
-                "url": "https://www.list-org.com/search?val=7707083893",
-                "data": {
-                    "ru_org": "Сбербанк ПАО",
-                    "title": "Список организаций с ИНН 7707083893",
-                },
-            },
-            {
-                "source": "rusprofile.ru",
-                "url": "https://www.rusprofile.ru/id/1027700132195",
-                "data": {
-                    "ru_org": "Сбербанк ПАО",
-                    "title": "ПАО Сбербанк",
-                },
-            },
-            {
-                "source": "focus.kontur.ru",
-                "url": "https://focus.kontur.ru/entity?query=7707083893",
-                "data": {
-                    "ru_org": "Сбербанк ПАО",
-                    "title": "Реквизиты компании",
-                },
-            },
-        ],
-        "7810783119": [
-            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7810783119", "ru_org": "Яндекс ООО", "en_org": "Yandex LLC"}},
-        ],
-        "7702070139": [
-            {
-                "source": "ФНС ЕГРЮЛ",
-                "url": "https://egrul.itsoft.ru/7702070139.json",
-                "data": {
-                    "inn": "7702070139",
-                    "ogrn": "1027739609391",
-                    "ru_org": "Банк ВТБ ПАО",
-                    "en_org": "VTB Bank PJSC",
-                    "surname_ru": "Костин",
-                    "name_ru": "Андрей",
-                    "middle_name_ru": "Леонидович",
-                    "ru_position": "Президент, Председатель правления",
-                    "en_position": "President, Chairman of the Board",
-                    "gender": "М",
-                },
-            },
-            {
-                "source": "list-org.com",
-                "url": "https://www.list-org.com/search?val=7702070139",
-                "data": {
-                    "ru_org": "Банк ВТБ ПАО",
-                    "en_org": "VTB Bank PJSC",
-                    "title": "Список организаций с ИНН 7702070139",
-                },
-            },
-            {
-                "source": "rusprofile.ru",
-                "url": "https://www.rusprofile.ru/id/1027739609391",
-                "data": {
-                    "ru_org": "Банк ВТБ ПАО",
-                    "title": "ПАО Банк ВТБ",
-                },
-            },
-            {
-                "source": "focus.kontur.ru",
-                "url": "https://focus.kontur.ru/entity?query=7702070139",
-                "data": {
-                    "ru_org": "Банк ВТБ ПАО",
-                    "title": "Реквизиты компании",
-                },
-            },
-        ],
-        "7704867853": [
-            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7704867853", "ru_org": "Озон ООО", "en_org": "Ozon LLC"}},
-        ],
-        "7736050003": [
-            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7736050003", "ru_org": "Ростелеком ПАО", "en_org": "Rostelecom PJSC"}},
-        ],
-        "7708503727": [
-            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7708503727", "ru_org": "Газпром Нефть ПАО", "en_org": "Gazprom Neft PJSC"}},
-        ],
-        "7728715184": [
-            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7728715184", "ru_org": "Газпромнефть-Снабжение ООО", "en_org": "Gazpromneft-Snabzhenie LLC"}},
-        ],
-        "7729588440": [
-            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7729588440", "ru_org": "Газпром ЦПС ООО", "en_org": "Gazprom CPS LLC"}},
-        ],
-        "7706092528": [
-            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7706092528", "ru_org": "Газпром Трансгаз Москва ООО", "en_org": "Gazprom Transgaz Moscow LLC"}},
-        ],
-    },
-}
-
 SOURCE_DOMAINS = {
     "egrul.nalog.ru": "ЕГРЮЛ",
     "www.rusprofile.ru": "rusprofile.ru",
@@ -329,25 +69,10 @@ SOURCE_DOMAINS = {
 }
 
 SOURCE_PROVIDERS: list[dict[str, Any]] = [
-    {"name": "ФНС ЕГРЮЛ", "supports_inn": True, "supports_name": True, "kind": "egrul", "rate_limit_policy": "retry", "is_person_source": True},
-    {"name": "rusprofile.ru", "supports_inn": True, "supports_name": True, "kind": "rusprofile", "rate_limit_policy": "retry", "is_person_source": False},
-    {"name": "list-org.com", "supports_inn": True, "supports_name": True, "kind": "list_org", "rate_limit_policy": "retry", "is_person_source": False},
-    {"name": "zachestnyibiznes.ru", "supports_inn": True, "supports_name": True, "kind": "zachestnyibiznes", "rate_limit_policy": "retry"},
-    {"name": "ФНС Интеграция ЕГРЮЛ/ЕГРИП", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "queue"},
-    {"name": "Федресурс", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
-    {"name": "OpenCorporates", "supports_inn": True, "supports_name": True, "kind": "open_corporates", "rate_limit_policy": "retry"},
-    {"name": "OffshoreLeaks", "supports_inn": True, "supports_name": True, "kind": "offshore", "rate_limit_policy": "best_effort"},
-    {"name": "Companies & Orgs Search Engine", "supports_inn": True, "supports_name": True, "kind": "companies_cse", "rate_limit_policy": "best_effort"},
-    {"name": "Corporation Wiki", "supports_inn": True, "supports_name": True, "kind": "corporation_wiki", "rate_limit_policy": "best_effort"},
-    {"name": "Global Brownbook", "supports_inn": True, "supports_name": True, "kind": "brownbook", "rate_limit_policy": "best_effort"},
-    {"name": "FAROS OSINT", "supports_inn": True, "supports_name": True, "kind": "faros", "rate_limit_policy": "best_effort"},
-    {"name": "OCCRP Aleph", "supports_inn": True, "supports_name": True, "kind": "occrp", "rate_limit_policy": "best_effort"},
-    {"name": "focus.kontur.ru", "supports_inn": True, "supports_name": True, "kind": "kontur", "rate_limit_policy": "retry", "is_person_source": False},
-    {"name": "КАД Арбитр", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
-    {"name": "ЕИС Закупки", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
-    {"name": "Банк России", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
-    {"name": "checko.ru", "supports_inn": True, "supports_name": True, "kind": "checko", "rate_limit_policy": "skip_on_429"},
-    {"name": "Wikidata", "supports_inn": False, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
+    {"name": "ФНС ЕГРЮЛ", "kind": "egrul", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": True},
+    {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True},
+    {"name": "list-org.com", "kind": "list_org", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False},
+    {"name": "focus.kontur.ru", "kind": "kontur", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False},
 ]
 
 INPUT_TYPE_INN = "INN"
@@ -421,6 +146,11 @@ class CompanyWebApp:
                   created_at TEXT NOT NULL,
                   details TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS source_cache (
+                  cache_key TEXT PRIMARY KEY,
+                  payload_json TEXT NOT NULL,
+                  expires_at REAL NOT NULL
+                );
                 """
             )
             db.commit()
@@ -493,12 +223,10 @@ class CompanyWebApp:
 
     def detect_input_type(self, raw: str) -> str:
         value = self._normalize_spaces(raw)
-        if re.fullmatch(r"\d{10}|\d{12}", value):
+        if re.fullmatch(r"\d{10,12}", value):
             return INPUT_TYPE_INN
         if re.match(r"https?://", value, flags=re.IGNORECASE):
             return INPUT_TYPE_URL
-        if self._contains_org_form(value):
-            return INPUT_TYPE_ORG_TEXT
         if self._looks_like_person_text(value):
             return INPUT_TYPE_PERSON_TEXT
         return INPUT_TYPE_ORG_TEXT
@@ -713,62 +441,103 @@ class CompanyWebApp:
         provider_map = {provider["name"]: provider for provider in SOURCE_PROVIDERS}
         return [provider_map[name] for name in names if name in provider_map]
 
-    def _cached_lookup(self, provider_name: str, key: str) -> dict[str, Any] | None:
-        cache_key = f"{provider_name}:{key}"
+    def _get_cache(self, cache_key: str) -> list[dict[str, Any]] | None:
         cached = self._source_cache.get(cache_key)
-        if not cached:
-            return None
-        expires_at = float(cached.get("expires_at", 0))
-        if time.time() >= expires_at:
-            self._source_cache.pop(cache_key, None)
-            return None
-        return cached
+        now = time.time()
+        if cached and now < float(cached.get("expires_at", 0)):
+            return list(cached.get("hits", []))
 
-    def _save_cached_lookup(
-        self,
-        provider_name: str,
-        key: str,
-        value: list[dict[str, Any]],
-        state: str,
-        reason: str = "",
-    ) -> None:
-        cache_key = f"{provider_name}:{key}"
-        ttl = self._positive_cache_ttl if state == "ok" and value else self._negative_cache_ttl
-        self._source_cache[cache_key] = {
-            "ts": time.time(),
-            "expires_at": time.time() + ttl,
-            "hits": value,
-            "state": state,
-            "reason": reason,
-        }
+        with self._connect() as db:
+            row = db.execute("SELECT payload_json, expires_at FROM source_cache WHERE cache_key=?", (cache_key,)).fetchone()
+            if not row:
+                return None
+            if now >= float(row["expires_at"]):
+                db.execute("DELETE FROM source_cache WHERE cache_key=?", (cache_key,))
+                db.commit()
+                return None
+            hits = json.loads(row["payload_json"])
+
+        self._source_cache[cache_key] = {"hits": hits, "expires_at": float(row["expires_at"])}
+        return hits
+
+    def _set_cache(self, cache_key: str, hits: list[dict[str, Any]], ttl: int = 3600) -> None:
+        expires_at = time.time() + ttl
+        payload = json.dumps(hits, ensure_ascii=False)
+        self._source_cache[cache_key] = {"hits": hits, "expires_at": expires_at}
+        with self._connect() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO source_cache(cache_key, payload_json, expires_at) VALUES (?, ?, ?)",
+                (cache_key, payload, expires_at),
+            )
+            db.commit()
 
     def _clear_cache_for_inn(self, inn: str) -> int:
-        key_fragment = f":inn:{inn}"
-        to_drop = [cache_key for cache_key in self._source_cache if key_fragment in cache_key]
-        for cache_key in to_drop:
-            self._source_cache.pop(cache_key, None)
-        return len(to_drop)
+        key_fragment = f":{inn}"
+        dropped = [k for k in self._source_cache if key_fragment in k]
+        for key in dropped:
+            self._source_cache.pop(key, None)
+        with self._connect() as db:
+            cur = db.execute("DELETE FROM source_cache WHERE cache_key LIKE ?", (f"%:{inn}%",))
+            db.commit()
+            return len(dropped) + int(cur.rowcount)
 
-    def _search_in_catalog(self, provider_name: str, normalized: str, inn: str) -> list[dict[str, Any]]:
-        if inn:
-            by_inn = SOURCE_CATALOG["inn"].get(inn, [])
-            hits = [item for item in by_inn if item.get("source") == provider_name]
-            if hits:
-                return hits
+    def _should_call_provider(self, provider: dict[str, Any], input_type: str) -> bool:
+        if input_type == INPUT_TYPE_INN:
+            return bool(provider.get("supports_inn"))
+        if input_type == INPUT_TYPE_URL:
+            return bool(provider.get("supports_url"))
+        return bool(provider.get("supports_name"))
 
-        direct = SOURCE_CATALOG["name"].get(normalized.upper(), [])
-        found = [item for item in direct if item.get("source") == provider_name]
-        if found:
-            return found
+    def _call_provider(self, provider: dict[str, Any], raw: str, input_type: str) -> dict[str, Any] | None:
+        kind = provider.get("kind")
+        if kind == "egrul":
+            inn = raw if input_type == INPUT_TYPE_INN else self._extract_inn(raw)
+            return self._parse_egrul(inn)
+        if kind == "list_org":
+            return self._parse_list_org(raw)
+        if kind == "rusprofile":
+            return self._parse_rusprofile(raw, input_type)
+        if kind == "kontur":
+            return self._parse_kontur(raw)
+        return None
 
-        token = normalized.split()[0].upper() if normalized else ""
-        if not token:
-            return []
-        aggregated: list[dict[str, Any]] = []
-        for org_name, records in SOURCE_CATALOG["name"].items():
-            if token in org_name:
-                aggregated.extend(item for item in records if item.get("source") == provider_name)
-        return aggregated
+    def _search_external_sources(self, raw: str, no_cache: bool = False) -> tuple[list[dict[str, Any]], list[str]]:
+        input_type = self.detect_input_type(raw)
+        hits: list[dict[str, Any]] = []
+        trace: list[str] = [f"1. Тип ввода: {input_type}", f"2. Ключ поиска: {raw}"]
+        hits_by_provider: dict[str, int] = {}
+
+        for provider in SOURCE_PROVIDERS:
+            if not self._should_call_provider(provider, input_type):
+                continue
+
+            cache_key = f"{provider['name']}:{raw}"
+            cached = None if no_cache else self._get_cache(cache_key)
+            if cached:
+                trace.append(f"Источник: {provider['name']} — provider_cached_hit")
+                hits.extend(cached)
+                hits_by_provider[provider["name"]] = len(cached)
+                continue
+
+            try:
+                data = self._call_provider(provider, raw, input_type)
+                if data:
+                    hit = {"source": provider["name"], "url": data.get("url", ""), "data": data}
+                    hits.append(hit)
+                    self._set_cache(cache_key, [hit], ttl=3600)
+                    trace.append(f"Источник: {provider['name']} — provider_called_ok")
+                    hits_by_provider[provider["name"]] = 1
+                else:
+                    trace.append(f"Источник: {provider['name']} — provider_called_empty")
+                    hits_by_provider[provider["name"]] = 0
+            except Exception as exc:  # noqa: BLE001
+                trace.append(f"Источник: {provider['name']} — provider_error ({exc})")
+                hits_by_provider[provider["name"]] = 0
+
+        trace.append("hits_by_provider: " + ", ".join(f"{k}={v}" for k, v in hits_by_provider.items()))
+        if not hits:
+            trace.append("Источники: не получено")
+        return hits, trace
 
     def _domain_throttle(self, url: str) -> None:
         host = urlparse(url).netloc.lower()
@@ -780,128 +549,123 @@ class CompanyWebApp:
             time.sleep(wait_for)
         self._domain_last_call[host] = time.time()
 
-    def _provider_fallback_from_catalog(self, provider_name: str, normalized: str, inn: str) -> tuple[dict[str, Any] | None, str, str]:
-        hits = self._search_in_catalog(provider_name, normalized, inn)
-        return (hits[0], "ok", "") if hits else (None, "empty", "")
+    def _request(self, url: str) -> requests.Response:
+        self._domain_throttle(url)
+        return requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
 
-    def _call_inn_provider(self, kind: str, provider_name: str, raw_input: str, normalized: str, inn: str) -> tuple[dict[str, Any] | None, str, str]:
-        if kind == "egrul":
-            return self._fetch_from_egrul(inn)
-        if kind == "checko":
-            return self._fetch_from_checko(raw_input, inn)
-        if kind == "rusprofile":
-            return self._fetch_from_rusprofile(inn, normalized)
-        if kind == "list_org":
-            return self._fetch_from_list_org(inn, normalized)
-        if kind == "open_corporates":
-            return self._fetch_from_open_corporates(inn, normalized)
-        if kind == "offshore":
-            return self._fetch_from_offshore_leaks(inn, normalized)
-        if kind == "companies_cse":
-            return self._fetch_from_companies_cse(inn, normalized)
-        if kind == "corporation_wiki":
-            return self._fetch_from_corporation_wiki(inn, normalized)
-        if kind == "brownbook":
-            return self._fetch_from_global_brownbook(inn, normalized)
-        if kind == "faros":
-            return self._fetch_from_faros(inn, normalized)
-        if kind == "occrp":
-            return self._fetch_from_occrp(inn, normalized)
-        if kind == "zachestnyibiznes":
-            return self._fetch_from_zachestnyibiznes(inn, normalized)
-        if kind == "kontur":
-            return self._fetch_from_kontur(inn, normalized)
-        return self._provider_fallback_from_catalog(provider_name, normalized, inn)
+    def _parse_egrul(self, inn: str) -> dict[str, Any] | None:
+        if not re.fullmatch(r"\d{10,12}", inn):
+            return None
+        url = f"https://egrul.itsoft.ru/{inn}.json"
+        resp = self._request(url)
+        if not resp.ok:
+            return None
+        data = resp.json()
+        gender = data.get("gender")
+        return {
+            "url": url,
+            "inn": data.get("inn") or inn,
+            "ogrn": data.get("ogrn"),
+            "ru_org": data.get("ru_org") or data.get("name", ""),
+            "en_org": data.get("en_org", ""),
+            "surname_ru": data.get("surname_ru", ""),
+            "name_ru": data.get("name_ru", ""),
+            "middle_name_ru": data.get("middle_name_ru", ""),
+            "gender": "М" if str(gender) == "1" else ("Ж" if str(gender) == "2" else ""),
+            "ru_position": data.get("ru_position") or data.get("director", {}).get("position", ""),
+            "en_position": data.get("en_position", ""),
+        }
 
-    def _run_provider(
-        self,
-        provider: dict[str, Any],
-        raw_input: str,
-        normalized: str,
-        input_type: str,
-        inn: str,
-        no_cache: bool = False,
-    ) -> tuple[list[dict[str, Any]], str]:
-        provider_name = provider["name"]
-        if input_type == INPUT_TYPE_INN and not provider["supports_inn"]:
-            return [], f"Источник: {provider_name} — пропущен (не поддерживает ИНН)"
-        if input_type != INPUT_TYPE_INN and not provider["supports_name"]:
-            return [], f"Источник: {provider_name} — пропущен (не поддерживает название)"
+    def _parse_list_org(self, query: str) -> dict[str, Any] | None:
+        search_url = f"https://www.list-org.com/search?val={query}"
+        search_resp = self._request(search_url)
+        if not search_resp.ok:
+            return None
+        soup = BeautifulSoup(search_resp.text, "lxml")
+        company_link = soup.find("a", href=re.compile(r"/company/\d+"))
+        if not isinstance(company_link, Tag):
+            return None
+        company_url = "https://www.list-org.com" + str(company_link.get("href", ""))
+        detail = self._request(company_url)
+        if not detail.ok:
+            return None
+        detail_soup = BeautifulSoup(detail.text, "lxml")
+        h1 = detail_soup.find("h1")
+        ru_org = h1.get_text(strip=True) if isinstance(h1, Tag) else ""
+        text = detail_soup.get_text(" ", strip=True)
+        fio_match = re.search(r"Руководитель[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", text)
+        surname_ru = name_ru = middle_name_ru = ""
+        if fio_match:
+            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
+        return {
+            "url": company_url,
+            "ru_org": ru_org,
+            "surname_ru": surname_ru,
+            "name_ru": name_ru,
+            "middle_name_ru": middle_name_ru,
+        }
 
-        key = f"inn:{inn}" if inn else normalized.upper()
-        cached = None if no_cache else self._cached_lookup(provider_name, key)
-        if cached is not None:
-            hits = cached.get("hits", [])
-            state = cached.get("state", "ok")
-            if state == "ok" and hits:
-                return hits, f"Источник: {provider_name} — provider_cached_hit"
-            ttl_left = max(0, int(float(cached.get("expires_at", 0)) - time.time()))
-            reason = cached.get("reason", "")
-            suffix = f"; причина={reason}" if reason else ""
-            return [], f"Источник: {provider_name} — skipped_due_to_negative_cache (ttl={ttl_left}s{suffix})"
+    def _parse_rusprofile(self, query: str, input_type: str) -> dict[str, Any] | None:
+        if input_type == INPUT_TYPE_URL and "rusprofile.ru" in query:
+            detail_url = query
+        else:
+            search_url = f"https://www.rusprofile.ru/search?query={query}"
+            search_resp = self._request(search_url)
+            if not search_resp.ok:
+                return None
+            soup = BeautifulSoup(search_resp.text, "lxml")
+            link = soup.find("a", href=re.compile(r"^/(id|company)/"))
+            if not isinstance(link, Tag):
+                return None
+            detail_url = "https://www.rusprofile.ru" + str(link.get("href", ""))
+        detail_resp = self._request(detail_url)
+        if not detail_resp.ok:
+            return None
+        soup = BeautifulSoup(detail_resp.text, "lxml")
+        title = soup.find("h1")
+        ru_org = title.get_text(strip=True) if isinstance(title, Tag) else ""
+        text = soup.get_text(" ", strip=True)
+        surname_ru = name_ru = middle_name_ru = ""
+        if input_type == INPUT_TYPE_PERSON_TEXT:
+            wanted_surname = self._normalize_spaces(query).split()[0] if query else ""
+            if wanted_surname:
+                direct = re.search(rf"({re.escape(wanted_surname)}\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", text, flags=re.IGNORECASE)
+                if direct:
+                    surname_ru, name_ru, middle_name_ru = self._split_fio_ru(direct.group(1))
+            if not surname_ru:
+                candidates = re.findall(r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", text)
+                for candidate in reversed(candidates):
+                    first_raw = candidate.split()[0]
+                    if first_raw.upper() in RU_TO_EN_OPF:
+                        continue
+                    surname_ru, name_ru, middle_name_ru = self._split_fio_ru(candidate)
+                    break
+        return {
+            "url": detail_url,
+            "ru_org": ru_org,
+            "surname_ru": surname_ru,
+            "name_ru": name_ru,
+            "middle_name_ru": middle_name_ru,
+        }
 
-        hit, state, reason = self._call_inn_provider(provider.get("kind", "catalog"), provider_name, raw_input, normalized, inn)
-        hits = [hit] if hit else []
-        self._save_cached_lookup(provider_name, key, hits, state=state, reason=reason)
-        if hits:
-            return hits, f"Источник: {provider_name} — provider_called_ok"
-        if state == "rate_limited":
-            return [], f"Источник: {provider_name} — rate_limited ({reason})"
-        if state == "error":
-            return [], f"Источник: {provider_name} — provider_error ({reason})"
-        return [], f"Источник: {provider_name} — provider_called_empty"
-
-    def _search_external_sources(self, company_name: str, no_cache: bool = False) -> tuple[list[dict[str, Any]], list[str]]:
-        input_type = self.detect_input_type(company_name)
-        inn = self._extract_inn(company_name)
-        normalization_seed = inn if inn else company_name
-        normalized, _ = self.normalize_ru_org(normalization_seed)
-        trace = [
-            f"Тип ввода: {input_type}",
-            f"Нормализованное название/ключ поиска: {normalized}",
-        ]
-        company_id = self._extract_checko_company_id(company_name)
-        if inn:
-            trace.append(f"ИНН: {inn}")
-            trace.append(f"Ключ поиска провайдеров: inn:{inn}")
-        if company_id:
-            trace.append(f"Выделен ID checko: {company_id}")
-        hits: list[dict[str, Any]] = []
-        providers = self._provider_chain(input_type, company_name)
-        trace.append(f"Провайдеров в очереди: {len(providers)}")
-        status_line: list[str] = []
-        hits_by_provider: dict[str, int] = {}
-        skipped_only = True
-        for provider in providers:
-            provider_hits, provider_status = self._run_provider(provider, company_name, normalized, input_type, inn, no_cache=no_cache)
-            trace.append(provider_status)
-            provider_name = provider["name"]
-            hits_by_provider[provider_name] = len(provider_hits)
-            if "provider_called_ok" in provider_status:
-                if provider_hits and any(provider_hits[0].get("data", {}).get(f) for f in ("ru_org", "en_org", "surname_ru", "name_ru", "middle_name_ru", "ru_position")):
-                    status_line.append(f"{provider_name} (ok)")
-                skipped_only = False
-            elif "provider_called_empty" in provider_status or "provider_error" in provider_status or "rate_limited" in provider_status:
-                skipped_only = False
-            if provider_hits:
-                hits.extend(provider_hits)
-
-        if status_line:
-            trace.append("Trace в UI: " + " → ".join(status_line))
-        trace.append("hits_by_provider: " + ", ".join(f"{k}={v}" for k, v in hits_by_provider.items()))
-
-        if not hits and skipped_only:
-            trace.append("Все источники пропущены. Вставь выписку")
-        if not hits:
-            trace.append("Fallback: Вставь выписку (regex-парсинг)")
-            trace.append("Источники: не получено (в источниках нет данных по запросу)")
-        return hits, trace
+    def _parse_kontur(self, query: str) -> dict[str, Any] | None:
+        url = f"https://focus.kontur.ru/entity?query={query}"
+        resp = self._request(url)
+        if not resp.ok:
+            return None
+        soup = BeautifulSoup(resp.text, "lxml")
+        h1 = soup.find("h1")
+        ru_org = h1.get_text(strip=True) if isinstance(h1, Tag) else ""
+        return {"url": url, "ru_org": ru_org}
 
     def _retry_reason(self, provider_name: str) -> str:
         retry_after_minutes = 10
         retry_at = datetime.now(timezone.utc).timestamp() + retry_after_minutes * 60
         retry_at_iso = datetime.fromtimestamp(retry_at, tz=timezone.utc).isoformat()
         return f"retry_at={retry_at_iso}; provider={provider_name}"
+
+    def _provider_fallback_from_catalog(self, provider_name: str, normalized: str, inn: str) -> tuple[dict[str, Any] | None, str, str]:
+        return None, "empty", "no catalog fallback"
 
     def _fetch_inn_fixture(self, provider_name: str, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
         if not inn:
