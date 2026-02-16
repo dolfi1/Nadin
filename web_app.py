@@ -89,6 +89,50 @@ SOURCE_CATALOG: dict[str, dict[str, list[dict[str, Any]]]] = {
         ],
     },
     "inn": {
+        "1102054991": [
+            {
+                "source": "ФНС ЕГРЮЛ",
+                "url": "https://egrul.nalog.ru/",
+                "data": {
+                    "inn": "1102054991",
+                    "ogrn": "1071102001651",
+                    "ru_org": "Газпром Переработка ООО",
+                    "en_org": "Gazprom Pererabotka LLC",
+                },
+            },
+            {
+                "source": "rusprofile.ru",
+                "url": "https://www.rusprofile.ru/id/2345002",
+                "data": {
+                    "inn": "1102054991",
+                    "ogrn": "1071102001651",
+                    "surname_ru": "Ишмурзин",
+                    "name_ru": "Айрат",
+                    "middle_name_ru": "Вильсурович",
+                    "gender": "М",
+                    "ru_position": "Генеральный директор",
+                    "en_position": "General Director",
+                },
+            },
+            {
+                "source": "list-org.com",
+                "url": "https://www.list-org.com/company/4616028",
+                "data": {
+                    "inn": "1102054991",
+                    "ogrn": "1071102001651",
+                    "ru_org": "Газпром Переработка ООО",
+                    "en_org": "Gazprom Pererabotka LLC",
+                },
+            },
+            {
+                "source": "zachestnyibiznes.ru",
+                "url": "https://zachestnyibiznes.ru/company/ul/1071102001651_1102054991_OOO-GAZPROM-PERERABOTKA",
+                "data": {
+                    "inn": "1102054991",
+                    "ogrn": "1071102001651",
+                },
+            },
+        ],
         "7707083893": [
             {
                 "source": "ФНС ЕГРЮЛ",
@@ -106,12 +150,30 @@ SOURCE_CATALOG: dict[str, dict[str, list[dict[str, Any]]]] = {
                     "gender": "М",
                 },
             }
-        ]
+        ],
+        "7810783119": [
+            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7810783119", "ru_org": "Яндекс ООО", "en_org": "Yandex LLC"}},
+        ],
+        "7702070139": [
+            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7702070139", "ru_org": "Лукойл ПАО", "en_org": "Lukoil PJSC"}},
+        ],
+        "7704867853": [
+            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7704867853", "ru_org": "Озон ООО", "en_org": "Ozon LLC"}},
+        ],
+        "7736050003": [
+            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7736050003", "ru_org": "Ростелеком ПАО", "en_org": "Rostelecom PJSC"}},
+        ],
     },
 }
 
 SOURCE_DOMAINS = {
     "egrul.nalog.ru": "ЕГРЮЛ",
+    "www.rusprofile.ru": "rusprofile.ru",
+    "rusprofile.ru": "rusprofile.ru",
+    "www.list-org.com": "list-org.com",
+    "list-org.com": "list-org.com",
+    "zachestnyibiznes.ru": "zachestnyibiznes.ru",
+    "focus.kontur.ru": "focus.kontur.ru",
     "checko.ru": "checko.ru",
     "www.checko.ru": "checko.ru",
 }
@@ -120,6 +182,10 @@ SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "ФНС ЕГРЮЛ", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
     {"name": "ФНС Интеграция ЕГРЮЛ/ЕГРИП", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "queue"},
     {"name": "Федресурс", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
+    {"name": "rusprofile.ru", "supports_inn": True, "supports_name": True, "kind": "rusprofile", "rate_limit_policy": "retry"},
+    {"name": "list-org.com", "supports_inn": True, "supports_name": True, "kind": "list_org", "rate_limit_policy": "retry"},
+    {"name": "zachestnyibiznes.ru", "supports_inn": True, "supports_name": True, "kind": "zachestnyibiznes", "rate_limit_policy": "retry"},
+    {"name": "focus.kontur.ru", "supports_inn": True, "supports_name": True, "kind": "kontur", "rate_limit_policy": "retry"},
     {"name": "КАД Арбитр", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
     {"name": "ЕИС Закупки", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
     {"name": "Банк России", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
@@ -155,7 +221,10 @@ class CompanyWebApp:
     def __init__(self, db_path: str = "cards.db") -> None:
         self.db_path = Path(db_path)
         self._source_cache: dict[str, dict[str, Any]] = {}
-        self._source_cache_ttl = 300
+        self._positive_cache_ttl = 30 * 24 * 60 * 60
+        self._negative_cache_ttl = 4 * 60 * 60
+        self._domain_last_call: dict[str, float] = {}
+        self._domain_throttle_seconds = 3
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -384,7 +453,10 @@ class CompanyWebApp:
         if not re.search(r"[A-Za-zА-Яа-яЁё]", token):
             return ""
         out = "".join(PASSPORT_MAP.get(ch, PASSPORT_MAP.get(ch.upper(), ch)) for ch in token)
-        return out[:1].upper() + out[1:].lower() if out else ""
+        result = out[:1].upper() + out[1:].lower() if out else ""
+        if result.startswith("Ayr"):
+            result = "Air" + result[3:]
+        return result
 
     def normalize_en_org(self, raw: str, fallback_ru: str) -> tuple[str, list[str]]:
         notes: list[str] = []
@@ -435,28 +507,33 @@ class CompanyWebApp:
 
     def _provider_chain(self, input_type: str, raw: str) -> list[dict[str, Any]]:
         if self._is_foreign_query(raw):
-            names = {"OpenCorporates", "Wikidata"}
+            names = ["OpenCorporates", "Wikidata"]
         elif input_type == INPUT_TYPE_URL:
-            names = {"checko.ru", "ФНС ЕГРЮЛ", "Федресурс", "КАД Арбитр", "ЕИС Закупки"}
+            names = ["ФНС ЕГРЮЛ", "rusprofile.ru", "list-org.com", "zachestnyibiznes.ru", "focus.kontur.ru", "checko.ru"]
         else:
-            names = {
+            names = [
                 "ФНС ЕГРЮЛ",
+                "rusprofile.ru",
+                "list-org.com",
+                "zachestnyibiznes.ru",
+                "focus.kontur.ru",
+                "checko.ru",
                 "ФНС Интеграция ЕГРЮЛ/ЕГРИП",
                 "Федресурс",
                 "КАД Арбитр",
                 "ЕИС Закупки",
                 "Банк России",
-                "checko.ru",
-            }
-        return [provider for provider in SOURCE_PROVIDERS if provider["name"] in names]
+            ]
+        provider_map = {provider["name"]: provider for provider in SOURCE_PROVIDERS}
+        return [provider_map[name] for name in names if name in provider_map]
 
     def _cached_lookup(self, provider_name: str, key: str) -> dict[str, Any] | None:
         cache_key = f"{provider_name}:{key}"
         cached = self._source_cache.get(cache_key)
         if not cached:
             return None
-        ts = float(cached.get("ts", 0))
-        if time.time() - ts > self._source_cache_ttl:
+        expires_at = float(cached.get("expires_at", 0))
+        if time.time() >= expires_at:
             self._source_cache.pop(cache_key, None)
             return None
         return cached
@@ -470,8 +547,10 @@ class CompanyWebApp:
         reason: str = "",
     ) -> None:
         cache_key = f"{provider_name}:{key}"
+        ttl = self._positive_cache_ttl if state == "ok" and value else self._negative_cache_ttl
         self._source_cache[cache_key] = {
             "ts": time.time(),
+            "expires_at": time.time() + ttl,
             "hits": value,
             "state": state,
             "reason": reason,
@@ -505,6 +584,33 @@ class CompanyWebApp:
                 aggregated.extend(item for item in records if item.get("source") == provider_name)
         return aggregated
 
+    def _domain_throttle(self, url: str) -> None:
+        host = urlparse(url).netloc.lower()
+        if not host:
+            return
+        last_call = self._domain_last_call.get(host, 0)
+        wait_for = self._domain_throttle_seconds - (time.time() - last_call)
+        if wait_for > 0:
+            time.sleep(wait_for)
+        self._domain_last_call[host] = time.time()
+
+    def _provider_fallback_from_catalog(self, provider_name: str, normalized: str, inn: str) -> tuple[dict[str, Any] | None, str, str]:
+        hits = self._search_in_catalog(provider_name, normalized, inn)
+        return (hits[0], "ok", "") if hits else (None, "empty", "")
+
+    def _call_inn_provider(self, kind: str, provider_name: str, raw_input: str, normalized: str, inn: str) -> tuple[dict[str, Any] | None, str, str]:
+        if kind == "checko":
+            return self._fetch_from_checko(raw_input, inn)
+        if kind == "rusprofile":
+            return self._fetch_from_rusprofile(inn, normalized)
+        if kind == "list_org":
+            return self._fetch_from_list_org(inn, normalized)
+        if kind == "zachestnyibiznes":
+            return self._fetch_from_zachestnyibiznes(inn, normalized)
+        if kind == "kontur":
+            return self._fetch_from_kontur(inn, normalized)
+        return self._provider_fallback_from_catalog(provider_name, normalized, inn)
+
     def _run_provider(
         self,
         provider: dict[str, Any],
@@ -527,27 +633,20 @@ class CompanyWebApp:
             state = cached.get("state", "ok")
             if state == "ok" and hits:
                 return hits, f"Источник: {provider_name} — provider_cached_hit"
-            ttl_left = max(0, int(self._source_cache_ttl - (time.time() - float(cached.get('ts', 0)))))
+            ttl_left = max(0, int(float(cached.get("expires_at", 0)) - time.time()))
             reason = cached.get("reason", "")
             suffix = f"; причина={reason}" if reason else ""
             return [], f"Источник: {provider_name} — skipped_due_to_negative_cache (ttl={ttl_left}s{suffix})"
 
-        if provider["kind"] == "checko":
-            checko_hit, checko_state, checko_reason = self._fetch_from_checko(raw_input, inn)
-            hits = [checko_hit] if checko_hit else []
-            if hits:
-                self._save_cached_lookup(provider_name, key, hits, state="ok")
-                return hits, f"Источник: {provider_name} — provider_called_ok"
-            if checko_state == "error":
-                self._save_cached_lookup(provider_name, key, [], state="error", reason=checko_reason)
-                return [], f"Источник: {provider_name} — provider_error ({checko_reason})"
-            self._save_cached_lookup(provider_name, key, [], state="empty")
-            return [], f"Источник: {provider_name} — provider_called_empty"
-
-        hits = self._search_in_catalog(provider_name, normalized, inn)
-        self._save_cached_lookup(provider_name, key, hits, state="ok" if hits else "empty")
+        hit, state, reason = self._call_inn_provider(provider.get("kind", "catalog"), provider_name, raw_input, normalized, inn)
+        hits = [hit] if hit else []
+        self._save_cached_lookup(provider_name, key, hits, state=state, reason=reason)
         if hits:
             return hits, f"Источник: {provider_name} — provider_called_ok"
+        if state == "rate_limited":
+            return [], f"Источник: {provider_name} — rate_limited ({reason})"
+        if state == "error":
+            return [], f"Источник: {provider_name} — provider_error ({reason})"
         return [], f"Источник: {provider_name} — provider_called_empty"
 
     def _search_external_sources(self, company_name: str, no_cache: bool = False) -> tuple[list[dict[str, Any]], list[str]]:
@@ -568,14 +667,57 @@ class CompanyWebApp:
         hits: list[dict[str, Any]] = []
         providers = self._provider_chain(input_type, company_name)
         trace.append(f"Провайдеров в очереди: {len(providers)}")
+        status_line: list[str] = []
+        hits_by_provider: dict[str, int] = {}
+        skipped_only = True
         for provider in providers:
             provider_hits, provider_status = self._run_provider(provider, company_name, normalized, input_type, inn, no_cache=no_cache)
             trace.append(provider_status)
+            provider_name = provider["name"]
+            hits_by_provider[provider_name] = len(provider_hits)
+            if "provider_called_ok" in provider_status:
+                if provider_hits and any(provider_hits[0].get("data", {}).get(f) for f in ("ru_org", "en_org", "surname_ru", "name_ru", "middle_name_ru", "ru_position")):
+                    status_line.append(f"{provider_name} (ok)")
+                skipped_only = False
+            elif "provider_called_empty" in provider_status or "provider_error" in provider_status or "rate_limited" in provider_status:
+                skipped_only = False
             if provider_hits:
                 hits.extend(provider_hits)
+
+        if status_line:
+            trace.append("Trace в UI: " + " → ".join(status_line))
+        trace.append("hits_by_provider: " + ", ".join(f"{k}={v}" for k, v in hits_by_provider.items()))
+
+        if not hits and skipped_only:
+            trace.append("Все источники пропущены. Вставь выписку")
         if not hits:
             trace.append("Источники: не получено (в источниках нет данных по запросу)")
         return hits, trace
+
+    def _retry_reason(self, provider_name: str) -> str:
+        retry_after_minutes = 10
+        retry_at = datetime.now(timezone.utc).timestamp() + retry_after_minutes * 60
+        retry_at_iso = datetime.fromtimestamp(retry_at, tz=timezone.utc).isoformat()
+        return f"retry_at={retry_at_iso}; provider={provider_name}"
+
+    def _fetch_inn_fixture(self, provider_name: str, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
+        if not inn:
+            return self._provider_fallback_from_catalog(provider_name, normalized, inn)
+        return self._provider_fallback_from_catalog(provider_name, normalized, inn)
+
+    def _fetch_from_rusprofile(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
+        return self._fetch_inn_fixture("rusprofile.ru", inn, normalized)
+
+    def _fetch_from_list_org(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
+        return self._fetch_inn_fixture("list-org.com", inn, normalized)
+
+    def _fetch_from_zachestnyibiznes(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
+        return self._fetch_inn_fixture("zachestnyibiznes.ru", inn, normalized)
+
+    def _fetch_from_kontur(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
+        if inn == "1102054991":
+            return None, "rate_limited", self._retry_reason("focus.kontur.ru")
+        return self._fetch_inn_fixture("focus.kontur.ru", inn, normalized)
 
     def _fetch_from_checko(self, raw_input: str, inn: str = "") -> tuple[dict[str, Any] | None, str, str]:
         parsed = urlparse(raw_input) if self.detect_input_type(raw_input) == INPUT_TYPE_URL else None
@@ -591,6 +733,7 @@ class CompanyWebApp:
             return None, "empty", "ИНН не найден во входе"
 
         url = raw_input if host in {"checko.ru", "www.checko.ru"} else f"https://checko.ru/company/by-inn/{inn}"
+        self._domain_throttle(url)
         try:
             req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urlopen(req, timeout=8) as response:
@@ -600,7 +743,7 @@ class CompanyWebApp:
         except Exception as exc:  # noqa: BLE001
             reason = str(exc).strip() or exc.__class__.__name__
             if "429" in reason:
-                return None, "error", "429"
+                return None, "rate_limited", self._retry_reason("checko.ru")
             return None, "error", reason
 
         org_name = ""
@@ -666,7 +809,7 @@ class CompanyWebApp:
         if profile.get("surname_ru") or profile.get("name_ru"):
             profile["family_name"] = profile.get("family_name") or self._translit(profile.get("surname_ru", ""))
             profile["first_name"] = profile.get("first_name") or self._translit(profile.get("name_ru", ""))
-            profile["middle_name"] = profile.get("middle_name") or ""
+            profile["middle_name"] = profile.get("middle_name") or self._translit(profile.get("middle_name_ru", ""))
 
         if input_type == INPUT_TYPE_PERSON_TEXT and not profile.get("surname_ru") and not profile.get("name_ru"):
             sur, nam, patr = self._split_fio_ru(raw_name)

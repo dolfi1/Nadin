@@ -218,7 +218,7 @@ def test_input_routing_does_not_fill_fio_for_org_or_inn(tmp_path):
     assert "<td>Имя</td><td></td>" in org_review
     assert "<td>Отчество</td><td></td>" in org_review
 
-    _, _, inn_review = call_app(app, "POST", "/autofill/review", form={"company_name": "1102054991"})
+    _, _, inn_review = call_app(app, "POST", "/autofill/review", form={"company_name": "1234567890"})
     assert "Тип ввода: INN" in inn_review
     assert "<td>Фамилия</td><td></td>" in inn_review
     assert "<td>Имя</td><td></td>" in inn_review
@@ -257,16 +257,16 @@ def test_multisource_fallback_skips_checko_429_and_keeps_fns_data(monkeypatch, t
     status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "7707083893"})
     assert status.startswith("200")
     assert "Источник: ФНС ЕГРЮЛ — provider_called_ok" in review
-    assert "Источник: checko.ru — provider_error (429)" in review
+    assert "Источник: checko.ru — rate_limited" in review
     assert "<td>Организация</td><td>Сбербанк ПАО</td>" in review
 
 def test_inn_input_keeps_name_and_org_empty_without_source_data(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
-    _, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "1102054991"})
+    _, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "1234567890"})
     assert "Тип ввода: INN" in review
-    assert "Ключ поиска провайдеров: inn:1102054991" in review
-    assert "<td>ИНН</td><td>1102054991</td><td>Ввод пользователя/ФНС</td><td>Заполнено</td>" in review
+    assert "Ключ поиска провайдеров: inn:1234567890" in review
+    assert "<td>ИНН</td><td>1234567890</td><td>Ввод пользователя/ФНС</td><td>Заполнено</td>" in review
     assert "<td>Организация</td><td></td><td>—</td><td>Нужно заполнить</td>" in review
     assert "<td>Organization</td><td></td><td>—</td><td>Нужно заполнить</td>" in review
     assert "<td>Family name</td><td></td>" in review
@@ -282,7 +282,7 @@ def test_negative_cache_reporting_and_retry_controls(monkeypatch, tmp_path):
     monkeypatch.setattr(web_app, "urlopen", fake_urlopen)
 
     _, _, first_review = call_app(app, "POST", "/autofill/review", form={"company_name": "1102054991"})
-    assert "provider_error (429)" in first_review
+    assert "rate_limited" in first_review
     assert "Повторить без кэша" in first_review
     assert "Сбросить кэш по ИНН" in first_review
 
@@ -295,7 +295,7 @@ def test_negative_cache_reporting_and_retry_controls(monkeypatch, tmp_path):
         "/autofill/review",
         form={"company_name": "1102054991", "no_cache": "1"},
     )
-    assert "provider_error (429)" in no_cache_review
+    assert "rate_limited" in no_cache_review
 
     _, _, reset_review = call_app(
         app,
@@ -304,3 +304,44 @@ def test_negative_cache_reporting_and_retry_controls(monkeypatch, tmp_path):
         form={"company_name": "1102054991", "reset_inn_cache": "1"},
     )
     assert "Кэш по ИНН очищен:" in reset_review
+
+
+def test_inn_1102054991_builds_expected_profile_and_trace(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "1102054991"})
+    assert status.startswith("200")
+    assert "<td>Обращение</td><td>Г-н</td>" in review
+    assert "<td>Family name</td><td>Ishmurzin</td>" in review
+    assert "<td>First name</td><td>Airat</td>" in review
+    assert "<td>Middle name</td><td>Vilsurovich</td>" in review
+    assert "<td>Фамилия</td><td>Ишмурзин</td>" in review
+    assert "<td>Имя</td><td>Айрат</td>" in review
+    assert "<td>Отчество</td><td>Вильсурович</td>" in review
+    assert "<td>Пол</td><td>М</td>" in review
+    assert "<td>Организация</td><td>Газпром Переработка ООО</td>" in review
+    assert "<td>Organization</td><td>Gazprom Pererabotka LLC</td>" in review
+    assert "<td>Должность</td><td>Генеральный директор</td>" in review
+    assert "<td>Position</td><td>General Director</td>" in review
+    assert "Trace в UI: ФНС ЕГРЮЛ (ok) → rusprofile.ru (ok) → list-org.com (ok)" in review
+
+
+def test_positive_cache_hit_is_used_for_second_inn_request(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    _, _, first_review = call_app(app, "POST", "/autofill/review", form={"company_name": "1102054991"})
+    assert "Источник: ФНС ЕГРЮЛ — provider_called_ok" in first_review
+
+    _, _, second_review = call_app(app, "POST", "/autofill/review", form={"company_name": "1102054991"})
+    assert "Источник: ФНС ЕГРЮЛ — provider_cached_hit" in second_review
+
+
+def test_five_inn_inputs_return_review_without_errors(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    inns = ["1102054991", "7707083893", "7810783119", "7702070139", "7736050003"]
+
+    for inn in inns:
+        status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": inn})
+        assert status.startswith("200")
+        assert "Internal error" not in review
+        assert f"Ключ поиска провайдеров: inn:{inn}" in review
