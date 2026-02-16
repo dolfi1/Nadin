@@ -205,7 +205,7 @@ def test_checko_inn_lookup_uses_external_source(monkeypatch, tmp_path):
     )
     assert status.startswith("200")
     assert "Выделен ID checko: 1071102001651" in review
-    assert "checko.ru: OK" in review
+    assert "Источник: checko.ru — OK" in review
     assert "<td>Источник</td><td>checko.ru</td>" not in review
 
 
@@ -244,4 +244,18 @@ def test_search_trace_has_no_internal_db_iterations(tmp_path):
 
     _, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "Газпром"})
     assert "Проверка источников по записи" not in review
-    assert "Каталог источников: не получено" in review
+    assert "Источники: не получено (в источниках нет данных по запросу)" in review
+
+def test_multisource_fallback_skips_checko_429_and_keeps_fns_data(monkeypatch, tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_urlopen(*_args, **_kwargs):
+        raise RuntimeError("HTTP Error 429: Too Many Requests")
+
+    monkeypatch.setattr(web_app, "urlopen", fake_urlopen)
+
+    status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "7707083893"})
+    assert status.startswith("200")
+    assert "Источник: ФНС ЕГРЮЛ — OK" in review
+    assert "Источник: checko.ru — 429 (пропущен)" in review
+    assert "<td>Организация</td><td>Сбербанк ПАО</td>" in review
