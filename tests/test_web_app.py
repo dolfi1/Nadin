@@ -121,7 +121,7 @@ def test_build_person_candidates_groups_fio_and_org(tmp_path):
         {"source": "list-org.com", "data": {"surname_ru": "Греф", "name_ru": "Владимир", "middle_name_ru": "Иванович", "ru_org": "КХ \"Греф\""}},
     ]
 
-    candidates = app._build_person_candidates(hits)
+    candidates = app._build_person_candidates(hits, "Греф")
 
     assert len(candidates) == 2
     assert any(c["fio_ru"] == "Греф Герман Оскарович" and c["org_ru"] == "ПАО Сбербанк" for c in candidates)
@@ -170,3 +170,71 @@ def test_search_page_shows_external_candidate_for_inn(tmp_path, monkeypatch):
     assert status == "200 OK"
     assert "Автозаполнить" in body
     assert "Сбербанк" in body
+
+
+def test_score_hit_boosts_exact_fio_brand_and_inn(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    hit = {
+        "source": "ФНС ЕГРЮЛ",
+        "data": {
+            "surname_ru": "Греф",
+            "name_ru": "Герман",
+            "middle_name_ru": "Оскарович",
+            "ru_org": "ПАО Сбербанк",
+            "ru_position": "Президент, Председатель правления",
+            "inn": "7707083893",
+            "revenue": 1200000,
+        },
+    }
+    score = app._score_hit(hit, "7707083893")
+    assert score >= 180
+
+
+def test_german_gref_prioritizes_sber(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    hits = [
+        {
+            "source": "list-org.com",
+            "data": {
+                "surname_ru": "Греф",
+                "name_ru": "Герман",
+                "middle_name_ru": "Оскарович",
+                "ru_org": "КФХ Греф",
+                "ru_position": "Директор",
+                "revenue": 500,
+            },
+        },
+        {
+            "source": "rusprofile.ru",
+            "data": {
+                "surname_ru": "Греф",
+                "name_ru": "Герман",
+                "middle_name_ru": "Оскарович",
+                "ru_org": "ПАО Сбербанк",
+                "ru_position": "Президент, Председатель правления",
+                "inn": "7707083893",
+                "revenue": 2000000,
+            },
+        },
+    ]
+
+    candidates = app._build_person_candidates(hits, "Герман Греф")
+    assert candidates[0]["fio_ru"] == "Греф Герман Оскарович"
+    assert candidates[0]["org_ru"] == "ПАО Сбербанк"
+
+
+def test_person_search_cache_key_is_lowercase(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    calls = {"count": 0}
+
+    def fake_call_provider(provider, raw, input_type):
+        calls["count"] += 1
+        return {"url": "http://example", "ru_org": "org"}
+
+    monkeypatch.setattr(app, "_call_provider", fake_call_provider)
+
+    app._search_external_sources("Греф", no_cache=False)
+    app._search_external_sources("греф", no_cache=False)
+
+    expected = sum(1 for provider in app._provider_chain(web_app.INPUT_TYPE_PERSON_TEXT, "Греф") if app._should_call_provider(provider, web_app.INPUT_TYPE_PERSON_TEXT))
+    assert calls["count"] == expected
