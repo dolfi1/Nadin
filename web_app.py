@@ -88,10 +88,10 @@ def is_person_query(raw: str) -> bool:
     value = raw.strip().lower()
     if re.fullmatch(r"\d{12}", value):
         return True
+    if re.match(r"^[а-яёa-z\s-]{3,}$", value) and not re.search(r"\d", value):
+        return True
     if "http" in value:
         return "/person/" in value or "/ip/" in value
-    if re.match(r"^[а-яёa-z\s-]+$", value):
-        return len(value.split()) >= 1
     return False
 
 
@@ -616,7 +616,11 @@ class CompanyWebApp:
             if cached:
                 return provider["name"], list(cached), "provider_cached_hit"
 
-            data = self._call_provider(provider, raw, input_type)
+            try:
+                data = self._call_provider(provider, raw, input_type)
+            except (requests.Timeout, TimeoutError) as exc:
+                logger.warning("Provider %s timeout for %s: %s", provider.get("name"), raw, exc)
+                return provider["name"], [], "provider_timeout_skipped"
             provider_hits: list[dict[str, Any]] = []
             if isinstance(data, list):
                 provider_hits = [
@@ -669,9 +673,9 @@ class CompanyWebApp:
             time.sleep(wait_for)
         self._domain_last_call[host] = time.time()
 
-    def _request(self, url: str) -> requests.Response:
+    def _request(self, url: str, timeout: int = 10) -> requests.Response:
         self._domain_throttle(url)
-        return requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        return requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
 
     def _parse_egrul(self, query: str) -> dict[str, Any] | None:
         if not re.fullmatch(r"\d{10,12}", query):
@@ -741,36 +745,90 @@ class CompanyWebApp:
             logger.error("EGRUL parse failed for %s: %s", query, exc)
             return None
 
-    def _parse_list_org(self, query: str) -> list[dict[str, Any]] | dict[str, Any] | None:
-        input_type = self.detect_input_type(query)
-        if input_type == INPUT_TYPE_PERSON_TEXT:
-            search_url = f"https://www.list-org.com/search?val={quote(query)}&type=man"
-            search_resp = self._request(search_url)
+    def _search_list_org(self, query: str, is_person: bool = False) -> list[dict[str, str]]:
+        type_param = "boss" if is_person else "all"
+        search_key = "name" if is_person else "val"
+        search_url = f"https://www.list-org.com/search?type={type_param}&{search_key}={quote(query)}"
+        logger.info("list-org search: %s", search_url)
+        try:
+            search_resp = self._request(search_url, timeout=30)
             if not search_resp.ok:
                 return []
             soup = BeautifulSoup(search_resp.text, "lxml")
-            hits: list[dict[str, Any]] = []
-            for person_link in soup.find_all("a", href=re.compile(r"/man/\d+")):
-                if not isinstance(person_link, Tag):
+            hits: list[dict[str, str]] = []
+            for row in soup.select("table tr"):
+                cells = row.select("td")
+                if len(cells) < 2:
                     continue
-                person_url = "https://www.list-org.com" + str(person_link.get("href", ""))
-                detail = self._request(person_url)
+                name = self._normalize_spaces(cells[0].get_text(" ", strip=True))
+                inn = self._normalize_spaces(cells[1].get_text(" ", strip=True))
+                org_link = cells[2].select_one("a") if len(cells) > 2 else None
+                org = self._normalize_spaces(org_link.get_text(" ", strip=True) if isinstance(org_link, Tag) else "")
+                href = str(org_link.get("href", "")) if isinstance(org_link, Tag) else ""
+                full_url = f"https://www.list-org.com{href}" if href.startswith("/") else href
+                if name or inn or full_url:
+                    hits.append({
+                        "source": "list-org.com",
+                        "name": name,
+                        "inn": inn,
+                        "org": org,
+                        "url": full_url,
+                    })
+            if hits:
+                return hits[:10]
+
+            selector = r"/man/\d+" if is_person else r"/company/\d+"
+            for link in soup.find_all("a", href=re.compile(selector)):
+                if not isinstance(link, Tag):
+                    continue
+                href = str(link.get("href", ""))
+                if not href:
+                    continue
+                full_url = f"https://www.list-org.com{href}" if href.startswith("/") else href
+                hits.append({
+                    "source": "list-org.com",
+                    "name": self._normalize_spaces(link.get_text(" ", strip=True)),
+                    "inn": "",
+                    "org": "",
+                    "url": full_url,
+                })
+                if len(hits) >= 10:
+                    break
+            return hits
+        except Exception as exc:  # noqa: BLE001
+            logger.error("list-org search error: %s", exc)
+            return []
+
+    def _parse_list_org(self, query: str) -> list[dict[str, Any]] | dict[str, Any] | None:
+        input_type = self.detect_input_type(query)
+        if input_type == INPUT_TYPE_PERSON_TEXT:
+            hits: list[dict[str, Any]] = []
+            for item in self._search_list_org(query, is_person=True):
+                person_url = item.get("url", "")
+                if not person_url:
+                    continue
+                try:
+                    detail = self._request(person_url, timeout=30)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("list-org person fetch timeout/failed: %s", exc)
+                    continue
                 if not detail.ok:
                     continue
                 detail_soup = BeautifulSoup(detail.text, "lxml")
                 text = detail_soup.get_text(" ", strip=True)
-                fio = person_link.get_text(" ", strip=True) or ""
+                fio = item.get("name", "")
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio)
-                org_match = re.search(r"(ПАО|АО|ООО|ИП|КХ|СПК|ЗАО)\s*[«\"]?[^,.]+", text)
+                org_match = re.search(r'(ПАО|АО|ООО|ИП|КХ|СПК|ЗАО)\s*[«"]?[^,.]+', text)
                 position_match = re.search(r"(Президент|Генеральный директор|Директор|Председатель)[^,.]*", text, flags=re.IGNORECASE)
                 hits.append({
                     "url": person_url,
-                    "ru_org": self._clean_ru_org_name(org_match.group(0) if org_match else ""),
+                    "ru_org": self._clean_ru_org_name(item.get("org") or (org_match.group(0) if org_match else "")),
                     "surname_ru": surname_ru,
                     "name_ru": name_ru,
                     "middle_name_ru": middle_name_ru,
+                    "gender": normalize_gender(middle_name_ru),
                     "ru_position": position_match.group(0).strip() if position_match else "",
-                    "inn": self._extract_inn(text),
+                    "inn": self._extract_inn(item.get("inn", "") or text),
                     "revenue": self._extract_revenue_from_soup(detail_soup),
                 })
                 if len(hits) >= 5:
@@ -778,7 +836,7 @@ class CompanyWebApp:
             return hits
 
         search_url = f"https://www.list-org.com/search?val={quote(query)}"
-        search_resp = self._request(search_url)
+        search_resp = self._request(search_url, timeout=30)
         if not search_resp.ok:
             return None
         soup = BeautifulSoup(search_resp.text, "lxml")
@@ -786,7 +844,7 @@ class CompanyWebApp:
         if not isinstance(company_link, Tag):
             return None
         company_url = "https://www.list-org.com" + str(company_link.get("href", ""))
-        detail = self._request(company_url)
+        detail = self._request(company_url, timeout=30)
         if not detail.ok:
             return None
         detail_soup = BeautifulSoup(detail.text, "lxml")
@@ -813,56 +871,71 @@ class CompanyWebApp:
         url = f"https://www.rusprofile.ru/search?query={quote(query)}"
         logger.info("rusprofile search: %s", url)
         try:
-            search_resp = self._request(url)
+            search_resp = self._request(url, timeout=30)
             if not search_resp.ok:
                 return []
             soup = BeautifulSoup(search_resp.text, "lxml")
             hits: list[dict[str, str]] = []
             seen_urls: set[str] = set()
-            for card in soup.select(".search-result__item"):
-                link_tag = card.select_one("a.search-result__title-link")
-                if not isinstance(link_tag, Tag):
-                    continue
-                link = str(link_tag.get("href", ""))
-                if not link:
-                    continue
-                if is_person and "/person/" not in link and "/ip/" not in link:
-                    continue
-                full_url = link if link.startswith("http") else f"https://www.rusprofile.ru{link}"
-                if full_url in seen_urls:
-                    continue
-                seen_urls.add(full_url)
-                inn_tag = card.select_one(".search-result__inn")
-                subtitle_tag = card.select_one(".search-result__subtitle")
-                snippet_tag = card.select_one(".search-result__snippet")
-                desc = self._normalize_spaces(snippet_tag.get_text(" ", strip=True) if isinstance(snippet_tag, Tag) else "")
-                position = ""
-                if "руководитель" in desc.lower() or "председатель" in desc.lower():
-                    position = desc.split(".", 1)[0]
-                hits.append({
-                    "source": "rusprofile.ru",
-                    "name": self._normalize_spaces(link_tag.get_text(" ", strip=True)),
-                    "org": self._normalize_spaces(subtitle_tag.get_text(" ", strip=True) if isinstance(subtitle_tag, Tag) else ""),
-                    "position": self._normalize_spaces(position),
-                    "inn": self._normalize_spaces(inn_tag.get_text(" ", strip=True).replace("ИНН", "") if isinstance(inn_tag, Tag) else ""),
-                    "url": full_url,
-                    "type": "person" if "/person/" in link or "/ip/" in link else "company",
-                })
-            return [hit for hit in hits if hit["type"] == "person"][:10] if is_person else hits[:10]
+            for item in soup.select(".search-result__item"):
+                company_name = ""
+                company_link = item.select_one("a.search-result__title-link")
+                if isinstance(company_link, Tag):
+                    company_name = self._normalize_spaces(company_link.get_text(" ", strip=True))
+                    company_href = str(company_link.get("href", ""))
+                    company_url = company_href if company_href.startswith("http") else f"https://www.rusprofile.ru{company_href}"
+                    if company_url and company_url not in seen_urls:
+                        seen_urls.add(company_url)
+                        inn_tag = item.select_one(".search-result__inn")
+                        company_inn = self._normalize_spaces(inn_tag.get_text(" ", strip=True).replace("ИНН", "") if isinstance(inn_tag, Tag) else "")
+                        hits.append({
+                            "source": "rusprofile.ru",
+                            "name": company_name,
+                            "inn": company_inn,
+                            "url": company_url,
+                            "type": "company",
+                        })
+
+                for person_link in item.select("a[href^='/person/'], a[href^='/ip/']"):
+                    if not isinstance(person_link, Tag):
+                        continue
+                    href = str(person_link.get("href", ""))
+                    person_url = href if href.startswith("http") else f"https://www.rusprofile.ru{href}"
+                    if not person_url or person_url in seen_urls:
+                        continue
+                    seen_urls.add(person_url)
+                    snippet_tag = item.select_one(".search-result__snippet")
+                    snippet = self._normalize_spaces(snippet_tag.get_text(" ", strip=True) if isinstance(snippet_tag, Tag) else "")
+                    hits.append({
+                        "source": "rusprofile.ru",
+                        "name": self._normalize_spaces(person_link.get_text(" ", strip=True)),
+                        "org": company_name,
+                        "position": self._normalize_spaces(snippet.split(".", 1)[0]) if snippet else "",
+                        "url": person_url,
+                        "type": "person",
+                    })
+            return [h for h in hits if h.get("type") == "person"][:10] if is_person else hits[:10]
         except Exception as exc:  # noqa: BLE001
             logger.error("rusprofile search error: %s", exc)
             return []
 
     def _parse_rusprofile(self, query: str, input_type: str, is_person: bool = False) -> list[dict[str, Any]] | dict[str, Any] | None:
-        person_mode = is_person or input_type == INPUT_TYPE_PERSON_TEXT
+        person_mode = is_person or input_type == INPUT_TYPE_PERSON_TEXT or is_person_query(query)
         if input_type == INPUT_TYPE_URL and "rusprofile.ru" in query and ("/person/" in query or "/ip/" in query):
             person_mode = True
 
         if person_mode:
-            person_hits = self._search_rusprofile(query, is_person=True)
-            urls = [item["url"] for item in person_hits]
+            urls: list[str] = []
             if input_type == INPUT_TYPE_URL and "rusprofile.ru" in query:
-                urls = [query] + urls
+                urls.append(query)
+            elif input_type == INPUT_TYPE_INN and re.fullmatch(r"\d{12}", query):
+                for item in self._search_rusprofile(query, is_person=True):
+                    if item.get("url"):
+                        urls.append(item["url"])
+            else:
+                for item in self._search_rusprofile(query, is_person=True):
+                    if item.get("url"):
+                        urls.append(item["url"])
 
             hits: list[dict[str, Any]] = []
             seen_urls: set[str] = set()
@@ -870,32 +943,39 @@ class CompanyWebApp:
                 if detail_url in seen_urls:
                     continue
                 seen_urls.add(detail_url)
-                detail_resp = self._request(detail_url)
+                try:
+                    detail_resp = self._request(detail_url, timeout=30)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("rusprofile person fetch timeout/failed: %s", exc)
+                    continue
                 if not detail_resp.ok:
                     continue
                 d_soup = BeautifulSoup(detail_resp.text, "lxml")
                 full_name = self._normalize_spaces(d_soup.select_one("h1").get_text(" ", strip=True) if d_soup.select_one("h1") else "")
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(full_name)
-                text = d_soup.get_text(" ", strip=True)
+                page_text = d_soup.get_text(" ", strip=True)
+                inn_node = d_soup.select_one(".inn-value, [itemprop='inn']")
+                inn_raw = self._normalize_spaces(inn_node.get_text(" ", strip=True) if isinstance(inn_node, Tag) else "")
+                inn = self._extract_inn(inn_raw or page_text)
 
-                inn_node = d_soup.select_one(".inn-value")
-                inn_text = self._normalize_spaces(inn_node.get_text(" ", strip=True) if isinstance(inn_node, Tag) else "")
-                inn_match = re.search(r"ИНН\D{0,5}(\d{10,12})", text)
-                inn = inn_match.group(1) if inn_match else self._extract_inn(inn_text or text)
+                orgs: list[dict[str, str]] = []
+                for org_item in d_soup.select(".company-item"):
+                    org_name_tag = org_item.select_one(".company-name, a[href^='/id/'], a[href^='/company/']")
+                    pos_tag = org_item.select_one(".position")
+                    org_name = self._normalize_spaces(org_name_tag.get_text(" ", strip=True) if isinstance(org_name_tag, Tag) else "")
+                    position = self._normalize_spaces(pos_tag.get_text(" ", strip=True) if isinstance(pos_tag, Tag) else "")
+                    if org_name or position:
+                        orgs.append({"org": org_name, "position": position})
 
-                pos_node = d_soup.select_one(".position, .role")
-                ru_position = self._normalize_spaces(pos_node.get_text(" ", strip=True) if isinstance(pos_node, Tag) else "")
-                if not ru_position:
-                    pos_match = re.search(r"(Президент[^,.]*|Генеральный директор[^,.]*|Председатель[^,.]*)", text, flags=re.IGNORECASE)
-                    ru_position = self._normalize_spaces(pos_match.group(1)) if pos_match else ""
+                if not orgs:
+                    org_node = d_soup.select_one(".company-link, .company-name, .org, a[href^='/id/'], a[href^='/company/']")
+                    pos_node = d_soup.select_one(".position, .role")
+                    org_text = self._normalize_spaces(org_node.get_text(" ", strip=True) if isinstance(org_node, Tag) else "")
+                    ru_position = self._normalize_spaces(pos_node.get_text(" ", strip=True) if isinstance(pos_node, Tag) else "")
+                    orgs.append({"org": org_text, "position": ru_position})
 
-                org_node = d_soup.select_one(".company-link, .company-name, .org")
-                org_text = org_node.get_text(" ", strip=True) if isinstance(org_node, Tag) else ""
-                if not org_text:
-                    org_link = d_soup.find("a", href=re.compile(r"^/(id|company)/"))
-                    if isinstance(org_link, Tag):
-                        org_text = org_link.get_text(" ", strip=True)
-
+                revenue = self._extract_revenue_from_soup(d_soup)
+                primary_org = orgs[0] if orgs else {"org": "", "position": ""}
                 hits.append({
                     "url": detail_url,
                     "surname_ru": surname_ru,
@@ -903,9 +983,10 @@ class CompanyWebApp:
                     "middle_name_ru": middle_name_ru,
                     "gender": normalize_gender(middle_name_ru),
                     "inn": inn,
-                    "ru_position": ru_position,
-                    "ru_org": self._clean_ru_org_name(org_text),
-                    "revenue": self._extract_revenue_from_soup(d_soup),
+                    "ru_org": self._clean_ru_org_name(primary_org.get("org", "")),
+                    "ru_position": self._normalize_spaces(primary_org.get("position", "")),
+                    "revenue": revenue,
+                    "source": "rusprofile.ru",
                 })
             return hits
 
@@ -913,7 +994,7 @@ class CompanyWebApp:
             detail_url = query
         else:
             search_url = f"https://www.rusprofile.ru/search?query={quote(query)}"
-            search_resp = self._request(search_url)
+            search_resp = self._request(search_url, timeout=30)
             if not search_resp.ok:
                 return None
             soup = BeautifulSoup(search_resp.text, "lxml")
@@ -922,7 +1003,7 @@ class CompanyWebApp:
                 return None
             detail_url = "https://www.rusprofile.ru" + str(link.get("href", ""))
 
-        detail_resp = self._request(detail_url)
+        detail_resp = self._request(detail_url, timeout=30)
         if not detail_resp.ok:
             return None
         soup = BeautifulSoup(detail_resp.text, "lxml")
