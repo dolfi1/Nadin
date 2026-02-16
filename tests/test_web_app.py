@@ -236,7 +236,7 @@ def test_empty_title_status_is_not_filled(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
     _, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "ПАО Сбербанк"})
-    assert "<td>Титул</td><td></td><td>—</td><td>Нужно заполнить</td>" in review
+    assert "<td>Титул</td><td></td><td>—</td><td>—Нужно заполнить</td>" in review
 
 
 def test_search_trace_has_no_internal_db_iterations(tmp_path):
@@ -247,7 +247,7 @@ def test_search_trace_has_no_internal_db_iterations(tmp_path):
     assert "Fallback: Вставь выписку (regex-парсинг)" in review
     assert "Источники: не получено (в источниках нет данных по запросу)" in review
 
-def test_multisource_fallback_skips_checko_429_and_keeps_fns_data(monkeypatch, tmp_path):
+def test_multisource_fallback_marks_providers_rate_limited_on_429(monkeypatch, tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
     def fake_urlopen(*_args, **_kwargs):
@@ -257,9 +257,9 @@ def test_multisource_fallback_skips_checko_429_and_keeps_fns_data(monkeypatch, t
 
     status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "7707083893"})
     assert status.startswith("200")
-    assert "Источник: ФНС ЕГРЮЛ — provider_called_ok" in review
+    assert "Источник: ФНС ЕГРЮЛ — rate_limited (429)" in review
     assert "Источник: checko.ru — rate_limited" in review
-    assert "<td>Организация</td><td>Сбербанк ПАО</td>" in review
+    assert "<td>Организация</td><td></td><td>—</td><td>Нужно заполнить</td>" in review
 
 def test_inn_input_keeps_name_and_org_empty_without_source_data(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
@@ -383,3 +383,30 @@ def test_ten_inn_inputs_have_95_percent_or_better_source_hits(tmp_path):
             successful += 1
 
     assert successful / len(inns) >= 0.95
+
+def test_vtb_inn_etalon_render(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "7702070139"})
+    assert status.startswith("200")
+    assert "<td>Обращение</td><td>Г-н</td>" in review
+    assert "<td>Фамилия</td><td>Костин</td>" in review
+    assert "<td>Имя</td><td>Андрей</td>" in review
+    assert "<td>Отчество</td><td>Леонидович</td>" in review
+    assert "<td>Организация</td><td>Банк ВТБ ПАО</td>" in review
+    assert "<td>Organization</td><td>Vtb Bank PJSC</td>" in review
+    assert "<td>Position</td><td>President, Chairman Of The Board</td>" in review
+    assert "hits_by_provider:" in review
+
+
+def test_sber_inn_uses_fns_person_data_and_correct_salutation(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "7707083893"})
+    assert status.startswith("200")
+    assert "<td>Фамилия</td><td>Греф</td>" in review
+    assert "<td>Имя</td><td>Герман</td>" in review
+    assert "<td>Отчество</td><td>Оскарович</td>" in review
+    assert "<td>Пол</td><td>М</td>" in review
+    assert "<td>Обращение</td><td>Г-н</td>" in review
+    assert "<td>Организация</td><td>Сбербанк ПАО</td>" in review

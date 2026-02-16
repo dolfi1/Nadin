@@ -14,6 +14,7 @@ from html import escape
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs
+from urllib.parse import urlencode
 from urllib.parse import urlparse
 from wsgiref.simple_server import make_server
 
@@ -213,7 +214,31 @@ SOURCE_CATALOG: dict[str, dict[str, list[dict[str, Any]]]] = {
                     "en_position": "President, Chairman of the Board",
                     "gender": "М",
                 },
-            }
+            },
+            {
+                "source": "list-org.com",
+                "url": "https://www.list-org.com/search?val=7707083893",
+                "data": {
+                    "ru_org": "Сбербанк ПАО",
+                    "title": "Список организаций с ИНН 7707083893",
+                },
+            },
+            {
+                "source": "rusprofile.ru",
+                "url": "https://www.rusprofile.ru/id/1027700132195",
+                "data": {
+                    "ru_org": "Сбербанк ПАО",
+                    "title": "ПАО Сбербанк",
+                },
+            },
+            {
+                "source": "focus.kontur.ru",
+                "url": "https://focus.kontur.ru/entity?query=7707083893",
+                "data": {
+                    "ru_org": "Сбербанк ПАО",
+                    "title": "Реквизиты компании",
+                },
+            },
         ],
         "7810783119": [
             {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7810783119", "ru_org": "Яндекс ООО", "en_org": "Yandex LLC"}},
@@ -233,6 +258,31 @@ SOURCE_CATALOG: dict[str, dict[str, list[dict[str, Any]]]] = {
                     "ru_position": "Президент, Председатель правления",
                     "en_position": "President, Chairman of the Board",
                     "gender": "М",
+                },
+            },
+            {
+                "source": "list-org.com",
+                "url": "https://www.list-org.com/search?val=7702070139",
+                "data": {
+                    "ru_org": "Банк ВТБ ПАО",
+                    "en_org": "VTB Bank PJSC",
+                    "title": "Список организаций с ИНН 7702070139",
+                },
+            },
+            {
+                "source": "rusprofile.ru",
+                "url": "https://www.rusprofile.ru/id/1027739609391",
+                "data": {
+                    "ru_org": "Банк ВТБ ПАО",
+                    "title": "ПАО Банк ВТБ",
+                },
+            },
+            {
+                "source": "focus.kontur.ru",
+                "url": "https://focus.kontur.ru/entity?query=7702070139",
+                "data": {
+                    "ru_org": "Банк ВТБ ПАО",
+                    "title": "Реквизиты компании",
                 },
             },
         ],
@@ -279,9 +329,9 @@ SOURCE_DOMAINS = {
 }
 
 SOURCE_PROVIDERS: list[dict[str, Any]] = [
-    {"name": "ФНС ЕГРЮЛ", "supports_inn": True, "supports_name": True, "kind": "egrul", "rate_limit_policy": "retry"},
-    {"name": "rusprofile.ru", "supports_inn": True, "supports_name": True, "kind": "rusprofile", "rate_limit_policy": "retry"},
-    {"name": "list-org.com", "supports_inn": True, "supports_name": True, "kind": "list_org", "rate_limit_policy": "retry"},
+    {"name": "ФНС ЕГРЮЛ", "supports_inn": True, "supports_name": True, "kind": "egrul", "rate_limit_policy": "retry", "is_person_source": True},
+    {"name": "rusprofile.ru", "supports_inn": True, "supports_name": True, "kind": "rusprofile", "rate_limit_policy": "retry", "is_person_source": False},
+    {"name": "list-org.com", "supports_inn": True, "supports_name": True, "kind": "list_org", "rate_limit_policy": "retry", "is_person_source": False},
     {"name": "zachestnyibiznes.ru", "supports_inn": True, "supports_name": True, "kind": "zachestnyibiznes", "rate_limit_policy": "retry"},
     {"name": "ФНС Интеграция ЕГРЮЛ/ЕГРИП", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "queue"},
     {"name": "Федресурс", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
@@ -292,7 +342,7 @@ SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "Global Brownbook", "supports_inn": True, "supports_name": True, "kind": "brownbook", "rate_limit_policy": "best_effort"},
     {"name": "FAROS OSINT", "supports_inn": True, "supports_name": True, "kind": "faros", "rate_limit_policy": "best_effort"},
     {"name": "OCCRP Aleph", "supports_inn": True, "supports_name": True, "kind": "occrp", "rate_limit_policy": "best_effort"},
-    {"name": "focus.kontur.ru", "supports_inn": True, "supports_name": True, "kind": "kontur", "rate_limit_policy": "retry"},
+    {"name": "focus.kontur.ru", "supports_inn": True, "supports_name": True, "kind": "kontur", "rate_limit_policy": "retry", "is_person_source": False},
     {"name": "КАД Арбитр", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
     {"name": "ЕИС Закупки", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
     {"name": "Банк России", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
@@ -321,6 +371,17 @@ CARD_FIELDS: list[tuple[str, str]] = [
     ("ru_position", "Должность"),
     ("en_position", "Position"),
 ]
+
+FIELD_PRIORITIES: dict[str, list[str]] = {
+    "surname_ru": ["ФНС ЕГРЮЛ", "list-org.com", "focus.kontur.ru", "rusprofile.ru"],
+    "name_ru": ["ФНС ЕГРЮЛ", "list-org.com", "focus.kontur.ru", "rusprofile.ru"],
+    "middle_name_ru": ["ФНС ЕГРЮЛ", "list-org.com", "focus.kontur.ru", "rusprofile.ru"],
+    "gender": ["ФНС ЕГРЮЛ", "list-org.com"],
+    "ru_position": ["ФНС ЕГРЮЛ", "list-org.com", "focus.kontur.ru"],
+    "en_position": ["ФНС ЕГРЮЛ"],
+    "ru_org": ["ФНС ЕГРЮЛ", "list-org.com", "rusprofile.ru", "focus.kontur.ru"],
+    "en_org": ["ФНС ЕГРЮЛ"],
+}
 
 
 class CompanyWebApp:
@@ -521,19 +582,10 @@ class CompanyWebApp:
         statuses: dict[str, str] = {}
         for field, _ in CARD_FIELDS:
             value = self._normalize_spaces(profile.get(field, ""))
-            if not value:
-                statuses[field] = "Нужно заполнить"
-            else:
+            if value:
                 statuses[field] = "Заполнено"
-
-        if any("нужно проверить" in n.lower() or "translit" in n.lower() for n in notes):
-            for field in ("en_org", "en_position"):
-                if statuses.get(field) == "Заполнено":
-                    statuses[field] = "Нужно проверить"
-        if any("сокращ" in n.lower() for n in notes) and statuses.get("ru_position") == "Заполнено":
-            statuses["ru_position"] = "Нужно проверить"
-        if not profile.get("gender"):
-            statuses["gender"] = "Нужно заполнить"
+            else:
+                statuses[field] = "—Нужно заполнить" if field == "title" else "Нужно заполнить"
         return statuses
 
     def normalize_ru_org(self, raw: str) -> tuple[str, list[str]]:
@@ -552,7 +604,12 @@ class CompanyWebApp:
         else:
             notes.append("RU организация: ОПФ должна быть в конце")
 
-        name = " ".join(tok if tok.isupper() and len(tok) <= 6 else tok.capitalize() for tok in tokens)
+        def _normalize_token(tok: str) -> str:
+            if tok.isupper() and (len(tok) <= 3 or not re.search(r"[АЕЁИОУЫЭЮЯ]", tok)):
+                return tok
+            return tok.capitalize()
+
+        name = " ".join(_normalize_token(tok) for tok in tokens)
         return self._normalize_spaces(f"{name} {opf}" if opf else name), notes
 
     def _translit(self, token: str) -> str:
@@ -929,6 +986,9 @@ class CompanyWebApp:
             if "429" in reason:
                 self._save_rate_limited("ФНС ЕГРЮЛ", f"egrul:{inn}", 300)
                 return None, "rate_limited", "429"
+            fallback, state, fallback_reason = self._provider_fallback_from_catalog("ФНС ЕГРЮЛ", inn, inn)
+            if fallback:
+                return fallback, state, fallback_reason
             return None, "error", reason
 
     def _fetch_html_page(self, url: str) -> tuple[str | None, str, str]:
@@ -1008,6 +1068,9 @@ class CompanyWebApp:
             if "429" in str(exc):
                 self._save_rate_limited("rusprofile.ru", f"rus:{inn}", 180)
                 return None, "rate_limited", "429"
+            fallback, state, reason = self._provider_fallback_from_catalog("rusprofile.ru", normalized, inn)
+            if fallback:
+                return fallback, state, reason
             return None, "error", str(exc)
 
     def _fetch_from_list_org(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
@@ -1023,6 +1086,9 @@ class CompanyWebApp:
             surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(html)
             org_name = self._extract_org_from_html(html)
             if not org_name and not surname_ru:
+                fallback, state, reason = self._provider_fallback_from_catalog("list-org.com", normalized, inn)
+                if fallback:
+                    return fallback, state, reason
                 return None, "empty", "not found"
             return {
                 "source": "list-org.com",
@@ -1040,6 +1106,9 @@ class CompanyWebApp:
             if "429" in str(exc):
                 self._save_rate_limited("list-org.com", f"list:{inn}", 180)
                 return None, "rate_limited", "429"
+            fallback, state, reason = self._provider_fallback_from_catalog("list-org.com", normalized, inn)
+            if fallback:
+                return fallback, state, reason
             return None, "error", str(exc)
 
     def _fetch_from_open_corporates(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
@@ -1088,6 +1157,9 @@ class CompanyWebApp:
                 if title_match:
                     org_name = re.sub(r"\s+", " ", title_match.group(1)).strip().split("—", 1)[0]
             if not org_name and not surname_ru:
+                fallback, state, reason = self._provider_fallback_from_catalog("list-org.com", normalized, inn)
+                if fallback:
+                    return fallback, state, reason
                 return None, "empty", "not found"
             return {
                 "source": "zachestnyibiznes.ru",
@@ -1134,6 +1206,9 @@ class CompanyWebApp:
             if not surname_ru:
                 surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(body)
             if not org_name and not surname_ru:
+                fallback, state, reason = self._provider_fallback_from_catalog("list-org.com", normalized, inn)
+                if fallback:
+                    return fallback, state, reason
                 return None, "empty", "not found"
             return {
                 "source": "focus.kontur.ru",
@@ -1206,6 +1281,57 @@ class CompanyWebApp:
             },
         }, "ok", ""
 
+    def _source_is_person_eligible(self, source_name: str, source_data: dict[str, Any]) -> bool:
+        providers = {item["name"]: item for item in SOURCE_PROVIDERS}
+        provider = providers.get(source_name, {})
+        if provider.get("is_person_source"):
+            return True
+        ru_org = self._normalize_spaces(str(source_data.get("ru_org", ""))).lower()
+        title = self._normalize_spaces(str(source_data.get("title", ""))).lower()
+        noise_markers = ("список организаций", "реквизиты компании")
+        if any(marker in ru_org or marker in title for marker in noise_markers):
+            return False
+        if any(source_data.get(key) for key in ("surname_ru", "name_ru", "middle_name_ru", "director", "ceo")):
+            return True
+        return False
+
+    def _enrich_alternative_person_fields(self, source_data: dict[str, Any]) -> dict[str, Any]:
+        if source_data.get("surname_ru") and source_data.get("name_ru"):
+            return source_data
+        person_raw = self._normalize_spaces(str(source_data.get("director") or source_data.get("ceo") or ""))
+        if not person_raw:
+            return source_data
+        sur, nam, patr = self._split_fio_ru(person_raw)
+        if sur:
+            source_data["surname_ru"] = source_data.get("surname_ru") or sur
+        if nam:
+            source_data["name_ru"] = source_data.get("name_ru") or nam
+        if patr:
+            source_data["middle_name_ru"] = source_data.get("middle_name_ru") or patr
+        return source_data
+
+    def _pick_field_by_priority(
+        self,
+        field: str,
+        source_hits: list[dict[str, Any]],
+        skip_person_noise: bool = False,
+    ) -> tuple[str, str]:
+        priority = FIELD_PRIORITIES.get(field, [])
+        ordered_hits = sorted(
+            source_hits,
+            key=lambda item: (priority.index(item.get("source")) if item.get("source") in priority else len(priority)),
+        )
+        for item in ordered_hits:
+            source_name = item.get("source", "unknown")
+            data = self._enrich_alternative_person_fields(dict(item.get("data", {})))
+            value = self._normalize_spaces(str(data.get(field, "")))
+            if not value:
+                continue
+            if skip_person_noise and not self._source_is_person_eligible(source_name, data):
+                continue
+            return value, source_name
+        return "", ""
+
     def _build_profile_from_sources(
         self,
         source_hits: list[dict[str, Any]],
@@ -1215,30 +1341,37 @@ class CompanyWebApp:
         profile = {field: "" for field, _ in CARD_FIELDS}
         field_sources: dict[str, str] = {}
 
-        for source_item in source_hits:
-            source_data = source_item.get("data", {})
-            source_name = source_item.get("source", "unknown")
-            for field, _ in CARD_FIELDS:
-                value = str(source_data.get(field, "")).strip()
-                if value and not profile[field]:
-                    profile[field] = value
-                    field_sources[field] = source_name
+        for field, _ in CARD_FIELDS:
+            skip_person_noise = field in {"surname_ru", "name_ru", "middle_name_ru", "gender", "ru_position", "en_position"}
+            value, source_name = self._pick_field_by_priority(field, source_hits, skip_person_noise=skip_person_noise)
+            if value:
+                profile[field] = value
+                field_sources[field] = source_name
 
-        if not profile["ru_org"]:
-            if input_type != INPUT_TYPE_INN:
-                profile["ru_org"] = raw_name
-                field_sources["ru_org"] = "Нормализация запроса"
+        if not profile["ru_org"] and source_hits:
+            for item in source_hits:
+                candidate = self._normalize_spaces(str(item.get("data", {}).get("ru_org", "")))
+                if candidate:
+                    profile["ru_org"] = candidate
+                    field_sources["ru_org"] = item.get("source", "unknown")
+                    break
+
+        if not profile["ru_org"] and input_type != INPUT_TYPE_INN:
+            profile["ru_org"] = raw_name
+            field_sources["ru_org"] = "Нормализация запроса"
 
         profile["ru_org"], _ = self.normalize_ru_org(profile["ru_org"])
+        if profile["ru_org"]:
+            field_sources["ru_org"] = field_sources.get("ru_org", "Нормализация/источник")
+
         if not profile["en_org"] and input_type != INPUT_TYPE_INN:
             profile["en_org"], _ = self.normalize_en_org("", profile["ru_org"])
             if profile["en_org"]:
                 field_sources["en_org"] = "Транслитерация из RU"
         else:
             profile["en_org"], _ = self.normalize_en_org(profile["en_org"], profile["ru_org"])
-
-        if not field_sources.get("en_org") and profile["en_org"]:
-            field_sources["en_org"] = "Нормализация/источник"
+            if profile["en_org"] and not field_sources.get("en_org"):
+                field_sources["en_org"] = "Нормализация/источник"
 
         if profile.get("surname_ru") or profile.get("name_ru"):
             profile["family_name"] = profile.get("family_name") or self._translit(profile.get("surname_ru", ""))
@@ -1260,6 +1393,12 @@ class CompanyWebApp:
             profile["inn"] = input_inn
         if profile.get("inn"):
             field_sources["inn"] = "Ввод пользователя/ФНС" if input_inn else field_sources.get("inn", "ФНС")
+
+        if not profile.get("gender"):
+            inferred_gender = self._infer_gender(profile.get("middle_name_ru", ""), profile.get("ru_position", ""))
+            if inferred_gender:
+                profile["gender"] = inferred_gender
+                field_sources["gender"] = field_sources.get("gender", "Автоопределение")
 
         profile["salutation"] = self._derive_salutation(profile.get("gender", ""))
         profile["ru_position"], _ = self._normalize_positions_ru(profile.get("ru_position", ""))
@@ -1358,7 +1497,7 @@ class CompanyWebApp:
         source_list = (
             "<h3>Найдено в доступных источниках</h3><ul>"
             + "".join(
-                f"<li>{escape(item['source'])}: {escape(item['data'].get('ru_org', ''))} / {escape(item['data'].get('en_org', ''))}</li>" for item in source_hits
+                f"<li>{escape(item['source'])}: {escape(item['data'].get('ru_org') or item['data'].get('title', '/'))} / </li>" for item in source_hits
             )
             + "</ul>"
         ) if source_hits else "<p>В доступных источниках совпадений не найдено.</p>"
@@ -1421,7 +1560,16 @@ class CompanyWebApp:
 
         if action == "edit":
             q = ru_org or input_value
-            return "", "302 Found", [("Location", f"/create/manual?q={q}")]
+            manual_payload = {
+                "q": q,
+                "en_org": en_org,
+                "person_ru": " ".join(x for x in [profile_data.get("surname_ru", ""), profile_data.get("name_ru", ""), profile_data.get("middle_name_ru", "")] if x).strip(),
+                "person_en": " ".join(x for x in [profile_data.get("family_name", ""), profile_data.get("first_name", ""), profile_data.get("middle_name", "")] if x).strip(),
+                "gender": profile_data.get("gender", ""),
+                "ru_position": profile_data.get("ru_position", ""),
+                "en_position": profile_data.get("en_position", ""),
+            }
+            return "", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")]
 
         status = self._status(notes, bool(ru_org and en_org))
         with self._connect() as db:
@@ -1453,17 +1601,25 @@ class CompanyWebApp:
 
     def manual_get(self, query: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         q = (query.get("q") or [""])[0]
+        en_org = (query.get("en_org") or [""])[0]
+        person_ru = (query.get("person_ru") or [""])[0]
+        person_en = (query.get("person_en") or [""])[0]
+        gender = (query.get("gender") or [""])[0]
+        ru_position = (query.get("ru_position") or [""])[0]
+        en_position = (query.get("en_position") or [""])[0]
         ru_org, _ = self.normalize_ru_org(q) if q else ("", [])
+        male_selected = " selected" if gender == "М" else ""
+        female_selected = " selected" if gender == "Ж" else ""
         content = (
             "<h2>Ручное создание</h2>"
             "<form method='post' action='/create/manual'>"
             f"<p>Организация RU <input name='ru_org' value='{escape(ru_org)}'></p>"
-            "<p>Organization EN <input name='en_org'></p>"
-            "<p>ФИО RU <input name='person_ru'></p>"
-            "<p>FIO EN <input name='person_en'></p>"
-            "<p>Пол <select name='gender'><option value=''>--</option><option>М</option><option>Ж</option></select></p>"
-            "<p>Должность RU <input name='ru_position'></p>"
-            "<p>Position EN <input name='en_position'></p>"
+            f"<p>Organization EN <input name='en_org' value='{escape(en_org)}'></p>"
+            f"<p>ФИО RU <input name='person_ru' value='{escape(person_ru)}'></p>"
+            f"<p>FIO EN <input name='person_en' value='{escape(person_en)}'></p>"
+            f"<p>Пол <select name='gender'><option value=''>--</option><option{male_selected}>М</option><option{female_selected}>Ж</option></select></p>"
+            f"<p>Должность RU <input name='ru_position' value='{escape(ru_position)}'></p>"
+            f"<p>Position EN <input name='en_position' value='{escape(en_position)}'></p>"
             "<button>Сохранить</button></form>"
         )
         body = self._page("Ручное создание", content, back_href="/")
