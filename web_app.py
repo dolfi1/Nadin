@@ -5,6 +5,7 @@ import io
 import json
 import re
 import sqlite3
+import time
 import unicodedata
 from urllib.request import Request
 from urllib.request import urlopen
@@ -42,61 +43,90 @@ PASSPORT_MAP = {
     "Ч": "CH", "Ш": "SH", "Щ": "SHCH", "Ъ": "", "Ы": "Y", "Ь": "", "Э": "E", "Ю": "YU", "Я": "YA",
 }
 
-SOURCE_CATALOG: dict[str, list[dict[str, Any]]] = {
-    "СБЕРБАНК ПАО": [
-        {
-            "source": "ЕГРЮЛ",
-            "url": "https://egrul.nalog.ru/",
-            "data": {
-                "title": "",
-                "salutation": "Г-н",
-                "family_name": "Gref",
-                "first_name": "Herman",
-                "middle_name": "",
-                "surname_ru": "Греф",
-                "name_ru": "Герман",
-                "middle_name_ru": "Оскарович",
-                "gender": "М",
-                "ru_org": "Сбербанк ПАО",
-                "en_org": "Sberbank PJSC",
-                "ru_position": "Президент, Председатель правления",
-                "en_position": "President, Chairman of the Board",
+SOURCE_CATALOG: dict[str, dict[str, list[dict[str, Any]]]] = {
+    "name": {
+        "СБЕРБАНК ПАО": [
+            {
+                "source": "ФНС ЕГРЮЛ",
+                "url": "https://egrul.nalog.ru/",
+                "data": {
+                    "title": "",
+                    "salutation": "Г-н",
+                    "family_name": "Gref",
+                    "first_name": "Herman",
+                    "middle_name": "",
+                    "surname_ru": "Греф",
+                    "name_ru": "Герман",
+                    "middle_name_ru": "Оскарович",
+                    "gender": "М",
+                    "ru_org": "Сбербанк ПАО",
+                    "en_org": "Sberbank PJSC",
+                    "ru_position": "Президент, Председатель правления",
+                    "en_position": "President, Chairman of the Board",
+                    "inn": "7707083893",
+                    "ogrn": "1027700132195",
+                },
             },
-        },
-        {
-            "source": "СПАРК",
-            "url": "https://spark-interfax.ru/",
-            "data": {
-                "ru_org": "ПАО Сбербанк",
-                "en_org": "Sberbank PJSC",
-                "ru_position": "Президент, Председатель Правления",
-                "en_position": "President, Chairman of the Board",
+            {
+                "source": "Федресурс",
+                "url": "https://fedresurs.ru/",
+                "data": {"ru_org": "Сбербанк ПАО", "en_org": "Sberbank PJSC"},
             },
-        },
-    ],
-    "РОМАШКА ООО": [
-        {
-            "source": "Контур.Фокус",
-            "url": "https://focus.kontur.ru/",
-            "data": {"ru_org": "Ромашка ООО", "en_org": "Romashka LLC"},
-        },
-        {
-            "source": "Rusprofile",
-            "url": "https://www.rusprofile.ru/",
-            "data": {"ru_org": "ООО Ромашка", "en_org": "Romashka LLC"},
-        },
-    ],
+        ],
+        "РОМАШКА ООО": [
+            {
+                "source": "ФНС ЕГРЮЛ",
+                "url": "https://egrul.nalog.ru/",
+                "data": {"ru_org": "Ромашка ООО", "en_org": "Romashka LLC"},
+            }
+        ],
+        "GOOGLE LLC": [
+            {
+                "source": "OpenCorporates",
+                "url": "https://opencorporates.com/",
+                "data": {"ru_org": "Google LLC", "en_org": "Google LLC"},
+            }
+        ],
+    },
+    "inn": {
+        "7707083893": [
+            {
+                "source": "ФНС ЕГРЮЛ",
+                "url": "https://egrul.nalog.ru/",
+                "data": {
+                    "ru_org": "Сбербанк ПАО",
+                    "en_org": "Sberbank PJSC",
+                    "inn": "7707083893",
+                    "ogrn": "1027700132195",
+                    "surname_ru": "Греф",
+                    "name_ru": "Герман",
+                    "middle_name_ru": "Оскарович",
+                    "ru_position": "Президент, Председатель правления",
+                    "en_position": "President, Chairman of the Board",
+                    "gender": "М",
+                },
+            }
+        ]
+    },
 }
 
 SOURCE_DOMAINS = {
     "egrul.nalog.ru": "ЕГРЮЛ",
-    "spark-interfax.ru": "СПАРК",
-    "focus.kontur.ru": "Контур.Фокус",
-    "rusprofile.ru": "Rusprofile",
-    "www.rusprofile.ru": "Rusprofile",
     "checko.ru": "checko.ru",
     "www.checko.ru": "checko.ru",
 }
+
+SOURCE_PROVIDERS: list[dict[str, Any]] = [
+    {"name": "ФНС ЕГРЮЛ", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
+    {"name": "ФНС Интеграция ЕГРЮЛ/ЕГРИП", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "queue"},
+    {"name": "Федресурс", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
+    {"name": "КАД Арбитр", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
+    {"name": "ЕИС Закупки", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
+    {"name": "Банк России", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
+    {"name": "checko.ru", "supports_inn": True, "supports_name": True, "kind": "checko", "rate_limit_policy": "skip_on_429"},
+    {"name": "OpenCorporates", "supports_inn": False, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
+    {"name": "Wikidata", "supports_inn": False, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
+]
 
 INPUT_TYPE_INN = "INN"
 INPUT_TYPE_URL = "URL"
@@ -123,6 +153,8 @@ CARD_FIELDS: list[tuple[str, str]] = [
 class CompanyWebApp:
     def __init__(self, db_path: str = "cards.db") -> None:
         self.db_path = Path(db_path)
+        self._source_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._source_cache_ttl = 300
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -387,6 +419,99 @@ class CompanyWebApp:
             return "Нужно проверить"
         return "Найдено"
 
+    def _is_foreign_query(self, query: str) -> bool:
+        cleaned = self._normalize_spaces(query)
+        input_type = self.detect_input_type(cleaned)
+        if not cleaned or input_type in {INPUT_TYPE_INN, INPUT_TYPE_URL}:
+            return False
+        return bool(re.search(r"[A-Za-z]", cleaned)) and not self._contains_org_form(cleaned)
+
+    def _provider_chain(self, input_type: str, raw: str) -> list[dict[str, Any]]:
+        if self._is_foreign_query(raw):
+            names = {"OpenCorporates", "Wikidata"}
+        elif input_type == INPUT_TYPE_URL:
+            names = {"checko.ru", "ФНС ЕГРЮЛ", "Федресурс", "КАД Арбитр", "ЕИС Закупки"}
+        else:
+            names = {
+                "ФНС ЕГРЮЛ",
+                "ФНС Интеграция ЕГРЮЛ/ЕГРИП",
+                "Федресурс",
+                "КАД Арбитр",
+                "ЕИС Закупки",
+                "Банк России",
+                "checko.ru",
+            }
+        return [provider for provider in SOURCE_PROVIDERS if provider["name"] in names]
+
+    def _cached_lookup(self, provider_name: str, key: str) -> list[dict[str, Any]] | None:
+        cache_key = f"{provider_name}:{key}"
+        cached = self._source_cache.get(cache_key)
+        if not cached:
+            return None
+        ts, value = cached
+        if time.time() - ts > self._source_cache_ttl:
+            self._source_cache.pop(cache_key, None)
+            return None
+        return value
+
+    def _save_cached_lookup(self, provider_name: str, key: str, value: list[dict[str, Any]]) -> None:
+        cache_key = f"{provider_name}:{key}"
+        self._source_cache[cache_key] = (time.time(), value)
+
+    def _search_in_catalog(self, provider_name: str, normalized: str, inn: str) -> list[dict[str, Any]]:
+        if inn:
+            by_inn = SOURCE_CATALOG["inn"].get(inn, [])
+            hits = [item for item in by_inn if item.get("source") == provider_name]
+            if hits:
+                return hits
+
+        direct = SOURCE_CATALOG["name"].get(normalized.upper(), [])
+        found = [item for item in direct if item.get("source") == provider_name]
+        if found:
+            return found
+
+        token = normalized.split()[0].upper() if normalized else ""
+        if not token:
+            return []
+        aggregated: list[dict[str, Any]] = []
+        for org_name, records in SOURCE_CATALOG["name"].items():
+            if token in org_name:
+                aggregated.extend(item for item in records if item.get("source") == provider_name)
+        return aggregated
+
+    def _run_provider(
+        self,
+        provider: dict[str, Any],
+        raw_input: str,
+        normalized: str,
+        input_type: str,
+        inn: str,
+    ) -> tuple[list[dict[str, Any]], str]:
+        provider_name = provider["name"]
+        if input_type == INPUT_TYPE_INN and not provider["supports_inn"]:
+            return [], f"Источник: {provider_name} — пропущен (не поддерживает ИНН)"
+        if input_type != INPUT_TYPE_INN and not provider["supports_name"]:
+            return [], f"Источник: {provider_name} — пропущен (не поддерживает название)"
+
+        key = inn if inn else normalized.upper()
+        cached = self._cached_lookup(provider_name, key)
+        if cached is not None:
+            if cached:
+                return cached, f"Источник: {provider_name} — OK (cache)"
+            return [], f"Источник: {provider_name} — пусто (cache)"
+
+        if provider["kind"] == "checko":
+            checko_hit, checko_status = self._fetch_from_checko(raw_input, inn)
+            hits = [checko_hit] if checko_hit else []
+            self._save_cached_lookup(provider_name, key, hits)
+            return hits, f"Источник: {provider_name} — {checko_status}"
+
+        hits = self._search_in_catalog(provider_name, normalized, inn)
+        self._save_cached_lookup(provider_name, key, hits)
+        if hits:
+            return hits, f"Источник: {provider_name} — OK"
+        return [], f"Источник: {provider_name} — пусто"
+
     def _search_external_sources(self, company_name: str) -> tuple[list[dict[str, Any]], list[str]]:
         input_type = self.detect_input_type(company_name)
         inn = self._extract_inn(company_name)
@@ -401,57 +526,30 @@ class CompanyWebApp:
             trace.append(f"ИНН: {inn}")
         if company_id:
             trace.append(f"Выделен ID checko: {company_id}")
-
-        checko_hit, checko_status = self._fetch_from_checko(company_name, inn)
-        trace.append(checko_status)
-        if checko_hit:
-            return [checko_hit], trace
-
-        if input_type == INPUT_TYPE_URL:
-            netloc = urlparse(company_name).netloc.lower()
-            source_name = SOURCE_DOMAINS.get(netloc)
-            if source_name:
-                trace.append(f"{source_name}: OK (определён по URL)")
-                for records in SOURCE_CATALOG.values():
-                    matches = [record for record in records if record.get("source") == source_name]
-                    if matches:
-                        return matches, trace
-                trace.append(f"{source_name}: не получено (в источниках нет данных по запросу)")
-            else:
-                trace.append("URL-источник: не получено (домен не поддерживается)")
-
-        candidates = SOURCE_CATALOG.get(normalized.upper(), [])
-        if candidates:
-            trace.append("Каталог источников: OK")
-            return candidates, trace
-
-        token = normalized.split()[0].upper() if normalized else ""
-        if not token:
-            trace.append("Каталог источников: не получено (пустой ключ поиска)")
-            return [], trace
-
-        aggregated: list[dict[str, str]] = []
-        for org_name, records in SOURCE_CATALOG.items():
-            if token in org_name:
-                aggregated.extend(records)
-        if aggregated:
-            trace.append(f"Каталог источников: OK (найдено {len(aggregated)})")
-        else:
-            trace.append("Каталог источников: не получено (в источниках нет данных по запросу)")
-        return aggregated, trace
+        hits: list[dict[str, Any]] = []
+        providers = self._provider_chain(input_type, company_name)
+        trace.append(f"Провайдеров в очереди: {len(providers)}")
+        for provider in providers:
+            provider_hits, provider_status = self._run_provider(provider, company_name, normalized, input_type, inn)
+            trace.append(provider_status)
+            if provider_hits:
+                hits.extend(provider_hits)
+        if not hits:
+            trace.append("Источники: не получено (в источниках нет данных по запросу)")
+        return hits, trace
 
     def _fetch_from_checko(self, raw_input: str, inn: str = "") -> tuple[dict[str, Any] | None, str]:
         parsed = urlparse(raw_input) if self.detect_input_type(raw_input) == INPUT_TYPE_URL else None
         host = (parsed.netloc.lower() if parsed else "")
 
         if host and host not in {"checko.ru", "www.checko.ru"}:
-            return None, "checko.ru: не получено (домен не checko.ru)"
+            return None, "пропущен (домен не checko.ru)"
         if not inn and host:
             path_match = re.search(r"-(\d{10}|\d{12})/?$", parsed.path)
             if path_match:
                 inn = path_match.group(1)
-        if not inn:
-            return None, "checko.ru: не получено (ИНН не найден во входе)"
+        if not inn and not host:
+            return None, "пропущен (ИНН не найден во входе)"
 
         url = raw_input if host in {"checko.ru", "www.checko.ru"} else f"https://checko.ru/company/by-inn/{inn}"
         try:
@@ -459,10 +557,12 @@ class CompanyWebApp:
             with urlopen(req, timeout=8) as response:
                 html = response.read().decode("utf-8", errors="ignore")
         except TimeoutError:
-            return None, "checko.ru: не получено (timeout)"
+            return None, "ошибка timeout"
         except Exception as exc:  # noqa: BLE001
             reason = str(exc).strip() or exc.__class__.__name__
-            return None, f"checko.ru: не получено ({reason})"
+            if "429" in reason:
+                return None, "429 (пропущен)"
+            return None, f"ошибка ({reason})"
 
         org_name = ""
         title_match = re.search(r"<title>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
@@ -477,7 +577,7 @@ class CompanyWebApp:
                 org_name = re.sub(r"<[^>]+>", "", h1_match.group(1)).strip()
 
         if not org_name:
-            return None, "checko.ru: не получено (parse error)"
+            return None, "пусто (parse error)"
 
         ru_org, _ = self.normalize_ru_org(org_name)
         en_org, _ = self.normalize_en_org("", ru_org)
@@ -488,7 +588,7 @@ class CompanyWebApp:
                 "ru_org": ru_org,
                 "en_org": en_org,
             },
-        }, "checko.ru: OK"
+        }, "OK"
 
     def _build_profile_from_sources(
         self,
@@ -664,7 +764,7 @@ class CompanyWebApp:
         notes = form.get("notes", [])
         source_names = form.get("source_name", [])
         search_trace = form.get("search_trace", [])
-        field_sources = {
+        field_provenance = {
             key.removeprefix("field_source_"): self._get_one(form, key)
             for key in form
             if key.startswith("field_source_") and self._get_one(form, key)
@@ -702,7 +802,7 @@ class CompanyWebApp:
                             "notes": notes,
                             "source_hits": source_names,
                             "search_trace": search_trace,
-                            "field_sources": field_sources,
+                            "field_provenance": field_provenance,
                             "profile": profile_data,
                         },
                         ensure_ascii=False,
@@ -842,7 +942,7 @@ class CompanyWebApp:
 
         payload = json.loads(card["data_json"] or "{}")
         profile = payload.get("profile", {})
-        field_sources = payload.get("field_sources", {})
+        field_sources = payload.get("field_provenance", payload.get("field_sources", {}))
         if not profile:
             profile = {field: "" for field, _ in CARD_FIELDS}
             profile["ru_org"] = card["ru_org"]
