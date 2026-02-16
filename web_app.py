@@ -39,6 +39,17 @@ PASSPORT_MAP = {
     "Ч": "CH", "Ш": "SH", "Щ": "SHCH", "Ъ": "", "Ы": "Y", "Ь": "", "Э": "E", "Ю": "YU", "Я": "YA",
 }
 
+SOURCE_CATALOG: dict[str, list[dict[str, str]]] = {
+    "СБЕРБАНК ПАО": [
+        {"source": "ЕГРЮЛ", "ru_org": "Сбербанк ПАО", "en_org": "Sberbank PJSC"},
+        {"source": "СПАРК", "ru_org": "ПАО Сбербанк", "en_org": "Sberbank PJSC"},
+    ],
+    "РОМАШКА ООО": [
+        {"source": "Контур.Фокус", "ru_org": "Ромашка ООО", "en_org": "Romashka LLC"},
+        {"source": "Rusprofile", "ru_org": "ООО Ромашка", "en_org": "Romashka LLC"},
+    ],
+}
+
 
 class CompanyWebApp:
     def __init__(self, db_path: str = "cards.db") -> None:
@@ -96,6 +107,12 @@ class CompanyWebApp:
             elif re.fullmatch(r"/card/\d+", path) and method == "GET":
                 card_id = int(path.split("/")[-1])
                 body, status, headers = self.card_view(card_id)
+            elif re.fullmatch(r"/card/\d+/edit", path) and method == "GET":
+                card_id = int(path.split("/")[-2])
+                body, status, headers = self.card_edit_get(card_id)
+            elif re.fullmatch(r"/card/\d+/edit", path) and method == "POST":
+                card_id = int(path.split("/")[-2])
+                body, status, headers = self.card_edit_post(card_id, form)
             elif re.fullmatch(r"/card/\d+/export.csv", path) and method == "GET":
                 card_id = int(path.split("/")[-2])
                 body, status, headers = self.export_csv(card_id)
@@ -194,6 +211,22 @@ class CompanyWebApp:
             return "Нужно проверить"
         return "Найдено"
 
+    def _search_external_sources(self, company_name: str) -> list[dict[str, str]]:
+        normalized, _ = self.normalize_ru_org(company_name)
+        candidates = SOURCE_CATALOG.get(normalized.upper(), [])
+        if candidates:
+            return candidates
+
+        token = normalized.split()[0].upper() if normalized else ""
+        if not token:
+            return []
+
+        aggregated: list[dict[str, str]] = []
+        for org_name, records in SOURCE_CATALOG.items():
+            if token in org_name:
+                aggregated.extend(records)
+        return aggregated
+
     def _write_audit(self, action: str, card_id: int | None, details: dict[str, Any]) -> None:
         with self._connect() as db:
             db.execute(
@@ -239,16 +272,37 @@ class CompanyWebApp:
 
     def autofill_review(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         raw = self._get_one(form, "company_name")
-        ru_org, ru_notes = self.normalize_ru_org(raw)
-        en_org, en_notes = self.normalize_en_org("", ru_org)
+        source_hits = self._search_external_sources(raw)
+        best = source_hits[0] if source_hits else None
+        ru_seed = best["ru_org"] if best else raw
+        en_seed = best["en_org"] if best else ""
+
+        ru_org, ru_notes = self.normalize_ru_org(ru_seed)
+        en_org, en_notes = self.normalize_en_org(en_seed, ru_org)
         notes = ru_notes + en_notes
+        if source_hits:
+            notes.append(f"Источники: найдено {len(source_hits)}")
+        else:
+            notes.append("Источники: совпадения не найдены, использована нормализация")
+
+        source_hidden = "".join(
+            f"<input type='hidden' name='source_name' value='{escape(item['source'])}'/>" for item in source_hits
+        )
         hidden = "".join(f"<input type='hidden' name='notes' value='{escape(n)}'/>" for n in notes)
+        source_list = (
+            "<h3>Найдено в доступных источниках</h3><ul>"
+            + "".join(
+                f"<li>{escape(item['source'])}: {escape(item['ru_org'])} / {escape(item['en_org'])}</li>" for item in source_hits
+            )
+            + "</ul>"
+        ) if source_hits else "<p>В доступных источниках совпадений не найдено.</p>"
         content = (
             "<h2>Автосбор: черновик</h2>"
+            f"{source_list}"
             "<form method='post' action='/autofill/confirm'>"
             f"<p>RU: <input name='ru_org' value='{escape(ru_org)}'/></p>"
             f"<p>EN: <input name='en_org' value='{escape(en_org)}'/></p>"
-            f"{hidden}"
+            f"{hidden}{source_hidden}"
             "<button>Подтвердить и сохранить</button></form>"
         )
         body = self._page("Автосбор: черновик", content, back_href="/")
@@ -258,11 +312,20 @@ class CompanyWebApp:
         ru_org = self._get_one(form, "ru_org")
         en_org = self._get_one(form, "en_org")
         notes = form.get("notes", [])
+        source_names = form.get("source_name", [])
         status = self._status(notes, bool(ru_org and en_org))
         with self._connect() as db:
             cur = db.execute(
                 "INSERT INTO cards(ru_org,en_org,status,source,created_at,updated_at,data_json) VALUES(?,?,?,?,?,?,?)",
-                (ru_org, en_org, status, "autofill", self._now(), self._now(), json.dumps({"notes": notes}, ensure_ascii=False)),
+                (
+                    ru_org,
+                    en_org,
+                    status,
+                    "autofill",
+                    self._now(),
+                    self._now(),
+                    json.dumps({"notes": notes, "source_hits": source_names}, ensure_ascii=False),
+                ),
             )
             card_id = cur.lastrowid
             db.commit()
@@ -333,11 +396,51 @@ class CompanyWebApp:
             f"<p>Organization EN: {escape(card['en_org'])}</p>"
             f"<p>Статус: {escape(card['status'])}</p>"
             f"<p>Источник: {escape(card['source'])}</p>"
+            f"<p><a href='/card/{card['id']}/edit'>Редактировать карточку</a></p>"
             f"<a href='/card/{card['id']}/export'>Показать данные карточки на сайте</a>"
             "<h3>Audit log</h3><ul>" + entries + "</ul>"
         )
         body = self._page(f"Карточка #{card['id']}", content, back_href="/")
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
+
+    def card_edit_get(self, card_id: int) -> tuple[str, str, list[tuple[str, str]]]:
+        with self._connect() as db:
+            card = db.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
+        if not card:
+            return "Not found", "404 Not Found", [("Content-Type", "text/plain; charset=utf-8")]
+
+        content = (
+            f"<h2>Редактирование карточки #{card['id']}</h2>"
+            f"<form method='post' action='/card/{card['id']}/edit'>"
+            f"<p>Организация RU <input name='ru_org' value='{escape(card['ru_org'])}'></p>"
+            f"<p>Organization EN <input name='en_org' value='{escape(card['en_org'])}'></p>"
+            "<button>Сохранить изменения</button>"
+            "</form>"
+        )
+        body = self._page(f"Редактирование карточки #{card['id']}", content, back_href=f"/card/{card_id}")
+        return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
+
+    def card_edit_post(self, card_id: int, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
+        ru_org, ru_notes = self.normalize_ru_org(self._get_one(form, "ru_org"))
+        en_org, en_notes = self.normalize_en_org(self._get_one(form, "en_org"), ru_org)
+        notes = ru_notes + en_notes
+        status = self._status(notes, bool(ru_org and en_org))
+
+        with self._connect() as db:
+            card = db.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
+            if not card:
+                return "Not found", "404 Not Found", [("Content-Type", "text/plain; charset=utf-8")]
+
+            payload = json.loads(card["data_json"] or "{}")
+            payload["notes"] = notes
+            db.execute(
+                "UPDATE cards SET ru_org=?, en_org=?, status=?, updated_at=?, data_json=? WHERE id=?",
+                (ru_org, en_org, status, self._now(), json.dumps(payload, ensure_ascii=False), card_id),
+            )
+            db.commit()
+
+        self._write_audit("edit", card_id, {"ru_org": ru_org, "en_org": en_org, "status": status})
+        return "", "302 Found", [("Location", f"/card/{card_id}")]
 
     def export_preview(self, card_id: int) -> tuple[str, str, list[tuple[str, str]]]:
         with self._connect() as db:

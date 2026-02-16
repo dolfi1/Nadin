@@ -47,6 +47,7 @@ def test_autofill_requires_review_before_save(tmp_path):
     status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "ПАО Сбербанк"})
     assert status.startswith("200")
     assert "Автосбор: черновик" in review
+    assert "Найдено в доступных источниках" in review
     assert "Sberbank PJSC" in review
 
     status, headers, _ = call_app(
@@ -60,6 +61,35 @@ def test_autofill_requires_review_before_save(tmp_path):
     card_status, _, page = call_app(app, "GET", headers["Location"])
     assert card_status.startswith("200")
     assert "PJSC" in page
+
+
+def test_card_edit_and_save(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    status, headers, _ = call_app(
+        app,
+        "POST",
+        "/create/manual",
+        form={"ru_org": "Ромашка ООО", "en_org": "Romashka LLC"},
+    )
+    assert status.startswith("302")
+
+    edit_status, _, edit_page = call_app(app, "GET", f"{headers['Location']}/edit")
+    assert edit_status.startswith("200")
+    assert "Сохранить изменения" in edit_page
+
+    save_status, _, _ = call_app(
+        app,
+        "POST",
+        f"{headers['Location']}/edit",
+        form={"ru_org": "Сбербанк ПАО", "en_org": "Sberbank PJSC"},
+    )
+    assert save_status.startswith("302")
+
+    _, _, card_page = call_app(app, "GET", headers["Location"])
+    assert "Сбербанк ПАО" in card_page
+    assert "Sberbank PJSC" in card_page
+    assert "Редактировать карточку" in card_page
 
 
 def test_csv_export_and_audit_log(tmp_path):
