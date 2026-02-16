@@ -79,8 +79,13 @@ def test_parse_rusprofile_person_text_extracts_fio(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
     def fake_get(url, **_kwargs):
-        if "person=1" in url:
-            return FakeResponse('<a href="/person/123">result</a>')
+        if "search?query=" in url:
+            return FakeResponse(
+                '<div class="search-result__item">'
+                '<a class="search-result__title-link" href="/id/1027700132195">ПАО Сбербанк</a>'
+                '<a href="/person/gref-go-770303580308">Греф Герман Оскарович</a>'
+                '</div>'
+            )
         return FakeResponse('<h1>Греф Герман Оскарович</h1><a href="/id/1027700132195">ПАО Сбербанк</a>')
 
     monkeypatch.setattr(web_app.requests, "get", fake_get)
