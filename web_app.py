@@ -82,6 +82,28 @@ SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "focus.kontur.ru", "kind": "kontur", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False},
 ]
 
+
+def is_person_query(raw: str) -> bool:
+    """Определяет, является ли запрос по человеку (ФИО, ИНН 12 цифр, URL /person/)."""
+    value = raw.strip().lower()
+    if re.fullmatch(r"\d{12}", value):
+        return True
+    if "http" in value:
+        return "/person/" in value or "/ip/" in value
+    if re.match(r"^[а-яёa-z\s-]+$", value):
+        return len(value.split()) >= 1
+    return False
+
+
+def normalize_gender(patronymic: str) -> str:
+    """Автоопределение пола по отчеству."""
+    token = patronymic.lower().strip()
+    if token.endswith("вич") or token.endswith("ич"):
+        return "М"
+    if token.endswith("вна"):
+        return "Ж"
+    return ""
+
 INPUT_TYPE_INN = "INN"
 INPUT_TYPE_URL = "URL"
 INPUT_TYPE_ORG_TEXT = "ORG_TEXT"
@@ -516,13 +538,14 @@ class CompanyWebApp:
 
     def _call_provider(self, provider: dict[str, Any], raw: str, input_type: str) -> list[dict[str, Any]] | dict[str, Any] | None:
         kind = provider.get("kind")
+        person_query = input_type == INPUT_TYPE_PERSON_TEXT or is_person_query(raw)
         if kind == "egrul":
             inn = raw if input_type == INPUT_TYPE_INN else self._extract_inn(raw)
             return self._parse_egrul(inn)
         if kind == "list_org":
             return self._parse_list_org(raw)
         if kind == "rusprofile":
-            return self._parse_rusprofile(raw, input_type)
+            return self._parse_rusprofile(raw, input_type, is_person=person_query)
         if kind == "kontur":
             return self._parse_kontur(raw)
         return None
@@ -786,61 +809,103 @@ class CompanyWebApp:
             "revenue": self._extract_revenue_from_soup(detail_soup),
         }
 
-    def _parse_rusprofile(self, query: str, input_type: str) -> list[dict[str, Any]] | dict[str, Any] | None:
-        if input_type == INPUT_TYPE_PERSON_TEXT:
-            search_url = f"https://www.rusprofile.ru/search?query={quote(query)}&person=1"
-            search_resp = self._request(search_url)
+    def _search_rusprofile(self, query: str, is_person: bool = False) -> list[dict[str, str]]:
+        url = f"https://www.rusprofile.ru/search?query={quote(query)}"
+        logger.info("rusprofile search: %s", url)
+        try:
+            search_resp = self._request(url)
             if not search_resp.ok:
                 return []
             soup = BeautifulSoup(search_resp.text, "lxml")
+            hits: list[dict[str, str]] = []
+            seen_urls: set[str] = set()
+            for card in soup.select(".search-result__item"):
+                link_tag = card.select_one("a.search-result__title-link")
+                if not isinstance(link_tag, Tag):
+                    continue
+                link = str(link_tag.get("href", ""))
+                if not link:
+                    continue
+                if is_person and "/person/" not in link and "/ip/" not in link:
+                    continue
+                full_url = link if link.startswith("http") else f"https://www.rusprofile.ru{link}"
+                if full_url in seen_urls:
+                    continue
+                seen_urls.add(full_url)
+                inn_tag = card.select_one(".search-result__inn")
+                subtitle_tag = card.select_one(".search-result__subtitle")
+                snippet_tag = card.select_one(".search-result__snippet")
+                desc = self._normalize_spaces(snippet_tag.get_text(" ", strip=True) if isinstance(snippet_tag, Tag) else "")
+                position = ""
+                if "руководитель" in desc.lower() or "председатель" in desc.lower():
+                    position = desc.split(".", 1)[0]
+                hits.append({
+                    "source": "rusprofile.ru",
+                    "name": self._normalize_spaces(link_tag.get_text(" ", strip=True)),
+                    "org": self._normalize_spaces(subtitle_tag.get_text(" ", strip=True) if isinstance(subtitle_tag, Tag) else ""),
+                    "position": self._normalize_spaces(position),
+                    "inn": self._normalize_spaces(inn_tag.get_text(" ", strip=True).replace("ИНН", "") if isinstance(inn_tag, Tag) else ""),
+                    "url": full_url,
+                    "type": "person" if "/person/" in link or "/ip/" in link else "company",
+                })
+            return [hit for hit in hits if hit["type"] == "person"][:10] if is_person else hits[:10]
+        except Exception as exc:  # noqa: BLE001
+            logger.error("rusprofile search error: %s", exc)
+            return []
+
+    def _parse_rusprofile(self, query: str, input_type: str, is_person: bool = False) -> list[dict[str, Any]] | dict[str, Any] | None:
+        person_mode = is_person or input_type == INPUT_TYPE_PERSON_TEXT
+        if input_type == INPUT_TYPE_URL and "rusprofile.ru" in query and ("/person/" in query or "/ip/" in query):
+            person_mode = True
+
+        if person_mode:
+            person_hits = self._search_rusprofile(query, is_person=True)
+            urls = [item["url"] for item in person_hits]
+            if input_type == INPUT_TYPE_URL and "rusprofile.ru" in query:
+                urls = [query] + urls
+
             hits: list[dict[str, Any]] = []
             seen_urls: set[str] = set()
-            for link in soup.select("a[href*='/person/'], a[href*='/id/']")[:8]:
-                if not isinstance(link, Tag):
-                    continue
-                href = str(link.get("href", ""))
-                if not href:
-                    continue
-                detail_url = href if href.startswith("http") else f"https://www.rusprofile.ru{href}"
+            for detail_url in urls[:10]:
                 if detail_url in seen_urls:
                     continue
                 seen_urls.add(detail_url)
-
                 detail_resp = self._request(detail_url)
                 if not detail_resp.ok:
                     continue
                 d_soup = BeautifulSoup(detail_resp.text, "lxml")
-                header = d_soup.find("h1")
-                h1_text = self._normalize_spaces(header.get_text(" ", strip=True) if isinstance(header, Tag) else "")
+                full_name = self._normalize_spaces(d_soup.select_one("h1").get_text(" ", strip=True) if d_soup.select_one("h1") else "")
+                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(full_name)
                 text = d_soup.get_text(" ", strip=True)
 
-                fio_match = re.search(r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)", h1_text or text)
-                fio_text = fio_match.group(1) if fio_match else h1_text
-                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_text)
+                inn_node = d_soup.select_one(".inn-value")
+                inn_text = self._normalize_spaces(inn_node.get_text(" ", strip=True) if isinstance(inn_node, Tag) else "")
+                inn_match = re.search(r"ИНН\D{0,5}(\d{10,12})", text)
+                inn = inn_match.group(1) if inn_match else self._extract_inn(inn_text or text)
 
-                org_node = d_soup.select_one(".company-name, .org")
+                pos_node = d_soup.select_one(".position, .role")
+                ru_position = self._normalize_spaces(pos_node.get_text(" ", strip=True) if isinstance(pos_node, Tag) else "")
+                if not ru_position:
+                    pos_match = re.search(r"(Президент[^,.]*|Генеральный директор[^,.]*|Председатель[^,.]*)", text, flags=re.IGNORECASE)
+                    ru_position = self._normalize_spaces(pos_match.group(1)) if pos_match else ""
+
+                org_node = d_soup.select_one(".company-link, .company-name, .org")
                 org_text = org_node.get_text(" ", strip=True) if isinstance(org_node, Tag) else ""
                 if not org_text:
                     org_link = d_soup.find("a", href=re.compile(r"^/(id|company)/"))
                     if isinstance(org_link, Tag):
                         org_text = org_link.get_text(" ", strip=True)
 
-                position_node = d_soup.select_one(".position, .role")
-                ru_position = position_node.get_text(" ", strip=True) if isinstance(position_node, Tag) else ""
-                if not ru_position:
-                    pos_match = re.search(r"(Президент[^,.]*|Генеральный директор[^,.]*|Председатель[^,.]*)", text, flags=re.IGNORECASE)
-                    ru_position = self._normalize_spaces(pos_match.group(1)) if pos_match else ""
-
-                inn_match = re.search(r"ИНН\D{0,5}(\d{10,12})", text)
                 hits.append({
                     "url": detail_url,
                     "surname_ru": surname_ru,
                     "name_ru": name_ru,
                     "middle_name_ru": middle_name_ru,
-                    "ru_org": self._clean_ru_org_name(org_text),
+                    "gender": normalize_gender(middle_name_ru),
+                    "inn": inn,
                     "ru_position": ru_position,
+                    "ru_org": self._clean_ru_org_name(org_text),
                     "revenue": self._extract_revenue_from_soup(d_soup),
-                    "inn": inn_match.group(1) if inn_match else self._extract_inn(text),
                 })
             return hits
 
@@ -1411,6 +1476,14 @@ class CompanyWebApp:
             profile.update(merged_person)
             field_sources.update({k: v for k, v in merged_sources.items() if v})
 
+        if source_hits:
+            best_revenue_hit = max(source_hits, key=lambda item: int(item.get("data", {}).get("revenue", 0) or 0))
+            revenue_value = int(best_revenue_hit.get("data", {}).get("revenue", 0) or 0)
+            if revenue_value:
+                profile["revenue"] = str(revenue_value)
+                field_sources["revenue"] = best_revenue_hit.get("source", "")
+                field_sources["revenue_mln"] = best_revenue_hit.get("source", "")
+
         if not profile["ru_org"] and source_hits:
             for item in source_hits:
                 candidate = self._normalize_spaces(str(item.get("data", {}).get("ru_org", "")))
@@ -1671,9 +1744,11 @@ class CompanyWebApp:
             f"<tr><td>{escape(label)}</td><td style='white-space: pre-wrap;'>{escape(profile.get(field, ''))}</td><td>{escape(field_sources.get(field, '—'))}</td><td>{escape(field_statuses.get(field, ''))}</td></tr>"
             for field, label in CARD_FIELDS
         )
+        revenue_raw = int(profile.get("revenue", 0) or 0)
+        revenue_mln = f"{(revenue_raw / 1_000_000):.2f}" if revenue_raw else ""
         source_table_rows += (
-            f"<tr><td>Выручка (млн руб)</td><td style='white-space: pre-wrap;'>{escape(str(profile.get('revenue', '0')))}</td>"
-            "<td>Источник</td><td>Справочно</td></tr>"
+            f"<tr><td>Выручка (млн руб)</td><td style='white-space: pre-wrap;'>{escape(revenue_mln)}</td>"
+            f"<td>{escape(field_sources.get('revenue_mln', field_sources.get('revenue', '—')))}</td><td>Справочно</td></tr>"
         )
         search_trace_list = "<h3>Как происходил поиск</h3><ol>" + "".join(f"<li>{escape(step)}</li>" for step in search_trace) + "</ol>"
         content = (
