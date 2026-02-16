@@ -49,12 +49,33 @@ def test_autofill_requires_review_before_save(tmp_path):
     assert "Автосбор: черновик" in review
     assert "Найдено в доступных источниках" in review
     assert "Sberbank PJSC" in review
+    assert "Как происходил поиск" in review
+    assert "Карточка и источники по полям" in review
+    assert "Источник" in review
 
     status, headers, _ = call_app(
         app,
         "POST",
         "/autofill/confirm",
-        form={"ru_org": "Сбербанк ПАО", "en_org": "Sberbank PJSC"},
+        form={
+            "ru_org": "Сбербанк ПАО",
+            "en_org": "Sberbank PJSC",
+            "profile_family_name": "Gref",
+            "profile_first_name": "Herman",
+            "profile_name_ru": "Герман",
+            "profile_surname_ru": "Греф",
+            "profile_middle_name_ru": "Оскарович",
+            "profile_ru_org": "Сбербанк ПАО",
+            "profile_en_org": "Sberbank PJSC",
+            "profile_ru_position": "Президент, Председатель правления",
+            "profile_en_position": "President, Chairman of the Board",
+            "field_source_family_name": "ЕГРЮЛ",
+            "field_source_first_name": "ЕГРЮЛ",
+            "field_source_ru_org": "ЕГРЮЛ",
+            "field_source_en_org": "СПАРК",
+            "source_name": "ЕГРЮЛ",
+            "search_trace": "Нормализованный запрос: Сбербанк ПАО",
+        },
     )
     assert status.startswith("302")
 
@@ -112,6 +133,7 @@ def test_csv_export_and_audit_log(tmp_path):
     _, _, preview_page = call_app(app, "GET", f"{headers['Location']}/export")
     assert "Данные карточки" in preview_page
     assert "Romashka LLC" in preview_page
+    assert "Откуда взята информация" in preview_page
 
     _, _, csv_body = call_app(app, "GET", f"{headers['Location']}/export.csv")
     assert "ru_org" in csv_body

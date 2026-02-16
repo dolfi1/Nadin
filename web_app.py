@@ -39,16 +39,67 @@ PASSPORT_MAP = {
     "Ч": "CH", "Ш": "SH", "Щ": "SHCH", "Ъ": "", "Ы": "Y", "Ь": "", "Э": "E", "Ю": "YU", "Я": "YA",
 }
 
-SOURCE_CATALOG: dict[str, list[dict[str, str]]] = {
+SOURCE_CATALOG: dict[str, list[dict[str, Any]]] = {
     "СБЕРБАНК ПАО": [
-        {"source": "ЕГРЮЛ", "ru_org": "Сбербанк ПАО", "en_org": "Sberbank PJSC"},
-        {"source": "СПАРК", "ru_org": "ПАО Сбербанк", "en_org": "Sberbank PJSC"},
+        {
+            "source": "ЕГРЮЛ",
+            "url": "https://egrul.nalog.ru/",
+            "data": {
+                "title": "",
+                "salutation": "Г-н",
+                "family_name": "Gref",
+                "first_name": "Herman",
+                "middle_name": "",
+                "surname_ru": "Греф",
+                "name_ru": "Герман",
+                "middle_name_ru": "Оскарович",
+                "gender": "М",
+                "ru_org": "Сбербанк ПАО",
+                "en_org": "Sberbank PJSC",
+                "ru_position": "Президент, Председатель правления",
+                "en_position": "President, Chairman of the Board",
+            },
+        },
+        {
+            "source": "СПАРК",
+            "url": "https://spark-interfax.ru/",
+            "data": {
+                "ru_org": "ПАО Сбербанк",
+                "en_org": "Sberbank PJSC",
+                "ru_position": "Президент, Председатель Правления",
+                "en_position": "President, Chairman of the Board",
+            },
+        },
     ],
     "РОМАШКА ООО": [
-        {"source": "Контур.Фокус", "ru_org": "Ромашка ООО", "en_org": "Romashka LLC"},
-        {"source": "Rusprofile", "ru_org": "ООО Ромашка", "en_org": "Romashka LLC"},
+        {
+            "source": "Контур.Фокус",
+            "url": "https://focus.kontur.ru/",
+            "data": {"ru_org": "Ромашка ООО", "en_org": "Romashka LLC"},
+        },
+        {
+            "source": "Rusprofile",
+            "url": "https://www.rusprofile.ru/",
+            "data": {"ru_org": "ООО Ромашка", "en_org": "Romashka LLC"},
+        },
     ],
 }
+
+CARD_FIELDS: list[tuple[str, str]] = [
+    ("title", "Титул"),
+    ("salutation", "Обращение"),
+    ("family_name", "Family name"),
+    ("first_name", "First name"),
+    ("middle_name", "Middle name"),
+    ("surname_ru", "Фамилия"),
+    ("name_ru", "Имя"),
+    ("middle_name_ru", "Middle name. рус"),
+    ("gender", "Пол"),
+    ("ru_org", "Организация"),
+    ("en_org", "Organization"),
+    ("ru_position", "Должность"),
+    ("en_position", "Position"),
+]
 
 
 class CompanyWebApp:
@@ -211,21 +262,52 @@ class CompanyWebApp:
             return "Нужно проверить"
         return "Найдено"
 
-    def _search_external_sources(self, company_name: str) -> list[dict[str, str]]:
+    def _search_external_sources(self, company_name: str) -> tuple[list[dict[str, Any]], list[str]]:
         normalized, _ = self.normalize_ru_org(company_name)
+        trace = [f"Входной запрос: {company_name}", f"Нормализованный запрос: {normalized}"]
         candidates = SOURCE_CATALOG.get(normalized.upper(), [])
         if candidates:
-            return candidates
+            trace.append(f"Точное совпадение по справочнику: {normalized.upper()}")
+            return candidates, trace
 
         token = normalized.split()[0].upper() if normalized else ""
         if not token:
-            return []
+            trace.append("Поиск прерван: пустой токен после нормализации")
+            return [], trace
 
         aggregated: list[dict[str, str]] = []
         for org_name, records in SOURCE_CATALOG.items():
+            trace.append(f"Проверка источников по записи: {org_name}")
             if token in org_name:
                 aggregated.extend(records)
-        return aggregated
+        trace.append(f"Совпадений по токену '{token}': {len(aggregated)}")
+        return aggregated, trace
+
+    def _build_profile_from_sources(self, source_hits: list[dict[str, Any]], raw_name: str) -> tuple[dict[str, str], dict[str, str]]:
+        profile = {field: "" for field, _ in CARD_FIELDS}
+        field_sources: dict[str, str] = {}
+
+        for source_item in source_hits:
+            source_data = source_item.get("data", {})
+            source_name = source_item.get("source", "unknown")
+            for field, _ in CARD_FIELDS:
+                value = str(source_data.get(field, "")).strip()
+                if value and not profile[field]:
+                    profile[field] = value
+                    field_sources[field] = source_name
+
+        if not profile["ru_org"]:
+            profile["ru_org"] = raw_name
+            field_sources["ru_org"] = "Нормализация запроса"
+
+        profile["ru_org"], _ = self.normalize_ru_org(profile["ru_org"])
+        if not profile["en_org"]:
+            profile["en_org"], _ = self.normalize_en_org("", profile["ru_org"])
+            field_sources["en_org"] = "Транслитерация из RU"
+        else:
+            profile["en_org"], _ = self.normalize_en_org(profile["en_org"], profile["ru_org"])
+
+        return profile, field_sources
 
     def _write_audit(self, action: str, card_id: int | None, details: dict[str, Any]) -> None:
         with self._connect() as db:
@@ -272,37 +354,53 @@ class CompanyWebApp:
 
     def autofill_review(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         raw = self._get_one(form, "company_name")
-        source_hits = self._search_external_sources(raw)
-        best = source_hits[0] if source_hits else None
-        ru_seed = best["ru_org"] if best else raw
-        en_seed = best["en_org"] if best else ""
+        source_hits, search_trace = self._search_external_sources(raw)
+        profile, field_sources = self._build_profile_from_sources(source_hits, raw)
 
-        ru_org, ru_notes = self.normalize_ru_org(ru_seed)
-        en_org, en_notes = self.normalize_en_org(en_seed, ru_org)
+        ru_org, ru_notes = self.normalize_ru_org(profile["ru_org"])
+        en_org, en_notes = self.normalize_en_org(profile["en_org"], ru_org)
+        profile["ru_org"] = ru_org
+        profile["en_org"] = en_org
         notes = ru_notes + en_notes
         if source_hits:
             notes.append(f"Источники: найдено {len(source_hits)}")
         else:
             notes.append("Источники: совпадения не найдены, использована нормализация")
 
-        source_hidden = "".join(
-            f"<input type='hidden' name='source_name' value='{escape(item['source'])}'/>" for item in source_hits
+        source_hidden = "".join(f"<input type='hidden' name='source_name' value='{escape(item['source'])}'/>" for item in source_hits)
+        trace_hidden = "".join(f"<input type='hidden' name='search_trace' value='{escape(step)}'/>" for step in search_trace)
+        field_source_hidden = "".join(
+            f"<input type='hidden' name='field_source_{escape(field)}' value='{escape(source)}'/>"
+            for field, source in field_sources.items()
+        )
+        profile_hidden = "".join(
+            f"<input type='hidden' name='profile_{escape(field)}' value='{escape(value)}'/>"
+            for field, value in profile.items()
         )
         hidden = "".join(f"<input type='hidden' name='notes' value='{escape(n)}'/>" for n in notes)
         source_list = (
             "<h3>Найдено в доступных источниках</h3><ul>"
             + "".join(
-                f"<li>{escape(item['source'])}: {escape(item['ru_org'])} / {escape(item['en_org'])}</li>" for item in source_hits
+                f"<li>{escape(item['source'])}: {escape(item['data'].get('ru_org', ''))} / {escape(item['data'].get('en_org', ''))}</li>" for item in source_hits
             )
             + "</ul>"
         ) if source_hits else "<p>В доступных источниках совпадений не найдено.</p>"
+        source_table_rows = "".join(
+            f"<tr><td>{escape(label)}</td><td>{escape(profile.get(field, ''))}</td><td>{escape(field_sources.get(field, '—'))}</td></tr>"
+            for field, label in CARD_FIELDS
+        )
+        search_trace_list = "<h3>Как происходил поиск</h3><ol>" + "".join(f"<li>{escape(step)}</li>" for step in search_trace) + "</ol>"
         content = (
             "<h2>Автосбор: черновик</h2>"
             f"{source_list}"
+            f"{search_trace_list}"
+            "<h3>Карточка и источники по полям</h3>"
+            "<table border='1' cellpadding='6' cellspacing='0'><tr><th>Поле</th><th>Значение</th><th>Источник</th></tr>"
+            f"{source_table_rows}</table>"
             "<form method='post' action='/autofill/confirm'>"
             f"<p>RU: <input name='ru_org' value='{escape(ru_org)}'/></p>"
             f"<p>EN: <input name='en_org' value='{escape(en_org)}'/></p>"
-            f"{hidden}{source_hidden}"
+            f"{hidden}{source_hidden}{trace_hidden}{field_source_hidden}{profile_hidden}"
             "<button>Подтвердить и сохранить</button></form>"
         )
         body = self._page("Автосбор: черновик", content, back_href="/")
@@ -313,6 +411,19 @@ class CompanyWebApp:
         en_org = self._get_one(form, "en_org")
         notes = form.get("notes", [])
         source_names = form.get("source_name", [])
+        search_trace = form.get("search_trace", [])
+        field_sources = {
+            key.removeprefix("field_source_"): self._get_one(form, key)
+            for key in form
+            if key.startswith("field_source_") and self._get_one(form, key)
+        }
+        profile_data = {
+            key.removeprefix("profile_"): self._get_one(form, key)
+            for key in form
+            if key.startswith("profile_")
+        }
+        profile_data["ru_org"] = ru_org
+        profile_data["en_org"] = en_org
         status = self._status(notes, bool(ru_org and en_org))
         with self._connect() as db:
             cur = db.execute(
@@ -324,7 +435,16 @@ class CompanyWebApp:
                     "autofill",
                     self._now(),
                     self._now(),
-                    json.dumps({"notes": notes, "source_hits": source_names}, ensure_ascii=False),
+                    json.dumps(
+                        {
+                            "notes": notes,
+                            "source_hits": source_names,
+                            "search_trace": search_trace,
+                            "field_sources": field_sources,
+                            "profile": profile_data,
+                        },
+                        ensure_ascii=False,
+                    ),
                 ),
             )
             card_id = cur.lastrowid
@@ -390,6 +510,9 @@ class CompanyWebApp:
         entries = "".join(
             f"<li>{escape(a['created_at'])} — {escape(a['action'])} ({escape(a['actor'])})</li>" for a in audits
         )
+        payload = json.loads(card["data_json"] or "{}")
+        trace = payload.get("search_trace", [])
+        trace_html = "<h3>Как происходил поиск</h3><ol>" + "".join(f"<li>{escape(step)}</li>" for step in trace) + "</ol>" if trace else ""
         content = (
             f"<h2>Карточка #{card['id']}</h2>"
             f"<p>Организация RU: {escape(card['ru_org'])}</p>"
@@ -398,6 +521,7 @@ class CompanyWebApp:
             f"<p>Источник: {escape(card['source'])}</p>"
             f"<p><a href='/card/{card['id']}/edit'>Редактировать карточку</a></p>"
             f"<a href='/card/{card['id']}/export'>Показать данные карточки на сайте</a>"
+            f"{trace_html}"
             "<h3>Audit log</h3><ul>" + entries + "</ul>"
         )
         body = self._page(f"Карточка #{card['id']}", content, back_href="/")
@@ -448,16 +572,28 @@ class CompanyWebApp:
         if not card:
             return "Not found", "404 Not Found", [("Content-Type", "text/plain; charset=utf-8")]
 
+        payload = json.loads(card["data_json"] or "{}")
+        profile = payload.get("profile", {})
+        field_sources = payload.get("field_sources", {})
+        if not profile:
+            profile = {field: "" for field, _ in CARD_FIELDS}
+            profile["ru_org"] = card["ru_org"]
+            profile["en_org"] = card["en_org"]
+        lines = "\n".join(f"{label}: {profile.get(field, '')}" for field, label in CARD_FIELDS)
+        source_rows = "".join(
+            f"<tr><td>{escape(label)}</td><td>{escape(field_sources.get(field, '—'))}</td></tr>"
+            for field, label in CARD_FIELDS
+        )
+        source_names = payload.get("source_hits", [])
+        sources_list = "<ul>" + "".join(f"<li>{escape(source)}</li>" for source in source_names) + "</ul>" if source_names else "<p>Источники не зафиксированы.</p>"
         content = (
             f"<h2>Данные карточки #{card['id']}</h2>"
-            "<table border='1' cellpadding='6' cellspacing='0'>"
-            f"<tr><td>id</td><td>{card['id']}</td></tr>"
-            f"<tr><td>ru_org</td><td>{escape(card['ru_org'])}</td></tr>"
-            f"<tr><td>en_org</td><td>{escape(card['en_org'])}</td></tr>"
-            f"<tr><td>status</td><td>{escape(card['status'])}</td></tr>"
-            f"<tr><td>source</td><td>{escape(card['source'])}</td></tr>"
-            f"<tr><td>created_at</td><td>{escape(card['created_at'])}</td></tr>"
-            "</table>"
+            f"<pre>{escape(lines)}</pre>"
+            "<h3>Откуда взята информация (по полям)</h3>"
+            "<table border='1' cellpadding='6' cellspacing='0'><tr><th>Поле</th><th>Источник</th></tr>"
+            f"{source_rows}</table>"
+            "<h3>Список использованных источников</h3>"
+            f"{sources_list}"
         )
         body = self._page(f"Данные карточки #{card['id']}", content, back_href=f"/card/{card_id}")
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
