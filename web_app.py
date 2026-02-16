@@ -495,7 +495,7 @@ class CompanyWebApp:
             return len(dropped) + int(cur.rowcount)
 
     def _clear_cache_for_person(self, query: str) -> int:
-        normalized = self._normalize_spaces(query).lower()
+        normalized = re.sub(r"\s+", "", self._normalize_spaces(query).lower())
         if not normalized:
             return 0
         key_fragment = f"person:{normalized}"
@@ -543,26 +543,20 @@ class CompanyWebApp:
 
     def _score_hit(self, hit: dict[str, Any], query: str) -> float:
         data = hit.get("data", hit)
-        q_norm = self._normalize_spaces(query.lower())
-        q_words_list = [w for w in q_norm.split() if w]
-        q_words = set(q_words_list)
-        fio = " ".join(x for x in [data.get("surname_ru", ""), data.get("name_ru", ""), data.get("middle_name_ru", "")] if x).strip()
-        fio_norm = self._normalize_spaces(fio.lower())
-        fio_words_list = [w for w in fio_norm.split() if w]
-        fio_words = set(fio_words_list)
+        q_lower = self._normalize_spaces(query.lower())
+        fio = " ".join(x for x in [data.get("surname_ru", ""), data.get("name_ru", ""), data.get("middle_name_ru", "")] if x)
+        fio_lower = self._normalize_spaces(fio.lower())
 
         score = 0.0
-        if q_words and fio_words and self.detect_input_type(query) == INPUT_TYPE_PERSON_TEXT:
-            exact_match = len(q_words & fio_words) / len(q_words)
-            if exact_match > 0.8:
-                score += 40
-            if sorted(q_words) == sorted(fio_words):
-                score += 20
-            if sorted(q_words_list) == sorted(fio_words_list):
+        if self.detect_input_type(query) == INPUT_TYPE_PERSON_TEXT and q_lower and fio_lower:
+            q_words = sorted(q_lower.split())
+            fio_words = sorted(fio_lower.split())
+            if q_words == fio_words:
                 score += 60
-            ratio = SequenceMatcher(None, q_norm, fio_norm).ratio()
-            if ratio > 0.75:
-                score += 40
+            if SequenceMatcher(None, q_lower, fio_lower).ratio() > 0.8:
+                score += 60
+            if all(word in fio_lower for word in q_lower.split()):
+                score += 30
 
         revenue = int(data.get("revenue", 0) or 0)
         score += min(revenue / 1e5, 50)
@@ -571,7 +565,7 @@ class CompanyWebApp:
         if any(token in org for token in ("сбер", "втб", "газпром")):
             score += 40
 
-        pos = self._normalize_spaces(str(data.get("ru_position", ""))).lower()
+        pos = self._normalize_spaces(str(data.get("ru_position", "")).lower())
         if "президент" in pos:
             score += 10
 
@@ -593,7 +587,7 @@ class CompanyWebApp:
 
         def load_provider(provider: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
             cache_prefix = "person:" if input_type == INPUT_TYPE_PERSON_TEXT else ""
-            cache_raw = raw.lower() if input_type == INPUT_TYPE_PERSON_TEXT else raw
+            cache_raw = re.sub(r"\s+", "", raw.lower()) if input_type == INPUT_TYPE_PERSON_TEXT else raw
             cache_key = f"{provider['name']}:{cache_prefix}{cache_raw}"
             cached = None if no_cache else self._get_cache(cache_key)
             if cached:
@@ -618,7 +612,7 @@ class CompanyWebApp:
 
         active_providers = [provider for provider in providers if self._should_call_provider(provider, input_type)]
         if active_providers:
-            with ThreadPoolExecutor(max_workers=min(4, len(active_providers))) as executor:
+            with ThreadPoolExecutor(max_workers=min(3, len(active_providers))) as executor:
                 futures = {executor.submit(load_provider, provider): provider for provider in active_providers}
                 for future in as_completed(futures):
                     provider = futures[future]
@@ -667,15 +661,6 @@ class CompanyWebApp:
             data = resp.json()
             sv_yul = data.get("СвЮЛ", {}) or {}
             company = data.get("company", {}) or {}
-            director = data.get("director", {}) or {}
-            directors = data.get("СведДолжнФЛ", []) or []
-            legacy_director = directors[0] if isinstance(directors, list) and directors else {}
-            legacy_fio = legacy_director.get("ФИО") or legacy_director.get("ФИОПолн") or ""
-            if not legacy_fio and isinstance(sv_yul, dict):
-                ruk = sv_yul.get("РукФЛ", {}) or {}
-                svfl = ruk.get("СвФЛ", {}) if isinstance(ruk, dict) else {}
-                legacy_fio = (svfl or {}).get("ФИОПолн") or (svfl or {}).get("ФИОРус") or ""
-            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(str(legacy_fio))
 
             company_name = (
                 sv_yul.get("НаимСокр")
@@ -686,22 +671,46 @@ class CompanyWebApp:
                 or data.get("ru_org", "")
             )
             ru_org = self._clean_ru_org_name(str(company_name).replace("ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "ПАО"))
-            director_gender = str(director.get("gender", "")).strip().lower()
+
+            head: dict[str, Any] = {}
+            sv_dol = sv_yul.get("СведДолжнФЛ") if isinstance(sv_yul, dict) else None
+            if isinstance(sv_dol, list) and sv_dol:
+                head = sv_dol[0] or {}
+            elif isinstance(data.get("СведДолжнФЛ"), list) and data["СведДолжнФЛ"]:
+                head = data["СведДолжнФЛ"][0] or {}
+
+            sv_fl = head.get("СвФЛ", {}) if isinstance(head, dict) else {}
+            director = data.get("director", {}) or {}
+            fio_raw = head.get("ФИО") or head.get("ФИОПолн") or (sv_fl.get("ФИОПолн") if isinstance(sv_fl, dict) else "") or ""
+            if not fio_raw and isinstance(sv_yul, dict):
+                ruk = sv_yul.get("РукФЛ", {}) or {}
+                ruk_fl = ruk.get("СвФЛ", {}) if isinstance(ruk, dict) else {}
+                fio_raw = (ruk_fl.get("ФИОПолн") if isinstance(ruk_fl, dict) else "") or ""
+            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(str(fio_raw))
+            surname_ru = str(director.get("surname") or director.get("surname_ru") or data.get("surname_ru") or surname_ru)
+            name_ru = str(director.get("name") or director.get("name_ru") or data.get("name_ru") or name_ru)
+            middle_name_ru = str(director.get("patronymic") or director.get("middle_name_ru") or data.get("middle_name_ru") or middle_name_ru)
+
+            position = head.get("Должность") or head.get("НаимДолжн") or director.get("position") or data.get("ru_position", "")
             rev_raw = (
-                (data.get("ФинПоказ", {}) or {}).get("Выручка")
+                ((sv_yul.get("ФинПоказ", {}) or {}).get("Выручка") if isinstance(sv_yul, dict) else None)
+                or (data.get("ФинПоказ", {}) or {}).get("Выручка")
                 or data.get("revenue", 0)
             )
+            gender_raw = str(data.get("gender", "") or director.get("gender", "")).strip().lower()
+            gender = "М" if gender_raw in {"1", "м", "m", "male", "мужской"} or "муж" in gender_raw else ("Ж" if gender_raw in {"2", "ж", "f", "female", "женский"} or "жен" in gender_raw else "")
+
             return {
                 "url": url,
                 "inn": company.get("inn") or data.get("inn") or data.get("ИННЮЛ") or query,
-                "ogrn": data.get("ogrn"),
+                "ogrn": data.get("ogrn") or data.get("ОГРН"),
                 "ru_org": ru_org,
                 "en_org": data.get("en_org", ""),
-                "surname_ru": director.get("surname_ru", "") or director.get("surname", "") or data.get("surname_ru", "") or surname_ru,
-                "name_ru": director.get("name_ru", "") or director.get("name", "") or data.get("name_ru", "") or name_ru,
-                "middle_name_ru": director.get("middle_name_ru", "") or director.get("patronymic", "") or data.get("middle_name_ru", "") or middle_name_ru,
-                "gender": "М" if director_gender in {"1", "м", "мужской"} or "муж" in director_gender else ("Ж" if director_gender else ""),
-                "ru_position": director.get("position", "") or legacy_director.get("Должность", "") or legacy_director.get("НаимДолжн", "") or data.get("ru_position", "Генеральный директор"),
+                "surname_ru": surname_ru,
+                "name_ru": name_ru,
+                "middle_name_ru": middle_name_ru,
+                "gender": gender,
+                "ru_position": position or "Генеральный директор",
                 "en_position": data.get("en_position", ""),
                 "revenue": self._extract_revenue(str(rev_raw)),
             }
@@ -786,45 +795,53 @@ class CompanyWebApp:
             soup = BeautifulSoup(search_resp.text, "lxml")
             hits: list[dict[str, Any]] = []
             seen_urls: set[str] = set()
-            for person_link in soup.select("a[href*='/person/']"):
-                if not isinstance(person_link, Tag):
+            for link in soup.select("a[href*='/person/'], a[href*='/id/']")[:8]:
+                if not isinstance(link, Tag):
                     continue
-                person_url = "https://www.rusprofile.ru" + str(person_link.get("href", ""))
-                if person_url in seen_urls:
+                href = str(link.get("href", ""))
+                if not href:
                     continue
-                seen_urls.add(person_url)
-                p_resp = self._request(person_url)
-                if not p_resp.ok:
+                detail_url = href if href.startswith("http") else f"https://www.rusprofile.ru{href}"
+                if detail_url in seen_urls:
                     continue
-                p_soup = BeautifulSoup(p_resp.text, "lxml")
-                fio = p_soup.find("h1").get_text(strip=True) if isinstance(p_soup.find("h1"), Tag) else person_link.get_text(" ", strip=True)
-                org_link = p_soup.find("a", href=re.compile(r"^/(id|company)/\d+"))
-                org_name = org_link.get_text(" ", strip=True) if isinstance(org_link, Tag) else ""
-                if not org_name:
-                    company_node = p_soup.select_one(".company-name")
-                    if isinstance(company_node, Tag):
-                        org_name = company_node.get_text(" ", strip=True)
-                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio)
-                ru_position = ""
-                text = p_soup.get_text(" ", strip=True)
-                pos_match = re.search(r"(Президент[^,.]*|Генеральный директор[^,.]*|Председатель правления[^,.]*)", text, flags=re.IGNORECASE)
-                if pos_match:
-                    ru_position = self._normalize_spaces(pos_match.group(1))
+                seen_urls.add(detail_url)
+
+                detail_resp = self._request(detail_url)
+                if not detail_resp.ok:
+                    continue
+                d_soup = BeautifulSoup(detail_resp.text, "lxml")
+                header = d_soup.find("h1")
+                h1_text = self._normalize_spaces(header.get_text(" ", strip=True) if isinstance(header, Tag) else "")
+                text = d_soup.get_text(" ", strip=True)
+
+                fio_match = re.search(r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)", h1_text or text)
+                fio_text = fio_match.group(1) if fio_match else h1_text
+                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_text)
+
+                org_node = d_soup.select_one(".company-name, .org")
+                org_text = org_node.get_text(" ", strip=True) if isinstance(org_node, Tag) else ""
+                if not org_text:
+                    org_link = d_soup.find("a", href=re.compile(r"^/(id|company)/"))
+                    if isinstance(org_link, Tag):
+                        org_text = org_link.get_text(" ", strip=True)
+
+                position_node = d_soup.select_one(".position, .role")
+                ru_position = position_node.get_text(" ", strip=True) if isinstance(position_node, Tag) else ""
+                if not ru_position:
+                    pos_match = re.search(r"(Президент[^,.]*|Генеральный директор[^,.]*|Председатель[^,.]*)", text, flags=re.IGNORECASE)
+                    ru_position = self._normalize_spaces(pos_match.group(1)) if pos_match else ""
+
+                inn_match = re.search(r"ИНН\D{0,5}(\d{10,12})", text)
                 hits.append({
-                    "url": person_url,
-                    "ru_org": self._clean_ru_org_name(org_name),
+                    "url": detail_url,
                     "surname_ru": surname_ru,
                     "name_ru": name_ru,
                     "middle_name_ru": middle_name_ru,
-                    "ru_position": ru_position or ("Президент, Председатель правления" if "греф" in fio.lower() else "Генеральный директор"),
-                    "inn": self._extract_inn(text),
-                    "revenue": self._extract_revenue_from_soup(p_soup),
+                    "ru_org": self._clean_ru_org_name(org_text),
+                    "ru_position": ru_position,
+                    "revenue": self._extract_revenue_from_soup(d_soup),
+                    "inn": inn_match.group(1) if inn_match else self._extract_inn(text),
                 })
-                fio_text = f"{surname_ru} {name_ru} {middle_name_ru}".strip().lower()
-                if "греф" in fio_text and "герман" in fio_text:
-                    hits.insert(0, hits.pop())
-                if len(hits) >= 5:
-                    break
             return hits
 
         if input_type == INPUT_TYPE_URL and "rusprofile.ru" in query:
@@ -1461,18 +1478,17 @@ class CompanyWebApp:
             db.commit()
 
     def _build_person_candidates(self, hits: list[dict[str, Any]], query: str = "") -> list[dict[str, str]]:
-        query_words = {w for w in self._normalize_spaces(query.lower()).split() if w}
+        query_words = [w for w in self._normalize_spaces(query.lower()).split() if w]
         filtered_hits = hits
         if query_words:
             strict = []
             for hit in hits:
                 data = hit.get("data", {})
-                fio_words = {
-                    w for w in self._normalize_spaces(
-                        " ".join(x for x in [data.get("surname_ru", ""), data.get("name_ru", ""), data.get("middle_name_ru", "")] if x).lower()
-                    ).split() if w
-                }
-                if query_words.issubset(fio_words):
+                surname = self._normalize_spaces(str(data.get("surname_ru", "")).lower())
+                fio = self._normalize_spaces(
+                    " ".join(x for x in [data.get("surname_ru", ""), data.get("name_ru", ""), data.get("middle_name_ru", "")] if x).lower()
+                )
+                if any(word in surname for word in query_words) or all(word in fio for word in query_words):
                     strict.append(hit)
             if strict:
                 filtered_hits = strict
@@ -1502,7 +1518,10 @@ class CompanyWebApp:
                 "score": f"{score:.2f}",
                 "revenue": str(revenue),
             }
-        return sorted(seen.values(), key=lambda c: float(c.get("score", 0)), reverse=True)[:6]
+        ranked = sorted(seen.values(), key=lambda c: float(c.get("score", 0)), reverse=True)[:6]
+        if ranked:
+            logger.info("Top candidate: %s", ranked[0].get("fio_ru", ""))
+        return ranked
 
     def _revenue_billions(self, revenue_mln: int | str | None) -> str:
         revenue = int(revenue_mln or 0)
