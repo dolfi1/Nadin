@@ -1,6 +1,7 @@
 from io import BytesIO
 from urllib.parse import urlencode
 
+import web_app
 from web_app import CompanyWebApp
 
 
@@ -170,3 +171,39 @@ def test_autofill_review_has_required_actions_and_statuses(tmp_path):
     assert "✏️ Отредактировать" in review
     assert "❌ Отмена" in review
     assert "Нужно заполнить" in review
+
+
+def test_autofill_review_fills_en_org_from_single_token(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "Газпром"})
+    assert status.startswith("200")
+    assert "<td>Организация</td><td>Газпром</td>" in review
+    assert "<td>Organization</td><td>Gazprom</td>" in review
+
+
+def test_checko_inn_lookup_uses_external_source(monkeypatch, tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return "<html><head><title>Газпром переработка ООО — checko</title></head></html>".encode("utf-8")
+
+    monkeypatch.setattr(web_app, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+
+    status, _, review = call_app(
+        app,
+        "POST",
+        "/autofill/review",
+        form={"company_name": "https://checko.ru/company/gazprom-pererabotka-1071102001651"},
+    )
+    assert status.startswith("200")
+    assert "Выделен ID checko: 1071102001651" in review
+    assert "checko.ru: найдена организация Газпром Переработка ООО" in review
+    assert "<td>Источник</td><td>checko.ru</td>" not in review

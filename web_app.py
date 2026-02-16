@@ -6,6 +6,8 @@ import json
 import re
 import sqlite3
 import unicodedata
+from urllib.request import Request
+from urllib.request import urlopen
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
@@ -92,6 +94,8 @@ SOURCE_DOMAINS = {
     "focus.kontur.ru": "Контур.Фокус",
     "rusprofile.ru": "Rusprofile",
     "www.rusprofile.ru": "Rusprofile",
+    "checko.ru": "checko.ru",
+    "www.checko.ru": "checko.ru",
 }
 
 INPUT_TYPE_INN = "INN"
@@ -106,7 +110,7 @@ CARD_FIELDS: list[tuple[str, str]] = [
     ("middle_name", "Middle name"),
     ("surname_ru", "Фамилия"),
     ("name_ru", "Имя"),
-    ("middle_name_ru", "Middle name. рус"),
+    ("middle_name_ru", "Отчество"),
     ("gender", "Пол"),
     ("ru_org", "Организация"),
     ("en_org", "Organization"),
@@ -225,6 +229,27 @@ class CompanyWebApp:
             return INPUT_TYPE_URL
         return INPUT_TYPE_TEXT
 
+    def _extract_inn(self, raw: str) -> str:
+        value = self._normalize_spaces(raw)
+        if re.fullmatch(r"\d{10}|\d{12}", value):
+            return value
+        if self.detect_input_type(value) != INPUT_TYPE_URL:
+            return ""
+
+        parsed = urlparse(value)
+        for candidate in re.findall(r"\d{10}|\d{12}", parsed.path):
+            return candidate
+        return ""
+
+    def _extract_checko_company_id(self, raw: str) -> str:
+        if self.detect_input_type(raw) != INPUT_TYPE_URL:
+            return ""
+        parsed = urlparse(raw)
+        if parsed.netloc.lower() not in {"checko.ru", "www.checko.ru"}:
+            return ""
+        match = re.search(r"-(\d{13})/?$", parsed.path)
+        return match.group(1) if match else ""
+
     def _split_fio_ru(self, fio: str) -> tuple[str, str, str]:
         parts = self._normalize_spaces(fio).split()
         if len(parts) >= 3:
@@ -313,7 +338,8 @@ class CompanyWebApp:
         if not cleaned:
             ru_parts = fallback_ru.split()
             opf_ru = ru_parts[-1] if ru_parts and ru_parts[-1] in RU_TO_EN_OPF else ""
-            name = " ".join(self._translit(tok) for tok in ru_parts[:-1])
+            name_tokens = ru_parts[:-1] if opf_ru else ru_parts
+            name = " ".join(self._translit(tok) for tok in name_tokens)
             cleaned = self._normalize_spaces(f"{name} {RU_TO_EN_OPF.get(opf_ru, '')}")
             notes.append("Organization EN: сгенерировано транслитерацией, нужно проверить")
 
@@ -344,9 +370,21 @@ class CompanyWebApp:
 
     def _search_external_sources(self, company_name: str) -> tuple[list[dict[str, Any]], list[str]]:
         input_type = self.detect_input_type(company_name)
-        normalized, _ = self.normalize_ru_org(company_name)
+        inn = self._extract_inn(company_name)
+        normalization_seed = inn if inn else company_name
+        normalized, _ = self.normalize_ru_org(normalization_seed)
         trace = [f"Входной запрос: {company_name}", f"Нормализованный запрос: {normalized}"]
         trace.append(f"Определён тип ввода: {input_type}")
+        company_id = self._extract_checko_company_id(company_name)
+        if inn:
+            trace.append(f"Выделен ИНН: {inn}")
+        if company_id:
+            trace.append(f"Выделен ID checko: {company_id}")
+
+        checko_hit, checko_trace = self._fetch_from_checko(company_name, inn)
+        trace.extend(checko_trace)
+        if checko_hit:
+            return [checko_hit], trace
 
         if input_type == INPUT_TYPE_URL:
             netloc = urlparse(company_name).netloc.lower()
@@ -377,6 +415,58 @@ class CompanyWebApp:
         trace.append(f"Совпадений по токену '{token}': {len(aggregated)}")
         return aggregated, trace
 
+    def _fetch_from_checko(self, raw_input: str, inn: str = "") -> tuple[dict[str, Any] | None, list[str]]:
+        trace: list[str] = []
+        parsed = urlparse(raw_input) if self.detect_input_type(raw_input) == INPUT_TYPE_URL else None
+        host = (parsed.netloc.lower() if parsed else "")
+
+        if host and host not in {"checko.ru", "www.checko.ru"}:
+            return None, trace
+        if not inn and host:
+            path_match = re.search(r"-(\d{10}|\d{12})/?$", parsed.path)
+            if path_match:
+                inn = path_match.group(1)
+        if not inn:
+            return None, trace
+
+        url = raw_input if host in {"checko.ru", "www.checko.ru"} else f"https://checko.ru/company/by-inn/{inn}"
+        trace.append(f"Запрос в checko.ru: {url}")
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=8) as response:
+                html = response.read().decode("utf-8", errors="ignore")
+        except Exception:
+            trace.append("checko.ru: данные не получены")
+            return None, trace
+
+        org_name = ""
+        title_match = re.search(r"<title>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+        if title_match:
+            title = re.sub(r"\s+", " ", title_match.group(1)).strip()
+            title = title.split("—", 1)[0].strip()
+            org_name = re.sub(r"\s*\(ИНН.*$", "", title, flags=re.IGNORECASE).strip()
+
+        if not org_name:
+            h1_match = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.IGNORECASE | re.DOTALL)
+            if h1_match:
+                org_name = re.sub(r"<[^>]+>", "", h1_match.group(1)).strip()
+
+        if not org_name:
+            trace.append("checko.ru: не удалось извлечь наименование")
+            return None, trace
+
+        ru_org, _ = self.normalize_ru_org(org_name)
+        en_org, _ = self.normalize_en_org("", ru_org)
+        trace.append(f"checko.ru: найдена организация {ru_org}")
+        return {
+            "source": "checko.ru",
+            "url": url,
+            "data": {
+                "ru_org": ru_org,
+                "en_org": en_org,
+            },
+        }, trace
+
     def _build_profile_from_sources(self, source_hits: list[dict[str, Any]], raw_name: str) -> tuple[dict[str, str], dict[str, str]]:
         profile = {field: "" for field, _ in CARD_FIELDS}
         field_sources: dict[str, str] = {}
@@ -400,6 +490,9 @@ class CompanyWebApp:
             field_sources["en_org"] = "Транслитерация из RU"
         else:
             profile["en_org"], _ = self.normalize_en_org(profile["en_org"], profile["ru_org"])
+
+        if not field_sources.get("en_org") and profile["en_org"]:
+            field_sources["en_org"] = "Нормализация/источник"
 
         if profile.get("surname_ru") or profile.get("name_ru"):
             profile["family_name"] = profile.get("family_name") or self._translit(profile.get("surname_ru", ""))
