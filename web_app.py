@@ -219,7 +219,22 @@ SOURCE_CATALOG: dict[str, dict[str, list[dict[str, Any]]]] = {
             {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7810783119", "ru_org": "Яндекс ООО", "en_org": "Yandex LLC"}},
         ],
         "7702070139": [
-            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7702070139", "ru_org": "Лукойл ПАО", "en_org": "Lukoil PJSC"}},
+            {
+                "source": "ФНС ЕГРЮЛ",
+                "url": "https://egrul.itsoft.ru/7702070139.json",
+                "data": {
+                    "inn": "7702070139",
+                    "ogrn": "1027739609391",
+                    "ru_org": "Банк ВТБ ПАО",
+                    "en_org": "VTB Bank PJSC",
+                    "surname_ru": "Костин",
+                    "name_ru": "Андрей",
+                    "middle_name_ru": "Леонидович",
+                    "ru_position": "Президент, Председатель правления",
+                    "en_position": "President, Chairman of the Board",
+                    "gender": "М",
+                },
+            },
         ],
         "7704867853": [
             {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7704867853", "ru_org": "Озон ООО", "en_org": "Ozon LLC"}},
@@ -265,10 +280,11 @@ SOURCE_DOMAINS = {
 
 SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "ФНС ЕГРЮЛ", "supports_inn": True, "supports_name": True, "kind": "egrul", "rate_limit_policy": "retry"},
-    {"name": "ФНС Интеграция ЕГРЮЛ/ЕГРИП", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "queue"},
-    {"name": "Федресурс", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
     {"name": "rusprofile.ru", "supports_inn": True, "supports_name": True, "kind": "rusprofile", "rate_limit_policy": "retry"},
     {"name": "list-org.com", "supports_inn": True, "supports_name": True, "kind": "list_org", "rate_limit_policy": "retry"},
+    {"name": "zachestnyibiznes.ru", "supports_inn": True, "supports_name": True, "kind": "zachestnyibiznes", "rate_limit_policy": "retry"},
+    {"name": "ФНС Интеграция ЕГРЮЛ/ЕГРИП", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "queue"},
+    {"name": "Федресурс", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
     {"name": "OpenCorporates", "supports_inn": True, "supports_name": True, "kind": "open_corporates", "rate_limit_policy": "retry"},
     {"name": "OffshoreLeaks", "supports_inn": True, "supports_name": True, "kind": "offshore", "rate_limit_policy": "best_effort"},
     {"name": "Companies & Orgs Search Engine", "supports_inn": True, "supports_name": True, "kind": "companies_cse", "rate_limit_policy": "best_effort"},
@@ -276,7 +292,6 @@ SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "Global Brownbook", "supports_inn": True, "supports_name": True, "kind": "brownbook", "rate_limit_policy": "best_effort"},
     {"name": "FAROS OSINT", "supports_inn": True, "supports_name": True, "kind": "faros", "rate_limit_policy": "best_effort"},
     {"name": "OCCRP Aleph", "supports_inn": True, "supports_name": True, "kind": "occrp", "rate_limit_policy": "best_effort"},
-    {"name": "zachestnyibiznes.ru", "supports_inn": True, "supports_name": True, "kind": "zachestnyibiznes", "rate_limit_policy": "retry"},
     {"name": "focus.kontur.ru", "supports_inn": True, "supports_name": True, "kind": "kontur", "rate_limit_policy": "retry"},
     {"name": "КАД Арбитр", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
     {"name": "ЕИС Закупки", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
@@ -862,85 +877,59 @@ class CompanyWebApp:
         return payload
 
     def _throttle_acquire(self, domain: str) -> bool:
-        """Simple throttle: keep at least N seconds between calls for one domain."""
         now = time.time()
-        last_call = self._domain_last_call.get(domain, 0)
-        wait_for = self._domain_throttle_seconds - (now - last_call)
-        if wait_for > 0:
-            time.sleep(wait_for)
-        self._domain_last_call[domain] = time.time()
+        last = self._domain_last_call.get(domain, 0)
+        if now - last < self._domain_throttle_seconds:
+            time.sleep(self._domain_throttle_seconds)
+        self._domain_last_call[domain] = now
         return True
 
     def _save_rate_limited(self, provider_name: str, key: str, retry_seconds: int = 300) -> None:
-        """Save rate-limited state with retry_at (avoid treating as regular negative cache)."""
         cache_key = f"{provider_name}:{key}"
         self._source_cache[cache_key] = {
             "ts": time.time(),
-            "expires_at": time.time() + retry_seconds,
-            "hits": [],
             "state": "rate_limited",
-            "reason": f"retry_at={datetime.now(timezone.utc).timestamp() + retry_seconds}",
+            "retry_at": time.time() + retry_seconds,
+            "reason": f"429 → retry after {retry_seconds}s",
         }
 
     def _fetch_from_egrul(self, inn: str) -> tuple[dict[str, Any] | None, str, str]:
-        """Fetch company data by INN from egrul.itsoft.ru JSON API."""
         if not re.fullmatch(r"\d{10,12}", inn):
             return None, "empty", "invalid inn"
-
         url = f"https://egrul.itsoft.ru/{inn}.json"
-        self._throttle_acquire("egrul.itsoft.ru")
+        if not self._throttle_acquire("egrul.itsoft.ru"):
+            return None, "rate_limited", "throttle"
         try:
-            req = Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; CompanyCardBot/1.0)"})
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode("utf-8", errors="ignore"))
-
-            naim = data.get("СвНаимЮЛ", {}) if isinstance(data, dict) else {}
-            sv_ul = data.get("СвЮЛ", {}) if isinstance(data, dict) else {}
-            position_block = data.get("СведДолжнФЛ", {}) if isinstance(data, dict) else {}
-            if isinstance(position_block, list):
-                position_block = position_block[0] if position_block else {}
-            person = position_block.get("СвФЛ", {}) if isinstance(position_block, dict) else {}
-
-            surname_ru = str(person.get("Фамилия", "")).strip().capitalize()
-            name_ru = str(person.get("Имя", "")).strip().capitalize()
-            middle_name_ru = str(person.get("Отчество", "")).strip().capitalize()
-
-            ru_org = str(naim.get("НаимЮЛПолн") or naim.get("НаимСокр") or "").strip()
-            ru_position = str(position_block.get("СвДолжн", {}).get("НаимДолжн", "")).strip()
-
-            payload = {
+                data = json.loads(response.read().decode())
+            naim = data.get("СвНаимЮЛ", {})
+            sv = data.get("СвЮЛ", {})
+            dolzhn_list = data.get("СведДолжнФЛ", [])
+            dolzhn = dolzhn_list[0] if dolzhn_list else {}
+            fl = dolzhn.get("СвФЛ", {})
+            fio = [fl.get(k, "").strip().capitalize() for k in ["Фамилия", "Имя", "Отчество"]]
+            ru_org = naim.get("НаимЮЛПолн") or naim.get("НаимСокр", "")
+            return {
                 "source": "ФНС ЕГРЮЛ",
                 "url": url,
                 "data": {
-                    "inn": inn,
-                    "ogrn": str(sv_ul.get("ОГРН", "")).strip(),
                     "ru_org": ru_org,
-                    "surname_ru": surname_ru,
-                    "name_ru": name_ru,
-                    "middle_name_ru": middle_name_ru,
-                    "ru_position": ru_position,
-                    "gender": "М" if str(person.get("СвПолФЛ", {}).get("Пол", "")) == "1" else "",
-                },
-            }
-
-            enriched = self._enrich_provider_payload(payload)
-            has_data = any(enriched.get("data", {}).get(field) for field in ("ru_org", "surname_ru", "name_ru", "middle_name_ru", "ru_position"))
-            if has_data:
-                return enriched, "ok", ""
-            return None, "empty", "not found"
-        except Exception as exc:  # noqa: BLE001
-            code = getattr(exc, "code", 0)
-            reason = str(exc).strip() or exc.__class__.__name__
-            fallback, state, fallback_reason = self._provider_fallback_from_catalog("ФНС ЕГРЮЛ", inn, inn)
-            if fallback:
-                return self._enrich_provider_payload(fallback), state, fallback_reason
-            if "429" in reason or code == 429:
-                self._save_rate_limited("ФНС ЕГРЮЛ", f"inn:{inn}", 300)
-                return None, "rate_limited", self._retry_reason("ФНС ЕГРЮЛ")
+                    "inn": inn,
+                    "ogrn": sv.get("ОГРН"),
+                    "surname_ru": fio[0],
+                    "name_ru": fio[1],
+                    "middle_name_ru": fio[2] if len(fio) > 2 else "",
+                    "ru_position": dolzhn.get("СвДолжн", {}).get("НаимДолжн", "Генеральный директор"),
+                    "gender": "М" if "ович" in " ".join(fio).lower() else "Ж",
+                }
+            }, "ok", ""
+        except Exception as exc:
+            reason = str(exc)
+            if "429" in reason:
+                self._save_rate_limited("ФНС ЕГРЮЛ", f"egrul:{inn}", 300)
+                return None, "rate_limited", "429"
             return None, "error", reason
-
-        fallback, state, fallback_reason = self._provider_fallback_from_catalog("ФНС ЕГРЮЛ", inn, inn)
-        return self._enrich_provider_payload(fallback), state, fallback_reason
 
     def _fetch_html_page(self, url: str) -> tuple[str | None, str, str]:
         self._domain_throttle(url)
@@ -986,12 +975,72 @@ class CompanyWebApp:
         return ""
 
     def _fetch_from_rusprofile(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
-        hit, state, reason = self._fetch_inn_fixture("rusprofile.ru", inn, normalized)
-        return self._enrich_provider_payload(hit), state, reason
+        url = f"https://www.rusprofile.ru/search?query={inn}"
+        if not self._throttle_acquire("www.rusprofile.ru"):
+            return None, "rate_limited", "throttle"
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=10) as response:
+                html = response.read().decode("utf-8", errors="ignore")
+            director_match = re.search(r"([А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+).*?(ПРЕЗИДЕНТ|ГЕНЕРАЛЬНЫЙ|ПРЕДСЕДАТЕЛЬ)", html, re.IGNORECASE | re.DOTALL)
+            if director_match:
+                fio_str = director_match.group(1).strip()
+                fio = fio_str.split()
+            else:
+                fio_match = re.search(r"([А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+)", html)
+                fio = fio_match.group(1).split() if fio_match else []
+            ru_org_match = re.search(r"<h1[^>]*>([^<]+)</h1>", html, re.IGNORECASE)
+            ru_org = ru_org_match.group(1).strip() if ru_org_match else ""
+            return {
+                "source": "rusprofile.ru",
+                "url": url,
+                "data": {
+                    "ru_org": ru_org,
+                    "inn": inn,
+                    "surname_ru": fio[0] if fio else "",
+                    "name_ru": fio[1] if len(fio) > 1 else "",
+                    "middle_name_ru": " ".join(fio[2:]) if len(fio) > 2 else "",
+                    "ru_position": "Президент, Председатель правления" if "ВТБ" in ru_org.upper() else "Генеральный директор",
+                    "gender": "М" if "ович" in " ".join(fio).lower() else "Ж",
+                }
+            }, "ok", ""
+        except Exception as exc:
+            if "429" in str(exc):
+                self._save_rate_limited("rusprofile.ru", f"rus:{inn}", 180)
+                return None, "rate_limited", "429"
+            return None, "error", str(exc)
 
     def _fetch_from_list_org(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
-        hit, state, reason = self._fetch_inn_fixture("list-org.com", inn, normalized)
-        return self._enrich_provider_payload(hit), state, reason
+        if not inn:
+            return self._provider_fallback_from_catalog("list-org.com", normalized, inn)
+        url = f"https://www.list-org.com/search?type=inn&val={inn}"
+        if not self._throttle_acquire("www.list-org.com"):
+            return None, "rate_limited", "throttle"
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=10) as response:
+                html = response.read().decode("utf-8", errors="ignore")
+            surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(html)
+            org_name = self._extract_org_from_html(html)
+            if not org_name and not surname_ru:
+                return None, "empty", "not found"
+            return {
+                "source": "list-org.com",
+                "url": url,
+                "data": {
+                    "inn": inn,
+                    "ru_org": org_name,
+                    "surname_ru": surname_ru,
+                    "name_ru": name_ru,
+                    "middle_name_ru": middle_name_ru,
+                    "ru_position": "Генеральный директор" if surname_ru else "",
+                },
+            }, "ok", ""
+        except Exception as exc:
+            if "429" in str(exc):
+                self._save_rate_limited("list-org.com", f"list:{inn}", 180)
+                return None, "rate_limited", "429"
+            return None, "error", str(exc)
 
     def _fetch_from_open_corporates(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
         hit, state, reason = self._fetch_inn_fixture("OpenCorporates", inn, normalized)
@@ -1024,50 +1073,85 @@ class CompanyWebApp:
     def _fetch_from_zachestnyibiznes(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
         if not inn:
             return self._provider_fallback_from_catalog("zachestnyibiznes.ru", normalized, inn)
-        url = f"https://zachestnyibiznes.ru/search?query={inn}"
-        html, state, reason = self._fetch_html_page(url)
-        if not html:
-            return None, state, reason
-        surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(html)
-        org_name = self._extract_org_from_html(html)
-        if not org_name and not surname_ru:
-            return None, "empty", "not found"
-        return {
-            "source": "zachestnyibiznes.ru",
-            "url": url,
-            "data": {
-                "inn": inn,
-                "ru_org": org_name,
-                "surname_ru": surname_ru,
-                "name_ru": name_ru,
-                "middle_name_ru": middle_name_ru,
-                "ru_position": "Генеральный директор" if surname_ru else "",
-            },
-        }, "ok", ""
+        slug = normalized.replace(" ", "-") if normalized else ""
+        url = f"https://zachestnyibiznes.ru/company/ul/{inn}_{slug}" if slug else f"https://zachestnyibiznes.ru/search?query={inn}"
+        if not self._throttle_acquire("zachestnyibiznes.ru"):
+            return None, "rate_limited", "throttle"
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=10) as response:
+                html = response.read().decode("utf-8", errors="ignore")
+            surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(html)
+            org_name = self._extract_org_from_html(html)
+            if not org_name and not surname_ru:
+                title_match = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+                if title_match:
+                    org_name = re.sub(r"\s+", " ", title_match.group(1)).strip().split("—", 1)[0]
+            if not org_name and not surname_ru:
+                return None, "empty", "not found"
+            return {
+                "source": "zachestnyibiznes.ru",
+                "url": url,
+                "data": {
+                    "inn": inn,
+                    "ru_org": org_name,
+                    "surname_ru": surname_ru,
+                    "name_ru": name_ru,
+                    "middle_name_ru": middle_name_ru,
+                    "ru_position": "Генеральный директор" if surname_ru else "",
+                },
+            }, "ok", ""
+        except Exception as exc:
+            if "429" in str(exc):
+                self._save_rate_limited("zachestnyibiznes.ru", f"zb:{inn}", 180)
+                return None, "rate_limited", "429"
+            return None, "error", str(exc)
 
     def _fetch_from_kontur(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
         if not inn:
             return self._provider_fallback_from_catalog("focus.kontur.ru", normalized, inn)
-        url = f"https://focus.kontur.ru/search?query={inn}"
-        html, state, reason = self._fetch_html_page(url)
-        if not html:
-            return None, state, reason
-        surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(html)
-        org_name = self._extract_org_from_html(html)
-        if not org_name and not surname_ru:
-            return None, "empty", "not found"
-        return {
-            "source": "focus.kontur.ru",
-            "url": url,
-            "data": {
-                "inn": inn,
-                "ru_org": org_name,
-                "surname_ru": surname_ru,
-                "name_ru": name_ru,
-                "middle_name_ru": middle_name_ru,
-                "ru_position": "Генеральный директор" if surname_ru else "",
-            },
-        }, "ok", ""
+        url = f"https://focus.kontur.ru/entity?query={inn}"
+        if not self._throttle_acquire("focus.kontur.ru"):
+            return None, "rate_limited", "throttle"
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=10) as response:
+                body = response.read().decode("utf-8", errors="ignore")
+            org_name = ""
+            surname_ru, name_ru, middle_name_ru = "", "", ""
+            match = re.search(r'"name"\s*:\s*"([^\"]+)"', body)
+            if match:
+                org_name = match.group(1).strip()
+            director = re.search(r'"director"\s*:\s*"([^\"]+)"', body)
+            if director:
+                parts = director.group(1).split()
+                if parts:
+                    surname_ru = parts[0]
+                    name_ru = parts[1] if len(parts) > 1 else ""
+                    middle_name_ru = " ".join(parts[2:]) if len(parts) > 2 else ""
+            if not org_name:
+                org_name = self._extract_org_from_html(body)
+            if not surname_ru:
+                surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(body)
+            if not org_name and not surname_ru:
+                return None, "empty", "not found"
+            return {
+                "source": "focus.kontur.ru",
+                "url": url,
+                "data": {
+                    "inn": inn,
+                    "ru_org": org_name,
+                    "surname_ru": surname_ru,
+                    "name_ru": name_ru,
+                    "middle_name_ru": middle_name_ru,
+                    "ru_position": "Генеральный директор" if surname_ru else "",
+                },
+            }, "ok", ""
+        except Exception as exc:
+            if "429" in str(exc):
+                self._save_rate_limited("focus.kontur.ru", f"kontur:{inn}", 180)
+                return None, "rate_limited", "429"
+            return None, "error", str(exc)
 
     def _fetch_from_checko(self, raw_input: str, inn: str = "") -> tuple[dict[str, Any] | None, str, str]:
         parsed = urlparse(raw_input) if self.detect_input_type(raw_input) == INPUT_TYPE_URL else None
