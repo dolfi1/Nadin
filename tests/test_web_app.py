@@ -205,5 +205,43 @@ def test_checko_inn_lookup_uses_external_source(monkeypatch, tmp_path):
     )
     assert status.startswith("200")
     assert "Выделен ID checko: 1071102001651" in review
-    assert "checko.ru: найдена организация Газпром Переработка ООО" in review
+    assert "checko.ru: OK" in review
     assert "<td>Источник</td><td>checko.ru</td>" not in review
+
+
+def test_input_routing_does_not_fill_fio_for_org_or_inn(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    _, _, org_review = call_app(app, "POST", "/autofill/review", form={"company_name": 'ООО "ГАЗПРОМ ПЕРЕРАБОТКА"'})
+    assert "Тип ввода: ORG_TEXT" in org_review
+    assert "<td>Фамилия</td><td></td>" in org_review
+    assert "<td>Имя</td><td></td>" in org_review
+    assert "<td>Отчество</td><td></td>" in org_review
+
+    _, _, inn_review = call_app(app, "POST", "/autofill/review", form={"company_name": "1102054991"})
+    assert "Тип ввода: INN" in inn_review
+    assert "<td>Фамилия</td><td></td>" in inn_review
+    assert "<td>Имя</td><td></td>" in inn_review
+
+
+def test_full_opf_normalization_moves_short_form_to_end(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    normalized, notes = app.normalize_ru_org("ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ «РОМАШКА»")
+    assert normalized == "Ромашка ООО"
+    assert any("полная ОПФ сокращена" in note for note in notes)
+
+
+def test_empty_title_status_is_not_filled(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    _, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "ПАО Сбербанк"})
+    assert "<td>Титул</td><td></td><td>—</td><td>Нужно заполнить</td>" in review
+
+
+def test_search_trace_has_no_internal_db_iterations(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    _, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "Газпром"})
+    assert "Проверка источников по записи" not in review
+    assert "Каталог источников: не получено" in review

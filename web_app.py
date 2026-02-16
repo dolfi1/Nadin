@@ -100,7 +100,8 @@ SOURCE_DOMAINS = {
 
 INPUT_TYPE_INN = "INN"
 INPUT_TYPE_URL = "URL"
-INPUT_TYPE_TEXT = "TEXT"
+INPUT_TYPE_ORG_TEXT = "ORG_TEXT"
+INPUT_TYPE_PERSON_TEXT = "PERSON_TEXT"
 
 CARD_FIELDS: list[tuple[str, str]] = [
     ("title", "Титул"),
@@ -227,7 +228,28 @@ class CompanyWebApp:
             return INPUT_TYPE_INN
         if re.match(r"https?://", value, flags=re.IGNORECASE):
             return INPUT_TYPE_URL
-        return INPUT_TYPE_TEXT
+        if self._contains_org_form(value):
+            return INPUT_TYPE_ORG_TEXT
+        if self._looks_like_person_text(value):
+            return INPUT_TYPE_PERSON_TEXT
+        return INPUT_TYPE_ORG_TEXT
+
+    def _contains_org_form(self, value: str) -> bool:
+        upper = value.upper()
+        short_forms = "|".join(re.escape(opf) for opf in RU_TO_EN_OPF)
+        if re.search(rf"\b({short_forms})\b", upper):
+            return True
+        return any(full in upper for full in FULL_RU_OPF)
+
+    def _looks_like_person_text(self, value: str) -> bool:
+        if any(ch in value for ch in '"«»“”'):
+            return False
+        if self._contains_org_form(value):
+            return False
+        parts = value.split()
+        if len(parts) not in {2, 3}:
+            return False
+        return all(re.fullmatch(r"[А-Яа-яЁё-]+", part) for part in parts)
 
     def _extract_inn(self, raw: str) -> str:
         value = self._normalize_spaces(raw)
@@ -288,13 +310,10 @@ class CompanyWebApp:
         return ""
 
     def _field_statuses(self, profile: dict[str, str], notes: list[str]) -> dict[str, str]:
-        need_fill = {"gender", "ru_position", "en_position"}
         statuses: dict[str, str] = {}
         for field, _ in CARD_FIELDS:
             value = self._normalize_spaces(profile.get(field, ""))
-            if field in need_fill and not value:
-                statuses[field] = "Нужно заполнить"
-            elif not value and field not in {"title", "middle_name", "middle_name_ru"}:
+            if not value:
                 statuses[field] = "Нужно заполнить"
             else:
                 statuses[field] = "Заполнено"
@@ -313,8 +332,8 @@ class CompanyWebApp:
         notes: list[str] = []
         cleaned = self._normalize_spaces(self._strip_noise(raw.upper()))
         for full, short in FULL_RU_OPF.items():
-            if cleaned.startswith(full + " "):
-                cleaned = cleaned.replace(full, short, 1)
+            if full in cleaned:
+                cleaned = cleaned.replace(full, short)
                 notes.append("RU организация: полная ОПФ сокращена")
         tokens = cleaned.split()
         opf = ""
@@ -373,16 +392,18 @@ class CompanyWebApp:
         inn = self._extract_inn(company_name)
         normalization_seed = inn if inn else company_name
         normalized, _ = self.normalize_ru_org(normalization_seed)
-        trace = [f"Входной запрос: {company_name}", f"Нормализованный запрос: {normalized}"]
-        trace.append(f"Определён тип ввода: {input_type}")
+        trace = [
+            f"Тип ввода: {input_type}",
+            f"Нормализованное название/ключ поиска: {normalized}",
+        ]
         company_id = self._extract_checko_company_id(company_name)
         if inn:
-            trace.append(f"Выделен ИНН: {inn}")
+            trace.append(f"ИНН: {inn}")
         if company_id:
             trace.append(f"Выделен ID checko: {company_id}")
 
-        checko_hit, checko_trace = self._fetch_from_checko(company_name, inn)
-        trace.extend(checko_trace)
+        checko_hit, checko_status = self._fetch_from_checko(company_name, inn)
+        trace.append(checko_status)
         if checko_hit:
             return [checko_hit], trace
 
@@ -390,54 +411,58 @@ class CompanyWebApp:
             netloc = urlparse(company_name).netloc.lower()
             source_name = SOURCE_DOMAINS.get(netloc)
             if source_name:
-                trace.append(f"Источник определён по домену: {source_name}")
+                trace.append(f"{source_name}: OK (определён по URL)")
                 for records in SOURCE_CATALOG.values():
                     matches = [record for record in records if record.get("source") == source_name]
                     if matches:
                         return matches, trace
-            trace.append("URL не распознан как поддерживаемый источник")
+                trace.append(f"{source_name}: не получено (в источниках нет данных по запросу)")
+            else:
+                trace.append("URL-источник: не получено (домен не поддерживается)")
 
         candidates = SOURCE_CATALOG.get(normalized.upper(), [])
         if candidates:
-            trace.append(f"Точное совпадение по справочнику: {normalized.upper()}")
+            trace.append("Каталог источников: OK")
             return candidates, trace
 
         token = normalized.split()[0].upper() if normalized else ""
         if not token:
-            trace.append("Поиск прерван: пустой токен после нормализации")
+            trace.append("Каталог источников: не получено (пустой ключ поиска)")
             return [], trace
 
         aggregated: list[dict[str, str]] = []
         for org_name, records in SOURCE_CATALOG.items():
-            trace.append(f"Проверка источников по записи: {org_name}")
             if token in org_name:
                 aggregated.extend(records)
-        trace.append(f"Совпадений по токену '{token}': {len(aggregated)}")
+        if aggregated:
+            trace.append(f"Каталог источников: OK (найдено {len(aggregated)})")
+        else:
+            trace.append("Каталог источников: не получено (в источниках нет данных по запросу)")
         return aggregated, trace
 
-    def _fetch_from_checko(self, raw_input: str, inn: str = "") -> tuple[dict[str, Any] | None, list[str]]:
-        trace: list[str] = []
+    def _fetch_from_checko(self, raw_input: str, inn: str = "") -> tuple[dict[str, Any] | None, str]:
         parsed = urlparse(raw_input) if self.detect_input_type(raw_input) == INPUT_TYPE_URL else None
         host = (parsed.netloc.lower() if parsed else "")
 
         if host and host not in {"checko.ru", "www.checko.ru"}:
-            return None, trace
+            return None, "checko.ru: не получено (домен не checko.ru)"
         if not inn and host:
             path_match = re.search(r"-(\d{10}|\d{12})/?$", parsed.path)
             if path_match:
                 inn = path_match.group(1)
         if not inn:
-            return None, trace
+            return None, "checko.ru: не получено (ИНН не найден во входе)"
 
         url = raw_input if host in {"checko.ru", "www.checko.ru"} else f"https://checko.ru/company/by-inn/{inn}"
-        trace.append(f"Запрос в checko.ru: {url}")
         try:
             req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urlopen(req, timeout=8) as response:
                 html = response.read().decode("utf-8", errors="ignore")
-        except Exception:
-            trace.append("checko.ru: данные не получены")
-            return None, trace
+        except TimeoutError:
+            return None, "checko.ru: не получено (timeout)"
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc).strip() or exc.__class__.__name__
+            return None, f"checko.ru: не получено ({reason})"
 
         org_name = ""
         title_match = re.search(r"<title>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
@@ -452,12 +477,10 @@ class CompanyWebApp:
                 org_name = re.sub(r"<[^>]+>", "", h1_match.group(1)).strip()
 
         if not org_name:
-            trace.append("checko.ru: не удалось извлечь наименование")
-            return None, trace
+            return None, "checko.ru: не получено (parse error)"
 
         ru_org, _ = self.normalize_ru_org(org_name)
         en_org, _ = self.normalize_en_org("", ru_org)
-        trace.append(f"checko.ru: найдена организация {ru_org}")
         return {
             "source": "checko.ru",
             "url": url,
@@ -465,9 +488,14 @@ class CompanyWebApp:
                 "ru_org": ru_org,
                 "en_org": en_org,
             },
-        }, trace
+        }, "checko.ru: OK"
 
-    def _build_profile_from_sources(self, source_hits: list[dict[str, Any]], raw_name: str) -> tuple[dict[str, str], dict[str, str]]:
+    def _build_profile_from_sources(
+        self,
+        source_hits: list[dict[str, Any]],
+        raw_name: str,
+        input_type: str,
+    ) -> tuple[dict[str, str], dict[str, str]]:
         profile = {field: "" for field, _ in CARD_FIELDS}
         field_sources: dict[str, str] = {}
 
@@ -499,7 +527,7 @@ class CompanyWebApp:
             profile["first_name"] = profile.get("first_name") or self._translit(profile.get("name_ru", ""))
             profile["middle_name"] = profile.get("middle_name") or ""
 
-        if not profile.get("surname_ru") and not profile.get("name_ru"):
+        if input_type == INPUT_TYPE_PERSON_TEXT and not profile.get("surname_ru") and not profile.get("name_ru"):
             sur, nam, patr = self._split_fio_ru(raw_name)
             profile["surname_ru"] = sur
             profile["name_ru"] = nam
@@ -564,8 +592,9 @@ class CompanyWebApp:
 
     def autofill_review(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         raw = self._get_one(form, "company_name")
+        input_type = self.detect_input_type(raw)
         source_hits, search_trace = self._search_external_sources(raw)
-        profile, field_sources = self._build_profile_from_sources(source_hits, raw)
+        profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type)
 
         ru_org, ru_notes = self.normalize_ru_org(profile["ru_org"])
         en_org, en_notes = self.normalize_en_org(profile["en_org"], ru_org)
@@ -580,7 +609,7 @@ class CompanyWebApp:
         if source_hits:
             notes.append(f"Источники: найдено {len(source_hits)}")
         else:
-            notes.append("Источники: совпадения не найдены, использована нормализация")
+            notes.append("Источники: не получено (в источниках нет данных по запросу)")
 
         field_statuses = self._field_statuses(profile, notes)
 
