@@ -138,3 +138,35 @@ def test_csv_export_and_audit_log(tmp_path):
     _, _, csv_body = call_app(app, "GET", f"{headers['Location']}/export.csv")
     assert "ru_org" in csv_body
     assert "Romashka LLC" in csv_body
+
+
+def test_search_by_inn_finds_existing_card(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    status, headers, _ = call_app(
+        app,
+        "POST",
+        "/autofill/confirm",
+        form={
+            "action": "create",
+            "input_value": "7707083893",
+            "ru_org": "Сбербанк ПАО",
+            "en_org": "Sberbank PJSC",
+        },
+    )
+    assert status.startswith("302")
+
+    search_status, search_headers, _ = call_app(app, "GET", "/", query="q=7707083893")
+    assert search_status.startswith("302")
+    assert search_headers["Location"] == headers["Location"]
+
+
+def test_autofill_review_has_required_actions_and_statuses(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "https://spark-interfax.ru/company/sber"})
+    assert status.startswith("200")
+    assert "✅ Создать карту" in review
+    assert "✏️ Отредактировать" in review
+    assert "❌ Отмена" in review
+    assert "Нужно заполнить" in review

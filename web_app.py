@@ -11,6 +11,7 @@ from html import escape
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs
+from urllib.parse import urlparse
 from wsgiref.simple_server import make_server
 
 RU_TO_EN_OPF = {
@@ -84,6 +85,18 @@ SOURCE_CATALOG: dict[str, list[dict[str, Any]]] = {
         },
     ],
 }
+
+SOURCE_DOMAINS = {
+    "egrul.nalog.ru": "ЕГРЮЛ",
+    "spark-interfax.ru": "СПАРК",
+    "focus.kontur.ru": "Контур.Фокус",
+    "rusprofile.ru": "Rusprofile",
+    "www.rusprofile.ru": "Rusprofile",
+}
+
+INPUT_TYPE_INN = "INN"
+INPUT_TYPE_URL = "URL"
+INPUT_TYPE_TEXT = "TEXT"
 
 CARD_FIELDS: list[tuple[str, str]] = [
     ("title", "Титул"),
@@ -204,6 +217,73 @@ class CompanyWebApp:
     def _strip_noise(self, text: str) -> str:
         return re.sub(r"[\"'“”«»()\[\]{}.,;:!?]", " ", text)
 
+    def detect_input_type(self, raw: str) -> str:
+        value = self._normalize_spaces(raw)
+        if re.fullmatch(r"\d{10}|\d{12}", value):
+            return INPUT_TYPE_INN
+        if re.match(r"https?://", value, flags=re.IGNORECASE):
+            return INPUT_TYPE_URL
+        return INPUT_TYPE_TEXT
+
+    def _split_fio_ru(self, fio: str) -> tuple[str, str, str]:
+        parts = self._normalize_spaces(fio).split()
+        if len(parts) >= 3:
+            return parts[0].capitalize(), parts[1].capitalize(), parts[2].capitalize()
+        if len(parts) == 2:
+            return parts[0].capitalize(), parts[1].capitalize(), ""
+        if len(parts) == 1:
+            return parts[0].capitalize(), "", ""
+        return "", "", ""
+
+    def _normalize_positions_ru(self, raw: str) -> tuple[str, list[str]]:
+        notes: list[str] = []
+        items = [self._normalize_spaces(x) for x in raw.split(",") if self._normalize_spaces(x)]
+        normalized: list[str] = []
+        for item in items:
+            cleaned = item.replace("ИО", "Исполняющий обязанности")
+            if cleaned != item:
+                notes.append("Должность RU: сокращения раскрыты")
+            normalized.append(cleaned[:1].upper() + cleaned[1:] if cleaned else "")
+        return ", ".join(normalized), notes
+
+    def _normalize_positions_en(self, raw: str) -> tuple[str, list[str]]:
+        notes: list[str] = []
+        raw = raw.replace(" and ", ", ").replace(" & ", ", ")
+        items = [self._normalize_spaces(x) for x in raw.split(",") if self._normalize_spaces(x)]
+        normalized = [" ".join(w.capitalize() for w in item.split()) for item in items]
+        if " and " in raw.lower() or " & " in raw:
+            notes.append("Position EN: разделители приведены к запятым")
+        return ", ".join(normalized), notes
+
+    def _derive_salutation(self, gender: str) -> str:
+        if gender == "М":
+            return "Г-н"
+        if gender == "Ж":
+            return "Г-жа"
+        return ""
+
+    def _field_statuses(self, profile: dict[str, str], notes: list[str]) -> dict[str, str]:
+        need_fill = {"gender", "ru_position", "en_position"}
+        statuses: dict[str, str] = {}
+        for field, _ in CARD_FIELDS:
+            value = self._normalize_spaces(profile.get(field, ""))
+            if field in need_fill and not value:
+                statuses[field] = "Нужно заполнить"
+            elif not value and field not in {"title", "middle_name", "middle_name_ru"}:
+                statuses[field] = "Нужно заполнить"
+            else:
+                statuses[field] = "Заполнено"
+
+        if any("нужно проверить" in n.lower() or "translit" in n.lower() for n in notes):
+            for field in ("en_org", "en_position"):
+                if statuses.get(field) == "Заполнено":
+                    statuses[field] = "Нужно проверить"
+        if any("сокращ" in n.lower() for n in notes) and statuses.get("ru_position") == "Заполнено":
+            statuses["ru_position"] = "Нужно проверить"
+        if not profile.get("gender"):
+            statuses["gender"] = "Нужно заполнить"
+        return statuses
+
     def normalize_ru_org(self, raw: str) -> tuple[str, list[str]]:
         notes: list[str] = []
         cleaned = self._normalize_spaces(self._strip_noise(raw.upper()))
@@ -263,8 +343,22 @@ class CompanyWebApp:
         return "Найдено"
 
     def _search_external_sources(self, company_name: str) -> tuple[list[dict[str, Any]], list[str]]:
+        input_type = self.detect_input_type(company_name)
         normalized, _ = self.normalize_ru_org(company_name)
         trace = [f"Входной запрос: {company_name}", f"Нормализованный запрос: {normalized}"]
+        trace.append(f"Определён тип ввода: {input_type}")
+
+        if input_type == INPUT_TYPE_URL:
+            netloc = urlparse(company_name).netloc.lower()
+            source_name = SOURCE_DOMAINS.get(netloc)
+            if source_name:
+                trace.append(f"Источник определён по домену: {source_name}")
+                for records in SOURCE_CATALOG.values():
+                    matches = [record for record in records if record.get("source") == source_name]
+                    if matches:
+                        return matches, trace
+            trace.append("URL не распознан как поддерживаемый источник")
+
         candidates = SOURCE_CATALOG.get(normalized.upper(), [])
         if candidates:
             trace.append(f"Точное совпадение по справочнику: {normalized.upper()}")
@@ -307,6 +401,25 @@ class CompanyWebApp:
         else:
             profile["en_org"], _ = self.normalize_en_org(profile["en_org"], profile["ru_org"])
 
+        if profile.get("surname_ru") or profile.get("name_ru"):
+            profile["family_name"] = profile.get("family_name") or self._translit(profile.get("surname_ru", ""))
+            profile["first_name"] = profile.get("first_name") or self._translit(profile.get("name_ru", ""))
+            profile["middle_name"] = profile.get("middle_name") or ""
+
+        if not profile.get("surname_ru") and not profile.get("name_ru"):
+            sur, nam, patr = self._split_fio_ru(raw_name)
+            profile["surname_ru"] = sur
+            profile["name_ru"] = nam
+            profile["middle_name_ru"] = patr
+            if sur:
+                profile["family_name"] = self._translit(sur)
+            if nam:
+                profile["first_name"] = self._translit(nam)
+
+        profile["salutation"] = self._derive_salutation(profile.get("gender", ""))
+        profile["ru_position"], _ = self._normalize_positions_ru(profile.get("ru_position", ""))
+        profile["en_position"], _ = self._normalize_positions_en(profile.get("en_position", ""))
+
         return profile, field_sources
 
     def _write_audit(self, action: str, card_id: int | None, details: dict[str, Any]) -> None:
@@ -324,8 +437,12 @@ class CompanyWebApp:
         similar: list[sqlite3.Row] = []
         if q:
             normalized, _ = self.normalize_ru_org(q)
+            input_type = self.detect_input_type(q)
             with self._connect() as db:
-                exact = db.execute("SELECT * FROM cards WHERE ru_org=? ORDER BY id DESC", (normalized,)).fetchall()
+                if input_type == INPUT_TYPE_INN:
+                    exact = db.execute("SELECT * FROM cards WHERE json_extract(data_json, '$.profile.inn')=? ORDER BY id DESC", (q,)).fetchall()
+                else:
+                    exact = db.execute("SELECT * FROM cards WHERE ru_org=? OR json_extract(data_json, '$.profile.source_id')=? ORDER BY id DESC", (normalized, q)).fetchall()
                 similar = db.execute("SELECT * FROM cards WHERE ru_org LIKE ? ORDER BY id DESC LIMIT 10", (f"%{normalized.split()[0]}%",)).fetchall()
             if exact:
                 return "", "302 Found", [("Location", f"/card/{exact[0]['id']}")]
@@ -342,7 +459,7 @@ class CompanyWebApp:
             norm=f"<p><b>Нормализовано:</b> {escape(normalized)}</p>" if normalized else "",
             not_found=(
                 f"<p>Карточка не найдена. Создать?</p>"
-                f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(q)}' /><button>Автосбор из открытых источников</button></form>"
+                f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(q)}' /><button>Автозаполнить из открытых источников</button></form>"
                 f"<a href='/create/manual?q={escape(q)}'>Создать вручную</a>"
             )
             if normalized and not exact
@@ -359,13 +476,20 @@ class CompanyWebApp:
 
         ru_org, ru_notes = self.normalize_ru_org(profile["ru_org"])
         en_org, en_notes = self.normalize_en_org(profile["en_org"], ru_org)
+        ru_pos, ru_pos_notes = self._normalize_positions_ru(profile.get("ru_position", ""))
+        en_pos, en_pos_notes = self._normalize_positions_en(profile.get("en_position", ""))
         profile["ru_org"] = ru_org
         profile["en_org"] = en_org
-        notes = ru_notes + en_notes
+        profile["ru_position"] = ru_pos
+        profile["en_position"] = en_pos
+        profile["salutation"] = self._derive_salutation(profile.get("gender", ""))
+        notes = ru_notes + en_notes + ru_pos_notes + en_pos_notes
         if source_hits:
             notes.append(f"Источники: найдено {len(source_hits)}")
         else:
             notes.append("Источники: совпадения не найдены, использована нормализация")
+
+        field_statuses = self._field_statuses(profile, notes)
 
         source_hidden = "".join(f"<input type='hidden' name='source_name' value='{escape(item['source'])}'/>" for item in source_hits)
         trace_hidden = "".join(f"<input type='hidden' name='search_trace' value='{escape(step)}'/>" for step in search_trace)
@@ -386,7 +510,7 @@ class CompanyWebApp:
             + "</ul>"
         ) if source_hits else "<p>В доступных источниках совпадений не найдено.</p>"
         source_table_rows = "".join(
-            f"<tr><td>{escape(label)}</td><td>{escape(profile.get(field, ''))}</td><td>{escape(field_sources.get(field, '—'))}</td></tr>"
+            f"<tr><td>{escape(label)}</td><td>{escape(profile.get(field, ''))}</td><td>{escape(field_sources.get(field, '—'))}</td><td>{escape(field_statuses.get(field, ''))}</td></tr>"
             for field, label in CARD_FIELDS
         )
         search_trace_list = "<h3>Как происходил поиск</h3><ol>" + "".join(f"<li>{escape(step)}</li>" for step in search_trace) + "</ol>"
@@ -395,18 +519,24 @@ class CompanyWebApp:
             f"{source_list}"
             f"{search_trace_list}"
             "<h3>Карточка и источники по полям</h3>"
-            "<table border='1' cellpadding='6' cellspacing='0'><tr><th>Поле</th><th>Значение</th><th>Источник</th></tr>"
+            "<table border='1' cellpadding='6' cellspacing='0'><tr><th>Поле</th><th>Значение</th><th>Источник</th><th>Статус</th></tr>"
             f"{source_table_rows}</table>"
             "<form method='post' action='/autofill/confirm'>"
             f"<p>RU: <input name='ru_org' value='{escape(ru_org)}'/></p>"
             f"<p>EN: <input name='en_org' value='{escape(en_org)}'/></p>"
+            f"<input type='hidden' name='input_value' value='{escape(raw)}'/>"
             f"{hidden}{source_hidden}{trace_hidden}{field_source_hidden}{profile_hidden}"
-            "<button>Подтвердить и сохранить</button></form>"
+            "<button name='action' value='create'>✅ Создать карту</button>"
+            "<button name='action' value='edit'>✏️ Отредактировать</button>"
+            "<button name='action' value='cancel'>❌ Отмена</button></form>"
         )
         body = self._page("Автосбор: черновик", content, back_href="/")
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
     def autofill_confirm(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
+        action = self._get_one(form, "action") or "create"
+        if action == "cancel":
+            return "", "302 Found", [("Location", "/")]
         ru_org = self._get_one(form, "ru_org")
         en_org = self._get_one(form, "en_org")
         notes = form.get("notes", [])
@@ -424,6 +554,16 @@ class CompanyWebApp:
         }
         profile_data["ru_org"] = ru_org
         profile_data["en_org"] = en_org
+        input_value = self._get_one(form, "input_value")
+        if self.detect_input_type(input_value) == INPUT_TYPE_INN:
+            profile_data["inn"] = input_value
+        elif self.detect_input_type(input_value) == INPUT_TYPE_URL:
+            profile_data["source_id"] = input_value
+
+        if action == "edit":
+            q = ru_org or input_value
+            return "", "302 Found", [("Location", f"/create/manual?q={q}")]
+
         status = self._status(notes, bool(ru_org and en_org))
         with self._connect() as db:
             cur = db.execute(
@@ -513,10 +653,16 @@ class CompanyWebApp:
         payload = json.loads(card["data_json"] or "{}")
         trace = payload.get("search_trace", [])
         trace_html = "<h3>Как происходил поиск</h3><ol>" + "".join(f"<li>{escape(step)}</li>" for step in trace) + "</ol>" if trace else ""
+        profile = payload.get("profile", {})
+        if not profile:
+            profile = {field: "" for field, _ in CARD_FIELDS}
+            profile["ru_org"] = card["ru_org"]
+            profile["en_org"] = card["en_org"]
+        lines = "".join(f"<tr><td>{escape(label)}</td><td>{escape(profile.get(field, ''))}</td></tr>" for field, label in CARD_FIELDS)
         content = (
             f"<h2>Карточка #{card['id']}</h2>"
-            f"<p>Организация RU: {escape(card['ru_org'])}</p>"
-            f"<p>Organization EN: {escape(card['en_org'])}</p>"
+            "<table border='1' cellpadding='6' cellspacing='0'>"
+            f"{lines}</table>"
             f"<p>Статус: {escape(card['status'])}</p>"
             f"<p>Источник: {escape(card['source'])}</p>"
             f"<p><a href='/card/{card['id']}/edit'>Редактировать карточку</a></p>"
