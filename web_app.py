@@ -99,6 +99,9 @@ class CompanyWebApp:
             elif re.fullmatch(r"/card/\d+/export.csv", path) and method == "GET":
                 card_id = int(path.split("/")[-2])
                 body, status, headers = self.export_csv(card_id)
+            elif re.fullmatch(r"/card/\d+/export", path) and method == "GET":
+                card_id = int(path.split("/")[-2])
+                body, status, headers = self.export_preview(card_id)
             else:
                 body, status, headers = "Not found", "404 Not Found", [("Content-Type", "text/plain; charset=utf-8")]
         except Exception as exc:  # noqa: BLE001
@@ -117,6 +120,15 @@ class CompanyWebApp:
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    def _page(self, title: str, content: str, back_href: str = "/") -> str:
+        nav = (
+            "<nav style='margin-bottom: 16px'>"
+            "<a href='/' style='margin-right: 12px'>🏠 Главная</a>"
+            f"<a href='{escape(back_href)}'>← Назад</a>"
+            "</nav>"
+        )
+        return f"<html><head><meta charset='utf-8'><title>{escape(title)}</title></head><body>{nav}{content}</body></html>"
 
     def _normalize_spaces(self, text: str) -> str:
         return re.sub(r"\s+", " ", text).strip()
@@ -204,7 +216,7 @@ class CompanyWebApp:
                 return "", "302 Found", [("Location", f"/card/{exact[0]['id']}")]
 
         items = "".join(f"<li><a href='/card/{r['id']}'>{escape(r['ru_org'])}</a></li>" for r in similar)
-        body = (
+        content = (
             "<h1>Карточки компаний/участников</h1>"
             "<form method='get' action='/'><input name='q' value='{q}' /><button>Найти</button></form>"
             "{norm}"
@@ -222,6 +234,7 @@ class CompanyWebApp:
             else "",
             similar=f"<h3>Похожие варианты</h3><ul>{items}</ul>" if similar else "",
         )
+        body = self._page("Карточки компаний/участников", content)
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
     def autofill_review(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
@@ -230,7 +243,7 @@ class CompanyWebApp:
         en_org, en_notes = self.normalize_en_org("", ru_org)
         notes = ru_notes + en_notes
         hidden = "".join(f"<input type='hidden' name='notes' value='{escape(n)}'/>" for n in notes)
-        body = (
+        content = (
             "<h2>Автосбор: черновик</h2>"
             "<form method='post' action='/autofill/confirm'>"
             f"<p>RU: <input name='ru_org' value='{escape(ru_org)}'/></p>"
@@ -238,6 +251,7 @@ class CompanyWebApp:
             f"{hidden}"
             "<button>Подтвердить и сохранить</button></form>"
         )
+        body = self._page("Автосбор: черновик", content, back_href="/")
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
     def autofill_confirm(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
@@ -258,7 +272,7 @@ class CompanyWebApp:
     def manual_get(self, query: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         q = (query.get("q") or [""])[0]
         ru_org, _ = self.normalize_ru_org(q) if q else ("", [])
-        body = (
+        content = (
             "<h2>Ручное создание</h2>"
             "<form method='post' action='/create/manual'>"
             f"<p>Организация RU <input name='ru_org' value='{escape(ru_org)}'></p>"
@@ -270,6 +284,7 @@ class CompanyWebApp:
             "<p>Position EN <input name='en_position'></p>"
             "<button>Сохранить</button></form>"
         )
+        body = self._page("Ручное создание", content, back_href="/")
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
     def manual_post(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
@@ -312,15 +327,36 @@ class CompanyWebApp:
         entries = "".join(
             f"<li>{escape(a['created_at'])} — {escape(a['action'])} ({escape(a['actor'])})</li>" for a in audits
         )
-        body = (
+        content = (
             f"<h2>Карточка #{card['id']}</h2>"
             f"<p>Организация RU: {escape(card['ru_org'])}</p>"
             f"<p>Organization EN: {escape(card['en_org'])}</p>"
             f"<p>Статус: {escape(card['status'])}</p>"
             f"<p>Источник: {escape(card['source'])}</p>"
-            f"<a href='/card/{card['id']}/export.csv'>Экспорт CSV</a>"
+            f"<a href='/card/{card['id']}/export'>Показать данные карточки на сайте</a>"
             "<h3>Audit log</h3><ul>" + entries + "</ul>"
         )
+        body = self._page(f"Карточка #{card['id']}", content, back_href="/")
+        return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
+
+    def export_preview(self, card_id: int) -> tuple[str, str, list[tuple[str, str]]]:
+        with self._connect() as db:
+            card = db.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
+        if not card:
+            return "Not found", "404 Not Found", [("Content-Type", "text/plain; charset=utf-8")]
+
+        content = (
+            f"<h2>Данные карточки #{card['id']}</h2>"
+            "<table border='1' cellpadding='6' cellspacing='0'>"
+            f"<tr><td>id</td><td>{card['id']}</td></tr>"
+            f"<tr><td>ru_org</td><td>{escape(card['ru_org'])}</td></tr>"
+            f"<tr><td>en_org</td><td>{escape(card['en_org'])}</td></tr>"
+            f"<tr><td>status</td><td>{escape(card['status'])}</td></tr>"
+            f"<tr><td>source</td><td>{escape(card['source'])}</td></tr>"
+            f"<tr><td>created_at</td><td>{escape(card['created_at'])}</td></tr>"
+            "</table>"
+        )
+        body = self._page(f"Данные карточки #{card['id']}", content, back_href=f"/card/{card_id}")
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
     def export_csv(self, card_id: int) -> tuple[str, str, list[tuple[str, str]]]:
