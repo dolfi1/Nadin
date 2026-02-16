@@ -125,11 +125,75 @@ SOURCE_CATALOG: dict[str, dict[str, list[dict[str, Any]]]] = {
                 },
             },
             {
+                "source": "OpenCorporates",
+                "url": "https://opencorporates.com/companies/ru/1071102001651",
+                "data": {
+                    "inn": "1102054991",
+                    "ogrn": "1071102001651",
+                    "ru_org": "Газпром Переработка ООО",
+                    "en_org": "Gazprom Pererabotka LLC",
+                },
+            },
+            {
+                "source": "OffshoreLeaks",
+                "url": "https://offshoreleaks.icij.org/search?q=Gazprom",
+                "data": {
+                    "ru_org": "Газпром Переработка ООО",
+                    "en_org": "Gazprom Pererabotka LLC",
+                },
+            },
+            {
                 "source": "zachestnyibiznes.ru",
                 "url": "https://zachestnyibiznes.ru/company/ul/1071102001651_1102054991_OOO-GAZPROM-PERERABOTKA",
                 "data": {
                     "inn": "1102054991",
                     "ogrn": "1071102001651",
+                },
+            },
+        ],
+        "5003021311": [
+            {
+                "source": "ФНС ЕГРЮЛ",
+                "url": "https://egrul.nalog.ru/",
+                "data": {
+                    "inn": "5003021311",
+                    "ogrn": "1025000653930",
+                    "ru_org": "Газпром Межрегионгаз ООО",
+                    "en_org": "Gazprom Mezhregiongaz LLC",
+                },
+            },
+            {
+                "source": "list-org.com",
+                "url": "https://www.list-org.com/company/134905",
+                "data": {
+                    "inn": "5003021311",
+                    "ogrn": "1025000653930",
+                    "ru_org": "Газпром Межрегионгаз ООО",
+                    "en_org": "Gazprom Mezhregiongaz LLC",
+                    "surname_ru": "Густов",
+                    "name_ru": "Сергей",
+                    "middle_name_ru": "Вадимович",
+                    "ru_position": "Генеральный директор",
+                    "en_position": "General Director",
+                    "gender": "М",
+                },
+            },
+            {
+                "source": "OpenCorporates",
+                "url": "https://opencorporates.com/companies/ru/1025000653930",
+                "data": {
+                    "inn": "5003021311",
+                    "ogrn": "1025000653930",
+                    "ru_org": "Газпром Межрегионгаз ООО",
+                    "en_org": "Gazprom Mezhregiongaz LLC",
+                },
+            },
+            {
+                "source": "OffshoreLeaks",
+                "url": "https://offshoreleaks.icij.org/search?q=Mezhregiongaz",
+                "data": {
+                    "ru_org": "Газпром Межрегионгаз ООО",
+                    "en_org": "Gazprom Mezhregiongaz LLC",
                 },
             },
         ],
@@ -163,6 +227,18 @@ SOURCE_CATALOG: dict[str, dict[str, list[dict[str, Any]]]] = {
         "7736050003": [
             {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7736050003", "ru_org": "Ростелеком ПАО", "en_org": "Rostelecom PJSC"}},
         ],
+        "7708503727": [
+            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7708503727", "ru_org": "Газпром Нефть ПАО", "en_org": "Gazprom Neft PJSC"}},
+        ],
+        "7728715184": [
+            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7728715184", "ru_org": "Газпромнефть-Снабжение ООО", "en_org": "Gazpromneft-Snabzhenie LLC"}},
+        ],
+        "7729588440": [
+            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7729588440", "ru_org": "Газпром ЦПС ООО", "en_org": "Gazprom CPS LLC"}},
+        ],
+        "7706092528": [
+            {"source": "ФНС ЕГРЮЛ", "url": "https://egrul.nalog.ru/", "data": {"inn": "7706092528", "ru_org": "Газпром Трансгаз Москва ООО", "en_org": "Gazprom Transgaz Moscow LLC"}},
+        ],
     },
 }
 
@@ -176,6 +252,15 @@ SOURCE_DOMAINS = {
     "focus.kontur.ru": "focus.kontur.ru",
     "checko.ru": "checko.ru",
     "www.checko.ru": "checko.ru",
+    "opencorporates.com": "OpenCorporates",
+    "www.opencorporates.com": "OpenCorporates",
+    "offshoreleaks.icij.org": "OffshoreLeaks",
+    "www.corporationwiki.com": "Corporation Wiki",
+    "corporationwiki.com": "Corporation Wiki",
+    "www.globalbrownbook.net": "Global Brownbook",
+    "globalbrownbook.net": "Global Brownbook",
+    "data.occrp.org": "OCCRP Aleph",
+    "www.faros.ai": "FAROS OSINT",
 }
 
 SOURCE_PROVIDERS: list[dict[str, Any]] = [
@@ -184,13 +269,19 @@ SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "Федресурс", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
     {"name": "rusprofile.ru", "supports_inn": True, "supports_name": True, "kind": "rusprofile", "rate_limit_policy": "retry"},
     {"name": "list-org.com", "supports_inn": True, "supports_name": True, "kind": "list_org", "rate_limit_policy": "retry"},
+    {"name": "OpenCorporates", "supports_inn": True, "supports_name": True, "kind": "open_corporates", "rate_limit_policy": "retry"},
+    {"name": "OffshoreLeaks", "supports_inn": True, "supports_name": True, "kind": "offshore", "rate_limit_policy": "best_effort"},
+    {"name": "Companies & Orgs Search Engine", "supports_inn": True, "supports_name": True, "kind": "companies_cse", "rate_limit_policy": "best_effort"},
+    {"name": "Corporation Wiki", "supports_inn": True, "supports_name": True, "kind": "corporation_wiki", "rate_limit_policy": "best_effort"},
+    {"name": "Global Brownbook", "supports_inn": True, "supports_name": True, "kind": "brownbook", "rate_limit_policy": "best_effort"},
+    {"name": "FAROS OSINT", "supports_inn": True, "supports_name": True, "kind": "faros", "rate_limit_policy": "best_effort"},
+    {"name": "OCCRP Aleph", "supports_inn": True, "supports_name": True, "kind": "occrp", "rate_limit_policy": "best_effort"},
     {"name": "zachestnyibiznes.ru", "supports_inn": True, "supports_name": True, "kind": "zachestnyibiznes", "rate_limit_policy": "retry"},
     {"name": "focus.kontur.ru", "supports_inn": True, "supports_name": True, "kind": "kontur", "rate_limit_policy": "retry"},
     {"name": "КАД Арбитр", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
     {"name": "ЕИС Закупки", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
     {"name": "Банк России", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
     {"name": "checko.ru", "supports_inn": True, "supports_name": True, "kind": "checko", "rate_limit_policy": "skip_on_429"},
-    {"name": "OpenCorporates", "supports_inn": False, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
     {"name": "Wikidata", "supports_inn": False, "supports_name": True, "kind": "catalog", "rate_limit_policy": "best_effort"},
 ]
 
@@ -507,14 +598,37 @@ class CompanyWebApp:
 
     def _provider_chain(self, input_type: str, raw: str) -> list[dict[str, Any]]:
         if self._is_foreign_query(raw):
-            names = ["OpenCorporates", "Wikidata"]
+            names = [
+                "OpenCorporates",
+                "OffshoreLeaks",
+                "Corporation Wiki",
+                "Global Brownbook",
+                "Companies & Orgs Search Engine",
+                "Wikidata",
+            ]
         elif input_type == INPUT_TYPE_URL:
-            names = ["ФНС ЕГРЮЛ", "rusprofile.ru", "list-org.com", "zachestnyibiznes.ru", "focus.kontur.ru", "checko.ru"]
+            names = [
+                "ФНС ЕГРЮЛ",
+                "list-org.com",
+                "OpenCorporates",
+                "OffshoreLeaks",
+                "rusprofile.ru",
+                "zachestnyibiznes.ru",
+                "focus.kontur.ru",
+                "checko.ru",
+            ]
         else:
             names = [
                 "ФНС ЕГРЮЛ",
-                "rusprofile.ru",
                 "list-org.com",
+                "OpenCorporates",
+                "OffshoreLeaks",
+                "rusprofile.ru",
+                "Corporation Wiki",
+                "Global Brownbook",
+                "Companies & Orgs Search Engine",
+                "FAROS OSINT",
+                "OCCRP Aleph",
                 "zachestnyibiznes.ru",
                 "focus.kontur.ru",
                 "checko.ru",
@@ -605,6 +719,20 @@ class CompanyWebApp:
             return self._fetch_from_rusprofile(inn, normalized)
         if kind == "list_org":
             return self._fetch_from_list_org(inn, normalized)
+        if kind == "open_corporates":
+            return self._fetch_from_open_corporates(inn, normalized)
+        if kind == "offshore":
+            return self._fetch_from_offshore_leaks(inn, normalized)
+        if kind == "companies_cse":
+            return self._fetch_from_companies_cse(inn, normalized)
+        if kind == "corporation_wiki":
+            return self._fetch_from_corporation_wiki(inn, normalized)
+        if kind == "brownbook":
+            return self._fetch_from_global_brownbook(inn, normalized)
+        if kind == "faros":
+            return self._fetch_from_faros(inn, normalized)
+        if kind == "occrp":
+            return self._fetch_from_occrp(inn, normalized)
         if kind == "zachestnyibiznes":
             return self._fetch_from_zachestnyibiznes(inn, normalized)
         if kind == "kontur":
@@ -691,6 +819,7 @@ class CompanyWebApp:
         if not hits and skipped_only:
             trace.append("Все источники пропущены. Вставь выписку")
         if not hits:
+            trace.append("Fallback: Вставь выписку (regex-парсинг)")
             trace.append("Источники: не получено (в источниках нет данных по запросу)")
         return hits, trace
 
@@ -705,11 +834,66 @@ class CompanyWebApp:
             return self._provider_fallback_from_catalog(provider_name, normalized, inn)
         return self._provider_fallback_from_catalog(provider_name, normalized, inn)
 
+    def _infer_gender(self, middle_name_ru: str, ru_position: str) -> str:
+        token = self._normalize_spaces(middle_name_ru).lower()
+        position = self._normalize_spaces(ru_position).lower()
+        if token.endswith(("ич", "оглы")):
+            return "М"
+        if token.endswith(("вна", "кызы")):
+            return "Ж"
+        if "директор" in position or "председатель" in position:
+            return "М"
+        return ""
+
+    def _enrich_provider_payload(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not payload:
+            return payload
+        data = payload.setdefault("data", {})
+        fio_ru = str(data.get("head_ru", "")).strip()
+        if fio_ru and not data.get("surname_ru") and not data.get("name_ru"):
+            sur, nam, patr = self._split_fio_ru(fio_ru)
+            data["surname_ru"] = sur
+            data["name_ru"] = nam
+            data["middle_name_ru"] = patr
+        if not data.get("gender"):
+            data["gender"] = self._infer_gender(str(data.get("middle_name_ru", "")), str(data.get("ru_position", "")))
+        return payload
+
     def _fetch_from_rusprofile(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
-        return self._fetch_inn_fixture("rusprofile.ru", inn, normalized)
+        hit, state, reason = self._fetch_inn_fixture("rusprofile.ru", inn, normalized)
+        return self._enrich_provider_payload(hit), state, reason
 
     def _fetch_from_list_org(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
-        return self._fetch_inn_fixture("list-org.com", inn, normalized)
+        hit, state, reason = self._fetch_inn_fixture("list-org.com", inn, normalized)
+        return self._enrich_provider_payload(hit), state, reason
+
+    def _fetch_from_open_corporates(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
+        hit, state, reason = self._fetch_inn_fixture("OpenCorporates", inn, normalized)
+        return self._enrich_provider_payload(hit), state, reason
+
+    def _fetch_from_offshore_leaks(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
+        hit, state, reason = self._fetch_inn_fixture("OffshoreLeaks", inn, normalized)
+        return self._enrich_provider_payload(hit), state, reason
+
+    def _fetch_from_companies_cse(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
+        hit, state, reason = self._fetch_inn_fixture("Companies & Orgs Search Engine", inn, normalized)
+        return self._enrich_provider_payload(hit), state, reason
+
+    def _fetch_from_corporation_wiki(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
+        hit, state, reason = self._fetch_inn_fixture("Corporation Wiki", inn, normalized)
+        return self._enrich_provider_payload(hit), state, reason
+
+    def _fetch_from_global_brownbook(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
+        hit, state, reason = self._fetch_inn_fixture("Global Brownbook", inn, normalized)
+        return self._enrich_provider_payload(hit), state, reason
+
+    def _fetch_from_faros(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
+        hit, state, reason = self._fetch_inn_fixture("FAROS OSINT", inn, normalized)
+        return self._enrich_provider_payload(hit), state, reason
+
+    def _fetch_from_occrp(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
+        hit, state, reason = self._fetch_inn_fixture("OCCRP Aleph", inn, normalized)
+        return self._enrich_provider_payload(hit), state, reason
 
     def _fetch_from_zachestnyibiznes(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
         return self._fetch_inn_fixture("zachestnyibiznes.ru", inn, normalized)
