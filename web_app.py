@@ -861,6 +861,130 @@ class CompanyWebApp:
             data["gender"] = self._infer_gender(str(data.get("middle_name_ru", "")), str(data.get("ru_position", "")))
         return payload
 
+    def _throttle_acquire(self, domain: str) -> bool:
+        """Simple throttle: keep at least N seconds between calls for one domain."""
+        now = time.time()
+        last_call = self._domain_last_call.get(domain, 0)
+        wait_for = self._domain_throttle_seconds - (now - last_call)
+        if wait_for > 0:
+            time.sleep(wait_for)
+        self._domain_last_call[domain] = time.time()
+        return True
+
+    def _save_rate_limited(self, provider_name: str, key: str, retry_seconds: int = 300) -> None:
+        """Save rate-limited state with retry_at (avoid treating as regular negative cache)."""
+        cache_key = f"{provider_name}:{key}"
+        self._source_cache[cache_key] = {
+            "ts": time.time(),
+            "expires_at": time.time() + retry_seconds,
+            "hits": [],
+            "state": "rate_limited",
+            "reason": f"retry_at={datetime.now(timezone.utc).timestamp() + retry_seconds}",
+        }
+
+    def _fetch_from_egrul(self, inn: str) -> tuple[dict[str, Any] | None, str, str]:
+        """Fetch company data by INN from egrul.itsoft.ru JSON API."""
+        if not re.fullmatch(r"\d{10,12}", inn):
+            return None, "empty", "invalid inn"
+
+        url = f"https://egrul.itsoft.ru/{inn}.json"
+        self._throttle_acquire("egrul.itsoft.ru")
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; CompanyCardBot/1.0)"})
+            with urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode("utf-8", errors="ignore"))
+
+            naim = data.get("СвНаимЮЛ", {}) if isinstance(data, dict) else {}
+            sv_ul = data.get("СвЮЛ", {}) if isinstance(data, dict) else {}
+            position_block = data.get("СведДолжнФЛ", {}) if isinstance(data, dict) else {}
+            if isinstance(position_block, list):
+                position_block = position_block[0] if position_block else {}
+            person = position_block.get("СвФЛ", {}) if isinstance(position_block, dict) else {}
+
+            surname_ru = str(person.get("Фамилия", "")).strip().capitalize()
+            name_ru = str(person.get("Имя", "")).strip().capitalize()
+            middle_name_ru = str(person.get("Отчество", "")).strip().capitalize()
+
+            ru_org = str(naim.get("НаимЮЛПолн") or naim.get("НаимСокр") or "").strip()
+            ru_position = str(position_block.get("СвДолжн", {}).get("НаимДолжн", "")).strip()
+
+            payload = {
+                "source": "ФНС ЕГРЮЛ",
+                "url": url,
+                "data": {
+                    "inn": inn,
+                    "ogrn": str(sv_ul.get("ОГРН", "")).strip(),
+                    "ru_org": ru_org,
+                    "surname_ru": surname_ru,
+                    "name_ru": name_ru,
+                    "middle_name_ru": middle_name_ru,
+                    "ru_position": ru_position,
+                    "gender": "М" if str(person.get("СвПолФЛ", {}).get("Пол", "")) == "1" else "",
+                },
+            }
+
+            enriched = self._enrich_provider_payload(payload)
+            has_data = any(enriched.get("data", {}).get(field) for field in ("ru_org", "surname_ru", "name_ru", "middle_name_ru", "ru_position"))
+            if has_data:
+                return enriched, "ok", ""
+            return None, "empty", "not found"
+        except Exception as exc:  # noqa: BLE001
+            code = getattr(exc, "code", 0)
+            reason = str(exc).strip() or exc.__class__.__name__
+            fallback, state, fallback_reason = self._provider_fallback_from_catalog("ФНС ЕГРЮЛ", inn, inn)
+            if fallback:
+                return self._enrich_provider_payload(fallback), state, fallback_reason
+            if "429" in reason or code == 429:
+                self._save_rate_limited("ФНС ЕГРЮЛ", f"inn:{inn}", 300)
+                return None, "rate_limited", self._retry_reason("ФНС ЕГРЮЛ")
+            return None, "error", reason
+
+        fallback, state, fallback_reason = self._provider_fallback_from_catalog("ФНС ЕГРЮЛ", inn, inn)
+        return self._enrich_provider_payload(fallback), state, fallback_reason
+
+    def _fetch_html_page(self, url: str) -> tuple[str | None, str, str]:
+        self._domain_throttle(url)
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=10) as response:
+                return response.read().decode("utf-8", errors="ignore"), "ok", ""
+        except TimeoutError:
+            return None, "error", "timeout"
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc).strip() or exc.__class__.__name__
+            if "429" in reason:
+                return None, "rate_limited", self._retry_reason(urlparse(url).netloc or "source")
+            return None, "error", reason
+
+    def _extract_director_from_html(self, html: str) -> tuple[str, str, str]:
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text)
+        patterns = [
+            r"Генеральн(?:ый|ого) директор[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
+            r"Руководитель[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            tokens = match.group(1).split()
+            if len(tokens) >= 3:
+                return tokens[0], tokens[1], " ".join(tokens[2:])
+        return "", "", ""
+
+    def _extract_org_from_html(self, html: str) -> str:
+        title_match = re.search(r"<title>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+        if title_match:
+            title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", title_match.group(1))).strip()
+            title = title.split("—", 1)[0].strip()
+            if title:
+                return title
+        h1_match = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.IGNORECASE | re.DOTALL)
+        if h1_match:
+            h1_text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", h1_match.group(1))).strip()
+            return h1_text
+        return ""
+
     def _fetch_from_rusprofile(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
         hit, state, reason = self._fetch_inn_fixture("rusprofile.ru", inn, normalized)
         return self._enrich_provider_payload(hit), state, reason
