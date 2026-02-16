@@ -5,10 +5,11 @@ from web_app import CompanyWebApp
 
 
 class FakeResponse:
-    def __init__(self, text: str = "", json_data=None, ok: bool = True):
+    def __init__(self, text: str = "", json_data=None, ok: bool = True, headers=None):
         self.text = text
         self._json_data = json_data or {}
         self.ok = ok
+        self.headers = headers or {"content-type": "application/json"}
 
     def json(self):
         return self._json_data
@@ -85,10 +86,11 @@ def test_parse_rusprofile_person_text_extracts_fio(tmp_path, monkeypatch):
     monkeypatch.setattr(web_app.requests, "get", fake_get)
 
     data = app._parse_rusprofile("Греф", web_app.INPUT_TYPE_PERSON_TEXT)
-    assert data is not None
-    assert data["ru_org"] == "ПАО Сбербанк"
-    assert data["surname_ru"] == "Греф"
-    assert data["name_ru"] == "Герман"
+    assert isinstance(data, list)
+    assert data
+    assert data[0]["ru_org"] == "ПАО Сбербанк"
+    assert data[0]["surname_ru"] == "Греф"
+    assert data[0]["name_ru"] == "Герман"
 
 
 def test_parse_rusprofile_url_input_uses_detail_page_directly(tmp_path, monkeypatch):
@@ -124,3 +126,47 @@ def test_build_person_candidates_groups_fio_and_org(tmp_path):
     assert len(candidates) == 2
     assert any(c["fio_ru"] == "Греф Герман Оскарович" and c["org_ru"] == "ПАО Сбербанк" for c in candidates)
     assert any(c["fio_ru"] == "Греф Владимир Иванович" for c in candidates)
+
+
+def test_search_external_sources_accepts_multi_hit_provider(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_call_provider(provider, raw, input_type):
+        if provider["kind"] == "rusprofile":
+            return [
+                {"url": "http://example/1", "surname_ru": "Греф", "name_ru": "Герман"},
+                {"url": "http://example/2", "surname_ru": "Греф", "name_ru": "Кристина"},
+            ]
+        return None
+
+    monkeypatch.setattr(app, "_call_provider", fake_call_provider)
+
+    hits, _ = app._search_external_sources("Греф", no_cache=True)
+    rus_hits = [h for h in hits if h["source"] == "rusprofile.ru"]
+    assert len(rus_hits) == 2
+
+
+def test_build_profile_prefers_egrul_for_inn_person_data(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    hits = [
+        {"source": "rusprofile.ru", "data": {"ru_org": "АО Статус", "surname_ru": "Иванов", "name_ru": "Иван"}},
+        {"source": "ФНС ЕГРЮЛ", "data": {"ru_org": "ПАО Сбербанк", "surname_ru": "Греф", "name_ru": "Герман", "middle_name_ru": "Оскарович"}},
+    ]
+
+    profile, _ = app._build_profile_from_sources(hits, "7707083893", web_app.INPUT_TYPE_INN)
+    assert profile["ru_org"] == "Сбербанк ПАО"
+    assert profile["surname_ru"] == "Греф"
+
+
+def test_search_page_shows_external_candidate_for_inn(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(app, "_search_external_sources", lambda *_args, **_kwargs: ([
+        {"source": "ФНС ЕГРЮЛ", "data": {"inn": "7707083893", "ru_org": "ПАО Сбербанк", "surname_ru": "Греф", "name_ru": "Герман"}}
+    ], []))
+
+    body, status, _ = app.search_page({"q": ["7707083893"]})
+    assert status == "200 OK"
+    assert "Автозаполнить" in body
+    assert "Сбербанк" in body
