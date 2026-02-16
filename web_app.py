@@ -769,7 +769,8 @@ class CompanyWebApp:
 def run_server(db_path: str = "cards.db", host: str = "0.0.0.0", port: int = 8000) -> None:
     app = CompanyWebApp(db_path=db_path)
     with make_server(host, port, app) as httpd:
-        print(f"Running on http://{host}:{port}")
+        browser_host = "localhost" if host == "0.0.0.0" else host
+        print(f"Running on http://{browser_host}:{port} (bound to {host}:{port})")
         httpd.serve_forever()
 
 
