@@ -244,6 +244,7 @@ def test_search_trace_has_no_internal_db_iterations(tmp_path):
 
     _, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "Газпром"})
     assert "Проверка источников по записи" not in review
+    assert "Fallback: Вставь выписку (regex-парсинг)" in review
     assert "Источники: не получено (в источниках нет данных по запросу)" in review
 
 def test_multisource_fallback_skips_checko_429_and_keeps_fns_data(monkeypatch, tmp_path):
@@ -323,7 +324,7 @@ def test_inn_1102054991_builds_expected_profile_and_trace(tmp_path):
     assert "<td>Organization</td><td>Gazprom Pererabotka LLC</td>" in review
     assert "<td>Должность</td><td>Генеральный директор</td>" in review
     assert "<td>Position</td><td>General Director</td>" in review
-    assert "Trace в UI: ФНС ЕГРЮЛ (ok) → rusprofile.ru (ok) → list-org.com (ok)" in review
+    assert "Trace в UI: ФНС ЕГРЮЛ (ok) → list-org.com (ok) → OpenCorporates (ok) → OffshoreLeaks (ok)" in review
 
 
 def test_positive_cache_hit_is_used_for_second_inn_request(tmp_path):
@@ -345,3 +346,40 @@ def test_five_inn_inputs_return_review_without_errors(tmp_path):
         assert status.startswith("200")
         assert "Internal error" not in review
         assert f"Ключ поиска провайдеров: inn:{inn}" in review
+
+
+def test_inn_5003021311_returns_multisource_hits_and_trace(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "5003021311"})
+    assert status.startswith("200")
+    assert "Источник: list-org.com — provider_called_ok" in review
+    assert "Источник: OpenCorporates — provider_called_ok" in review
+    assert "Источник: OffshoreLeaks — provider_called_ok" in review
+    assert "Trace в UI: ФНС ЕГРЮЛ (ok) → list-org.com (ok) → OpenCorporates (ok) → OffshoreLeaks (ok)" in review
+    assert "<td>Организация</td><td>Газпром Межрегионгаз ООО</td>" in review
+
+
+def test_ten_inn_inputs_have_95_percent_or_better_source_hits(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    inns = [
+        "5003021311",
+        "1102054991",
+        "7707083893",
+        "7810783119",
+        "7702070139",
+        "7704867853",
+        "7736050003",
+        "7708503727",
+        "7728715184",
+        "7706092528",
+    ]
+
+    successful = 0
+    for inn in inns:
+        status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": inn})
+        assert status.startswith("200")
+        if "provider_called_ok" in review:
+            successful += 1
+
+    assert successful / len(inns) >= 0.95
