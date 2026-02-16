@@ -19,7 +19,7 @@ def test_detect_input_type_routes_inn_url_person_and_org(tmp_path):
 
     assert app.detect_input_type("7702070139") == web_app.INPUT_TYPE_INN
     assert app.detect_input_type("https://www.rusprofile.ru/id/1027739609391") == web_app.INPUT_TYPE_URL
-    assert app.detect_input_type("Греф") == web_app.INPUT_TYPE_ORG_TEXT
+    assert app.detect_input_type("Греф") == web_app.INPUT_TYPE_PERSON_TEXT
     assert app.detect_input_type("Греф Герман Оскарович") == web_app.INPUT_TYPE_PERSON_TEXT
 
 
@@ -32,13 +32,15 @@ def test_parse_egrul_maps_real_fields(tmp_path, monkeypatch):
             json_data={
                 "inn": "7702070139",
                 "ogrn": "1027739609391",
-                "ru_org": "Банк ВТБ ПАО",
+                "name": "Организация Банк ВТБ ПАО",
                 "en_org": "VTB Bank PJSC",
-                "surname_ru": "Костин",
-                "name_ru": "Андрей",
-                "middle_name_ru": "Леонидович",
-                "gender": "1",
-                "ru_position": "Президент, Председатель правления",
+                "director": {
+                    "surname": "Костин",
+                    "name": "Андрей",
+                    "patronymic": "Леонидович",
+                    "gender": "мужской",
+                    "position": "Президент, Председатель правления",
+                },
             }
         )
 
@@ -76,9 +78,9 @@ def test_parse_rusprofile_person_text_extracts_fio(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
     def fake_get(url, **_kwargs):
-        if "search?query" in url:
-            return FakeResponse('<a href="/id/123">result</a>')
-        return FakeResponse("<h1>ПАО Сбербанк</h1><div>Греф Герман Оскарович</div>")
+        if "person=1" in url:
+            return FakeResponse('<a href="/person/123">result</a>')
+        return FakeResponse('<h1>Греф Герман Оскарович</h1><a href="/id/1027700132195">ПАО Сбербанк</a>')
 
     monkeypatch.setattr(web_app.requests, "get", fake_get)
 
@@ -106,3 +108,19 @@ def test_parse_rusprofile_url_input_uses_detail_page_directly(tmp_path, monkeypa
     assert data is not None
     assert data["ru_org"] == "ПАО Сбербанк"
     assert called["urls"] == [raw_url]
+
+
+def test_build_person_candidates_groups_fio_and_org(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    hits = [
+        {"source": "rusprofile.ru", "data": {"surname_ru": "Греф", "name_ru": "Герман", "middle_name_ru": "Оскарович", "ru_org": "ПАО Сбербанк", "ru_position": "Президент"}},
+        {"source": "list-org.com", "data": {"surname_ru": "Греф", "name_ru": "Герман", "middle_name_ru": "Оскарович", "ru_org": "ПАО Сбербанк", "ru_position": "Президент"}},
+        {"source": "list-org.com", "data": {"surname_ru": "Греф", "name_ru": "Владимир", "middle_name_ru": "Иванович", "ru_org": "КХ \"Греф\""}},
+    ]
+
+    candidates = app._build_person_candidates(hits)
+
+    assert len(candidates) == 2
+    assert any(c["fio_ru"] == "Греф Герман Оскарович" and c["org_ru"] == "ПАО Сбербанк" for c in candidates)
+    assert any(c["fio_ru"] == "Греф Владимир Иванович" for c in candidates)

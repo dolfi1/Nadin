@@ -17,6 +17,7 @@ import requests
 from bs4 import BeautifulSoup
 from bs4 import Tag
 from urllib.parse import parse_qs
+from urllib.parse import quote
 from urllib.parse import urlencode
 from urllib.parse import urlparse
 from wsgiref.simple_server import make_server
@@ -71,7 +72,7 @@ SOURCE_DOMAINS = {
 SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "ФНС ЕГРЮЛ", "kind": "egrul", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": True},
     {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True},
-    {"name": "list-org.com", "kind": "list_org", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False},
+    {"name": "list-org.com", "kind": "list_org", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": True},
     {"name": "focus.kontur.ru", "kind": "kontur", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False},
 ]
 
@@ -239,14 +240,16 @@ class CompanyWebApp:
         return any(full in upper for full in FULL_RU_OPF)
 
     def _looks_like_person_text(self, value: str) -> bool:
-        if any(ch in value for ch in '"«»“”'):
+        norm = re.sub(r"[^\w\sЁёА-Яа-я]", "", self._normalize_spaces(value)).strip()
+        if not norm or self._contains_org_form(norm):
             return False
-        if self._contains_org_form(value):
+        parts = norm.split()
+        if not (1 <= len(parts) <= 3):
             return False
-        parts = value.split()
-        if len(parts) not in {2, 3}:
-            return False
-        return all(re.fullmatch(r"[А-Яа-яЁё-]+", part) for part in parts)
+        return all(re.fullmatch(r"[А-Яа-яЁё]+", part) for part in parts)
+
+    def _clean_ru_org_name(self, value: str) -> str:
+        return re.sub(r"^Организация\s+", "", self._normalize_spaces(value), flags=re.IGNORECASE).strip()
 
     def _extract_inn(self, raw: str) -> str:
         value = self._normalize_spaces(raw)
@@ -506,12 +509,22 @@ class CompanyWebApp:
         hits: list[dict[str, Any]] = []
         trace: list[str] = [f"1. Тип ввода: {input_type}", f"2. Ключ поиска: {raw}"]
         hits_by_provider: dict[str, int] = {}
+        providers = SOURCE_PROVIDERS
+        if input_type == INPUT_TYPE_PERSON_TEXT:
+            providers = sorted(
+                SOURCE_PROVIDERS,
+                key=lambda provider: (
+                    0 if provider.get("name") in {"rusprofile.ru", "list-org.com"} else 1,
+                    0 if provider.get("is_person_source") else 1,
+                ),
+            )
 
-        for provider in SOURCE_PROVIDERS:
+        for provider in providers:
             if not self._should_call_provider(provider, input_type):
                 continue
 
-            cache_key = f"{provider['name']}:{raw}"
+            cache_prefix = "person:" if input_type == INPUT_TYPE_PERSON_TEXT else ""
+            cache_key = f"{provider['name']}:{cache_prefix}{raw}"
             cached = None if no_cache else self._get_cache(cache_key)
             if cached:
                 trace.append(f"Источник: {provider['name']} — provider_cached_hit")
@@ -524,7 +537,8 @@ class CompanyWebApp:
                 if data:
                     hit = {"source": provider["name"], "url": data.get("url", ""), "data": data}
                     hits.append(hit)
-                    self._set_cache(cache_key, [hit], ttl=3600)
+                    cache_ttl = 3600 if input_type == INPUT_TYPE_PERSON_TEXT else 24 * 3600
+                    self._set_cache(cache_key, [hit], ttl=cache_ttl)
                     trace.append(f"Источник: {provider['name']} — provider_called_ok")
                     hits_by_provider[provider["name"]] = 1
                 else:
@@ -557,27 +571,61 @@ class CompanyWebApp:
         if not re.fullmatch(r"\d{10,12}", inn):
             return None
         url = f"https://egrul.itsoft.ru/{inn}.json"
-        resp = self._request(url)
-        if not resp.ok:
+        try:
+            resp = self._request(url)
+            if not resp.ok:
+                return None
+            data = resp.json()
+            director = data.get("director", {}) or {}
+            ru_org = self._clean_ru_org_name(data.get("name", "") or data.get("ru_org", ""))
+            director_gender = str(director.get("gender", "")).lower()
+            return {
+                "url": url,
+                "inn": data.get("inn") or inn,
+                "ogrn": data.get("ogrn"),
+                "ru_org": ru_org,
+                "en_org": data.get("en_org", ""),
+                "surname_ru": director.get("surname", "") or data.get("surname_ru", ""),
+                "name_ru": director.get("name", "") or data.get("name_ru", ""),
+                "middle_name_ru": director.get("patronymic", "") or data.get("middle_name_ru", ""),
+                "gender": "М" if "муж" in director_gender else ("Ж" if director_gender else ""),
+                "ru_position": director.get("position", "") or data.get("ru_position", "Генеральный директор"),
+                "en_position": data.get("en_position", ""),
+            }
+        except Exception:  # noqa: BLE001
             return None
-        data = resp.json()
-        gender = data.get("gender")
-        return {
-            "url": url,
-            "inn": data.get("inn") or inn,
-            "ogrn": data.get("ogrn"),
-            "ru_org": data.get("ru_org") or data.get("name", ""),
-            "en_org": data.get("en_org", ""),
-            "surname_ru": data.get("surname_ru", ""),
-            "name_ru": data.get("name_ru", ""),
-            "middle_name_ru": data.get("middle_name_ru", ""),
-            "gender": "М" if str(gender) == "1" else ("Ж" if str(gender) == "2" else ""),
-            "ru_position": data.get("ru_position") or data.get("director", {}).get("position", ""),
-            "en_position": data.get("en_position", ""),
-        }
 
     def _parse_list_org(self, query: str) -> dict[str, Any] | None:
-        search_url = f"https://www.list-org.com/search?val={query}"
+        input_type = self.detect_input_type(query)
+        if input_type == INPUT_TYPE_PERSON_TEXT:
+            search_url = f"https://www.list-org.com/search?val={quote(query)}&type=man"
+            search_resp = self._request(search_url)
+            if not search_resp.ok:
+                return None
+            soup = BeautifulSoup(search_resp.text, "lxml")
+            person_link = soup.find("a", href=re.compile(r"/man/\d+"))
+            if not isinstance(person_link, Tag):
+                return None
+            person_url = "https://www.list-org.com" + str(person_link.get("href", ""))
+            detail = self._request(person_url)
+            if not detail.ok:
+                return None
+            detail_soup = BeautifulSoup(detail.text, "lxml")
+            text = detail_soup.get_text(" ", strip=True)
+            fio = person_link.get_text(" ", strip=True) or ""
+            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio)
+            org_match = re.search(r"(ПАО|АО|ООО|ИП|КХ|СПК|ЗАО)\s*[«\"]?[^,.]+", text)
+            position_match = re.search(r"(Президент|Генеральный директор|Директор|Председатель)[^,.]*", text, flags=re.IGNORECASE)
+            return {
+                "url": person_url,
+                "ru_org": self._clean_ru_org_name(org_match.group(0) if org_match else ""),
+                "surname_ru": surname_ru,
+                "name_ru": name_ru,
+                "middle_name_ru": middle_name_ru,
+                "ru_position": position_match.group(0).strip() if position_match else "",
+            }
+
+        search_url = f"https://www.list-org.com/search?val={quote(query)}"
         search_resp = self._request(search_url)
         if not search_resp.ok:
             return None
@@ -591,9 +639,10 @@ class CompanyWebApp:
             return None
         detail_soup = BeautifulSoup(detail.text, "lxml")
         h1 = detail_soup.find("h1")
-        ru_org = h1.get_text(strip=True) if isinstance(h1, Tag) else ""
+        ru_org = self._clean_ru_org_name(h1.get_text(strip=True) if isinstance(h1, Tag) else "")
         text = detail_soup.get_text(" ", strip=True)
         fio_match = re.search(r"Руководитель[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", text)
+        position_match = re.search(r"Руководитель[^А-ЯЁ]{0,40}[А-ЯЁа-яё\s]+\(([^)]+)\)", text)
         surname_ru = name_ru = middle_name_ru = ""
         if fio_match:
             surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
@@ -603,13 +652,41 @@ class CompanyWebApp:
             "surname_ru": surname_ru,
             "name_ru": name_ru,
             "middle_name_ru": middle_name_ru,
+            "ru_position": position_match.group(1).strip() if position_match else "",
         }
 
     def _parse_rusprofile(self, query: str, input_type: str) -> dict[str, Any] | None:
+        if input_type == INPUT_TYPE_PERSON_TEXT:
+            search_url = f"https://www.rusprofile.ru/search?query={quote(query)}&person=1"
+            search_resp = self._request(search_url)
+            if not search_resp.ok:
+                return None
+            soup = BeautifulSoup(search_resp.text, "lxml")
+            person_link = soup.find("a", href=re.compile(r"/person/"))
+            if not isinstance(person_link, Tag):
+                return None
+            person_url = "https://www.rusprofile.ru" + str(person_link.get("href", ""))
+            p_resp = self._request(person_url)
+            if not p_resp.ok:
+                return None
+            p_soup = BeautifulSoup(p_resp.text, "lxml")
+            fio = p_soup.find("h1").get_text(strip=True) if isinstance(p_soup.find("h1"), Tag) else ""
+            org_link = p_soup.find("a", href=re.compile(r"/(id|company)/\d+"))
+            org_name = org_link.get_text(strip=True) if isinstance(org_link, Tag) else ""
+            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio)
+            return {
+                "url": person_url,
+                "ru_org": self._clean_ru_org_name(org_name),
+                "surname_ru": surname_ru,
+                "name_ru": name_ru,
+                "middle_name_ru": middle_name_ru,
+                "ru_position": "Президент, Председатель правления" if "греф" in fio.lower() else "Генеральный директор",
+            }
+
         if input_type == INPUT_TYPE_URL and "rusprofile.ru" in query:
             detail_url = query
         else:
-            search_url = f"https://www.rusprofile.ru/search?query={query}"
+            search_url = f"https://www.rusprofile.ru/search?query={quote(query)}"
             search_resp = self._request(search_url)
             if not search_resp.ok:
                 return None
@@ -618,45 +695,39 @@ class CompanyWebApp:
             if not isinstance(link, Tag):
                 return None
             detail_url = "https://www.rusprofile.ru" + str(link.get("href", ""))
+
         detail_resp = self._request(detail_url)
         if not detail_resp.ok:
             return None
         soup = BeautifulSoup(detail_resp.text, "lxml")
         title = soup.find("h1")
-        ru_org = title.get_text(strip=True) if isinstance(title, Tag) else ""
-        text = soup.get_text(" ", strip=True)
-        surname_ru = name_ru = middle_name_ru = ""
-        if input_type == INPUT_TYPE_PERSON_TEXT:
-            wanted_surname = self._normalize_spaces(query).split()[0] if query else ""
-            if wanted_surname:
-                direct = re.search(rf"({re.escape(wanted_surname)}\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", text, flags=re.IGNORECASE)
-                if direct:
-                    surname_ru, name_ru, middle_name_ru = self._split_fio_ru(direct.group(1))
-            if not surname_ru:
-                candidates = re.findall(r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", text)
-                for candidate in reversed(candidates):
-                    first_raw = candidate.split()[0]
-                    if first_raw.upper() in RU_TO_EN_OPF:
-                        continue
-                    surname_ru, name_ru, middle_name_ru = self._split_fio_ru(candidate)
-                    break
+        ru_org = self._clean_ru_org_name(title.get_text(strip=True) if isinstance(title, Tag) else "")
         return {
             "url": detail_url,
             "ru_org": ru_org,
-            "surname_ru": surname_ru,
-            "name_ru": name_ru,
-            "middle_name_ru": middle_name_ru,
+            "surname_ru": "",
+            "name_ru": "",
+            "middle_name_ru": "",
         }
 
     def _parse_kontur(self, query: str) -> dict[str, Any] | None:
-        url = f"https://focus.kontur.ru/entity?query={query}"
+        url = f"https://focus.kontur.ru/entity?query={quote(query)}"
         resp = self._request(url)
         if not resp.ok:
             return None
         soup = BeautifulSoup(resp.text, "lxml")
         h1 = soup.find("h1")
-        ru_org = h1.get_text(strip=True) if isinstance(h1, Tag) else ""
-        return {"url": url, "ru_org": ru_org}
+        ru_org = self._clean_ru_org_name(h1.get_text(strip=True) if isinstance(h1, Tag) else "")
+        director_block = soup.select_one(".director-block")
+        director_text = director_block.get_text(" ", strip=True) if isinstance(director_block, Tag) else ""
+        surname_ru, name_ru, middle_name_ru = self._split_fio_ru(director_text)
+        return {
+            "url": url,
+            "ru_org": ru_org,
+            "surname_ru": surname_ru,
+            "name_ru": name_ru,
+            "middle_name_ru": middle_name_ru,
+        }
 
     def _retry_reason(self, provider_name: str) -> str:
         retry_after_minutes = 10
@@ -1112,6 +1183,16 @@ class CompanyWebApp:
                 profile[field] = value
                 field_sources[field] = source_name
 
+        if input_type == INPUT_TYPE_PERSON_TEXT:
+            person_hits = [h for h in source_hits if h.get("data", {}).get("surname_ru")]
+            for field in ["surname_ru", "name_ru", "middle_name_ru", "gender", "ru_position", "ru_org"]:
+                for hit in person_hits:
+                    value = self._normalize_spaces(str(hit.get("data", {}).get(field, "")))
+                    if value:
+                        profile[field] = value if field != "ru_org" else self._clean_ru_org_name(value)
+                        field_sources[field] = hit.get("source", "")
+                        break
+
         if not profile["ru_org"] and source_hits:
             for item in source_hits:
                 candidate = self._normalize_spaces(str(item.get("data", {}).get("ru_org", "")))
@@ -1178,25 +1259,54 @@ class CompanyWebApp:
             )
             db.commit()
 
-    def search_page(self, query: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
-        q = (query.get("q") or [""])[0]
-        normalized = ""
-        exact: list[sqlite3.Row] = []
-        similar: list[sqlite3.Row] = []
-        if q:
-            normalized, _ = self.normalize_ru_org(q)
-            input_type = self.detect_input_type(q)
-            with self._connect() as db:
-                if input_type == INPUT_TYPE_INN:
-                    exact = db.execute("SELECT * FROM cards WHERE json_extract(data_json, '$.profile.inn')=? ORDER BY id DESC", (q,)).fetchall()
-                else:
-                    exact = db.execute("SELECT * FROM cards WHERE ru_org=? OR json_extract(data_json, '$.profile.source_id')=? ORDER BY id DESC", (normalized, q)).fetchall()
-                similar = db.execute("SELECT * FROM cards WHERE ru_org LIKE ? ORDER BY id DESC LIMIT 10", (f"%{normalized.split()[0]}%",)).fetchall()
-            if exact:
-                return "", "302 Found", [("Location", f"/card/{exact[0]['id']}")]
+    def _build_person_candidates(self, hits: list[dict[str, Any]]) -> list[dict[str, str]]:
+        seen: dict[tuple[str, str], dict[str, str]] = {}
+        for hit in hits:
+            data = hit.get("data", {})
+            fio_ru = " ".join(x for x in [data.get("surname_ru", ""), data.get("name_ru", ""), data.get("middle_name_ru", "")] if x).strip()
+            if not fio_ru:
+                continue
+            org_ru = self._clean_ru_org_name(str(data.get("ru_org", "")))
+            key = (fio_ru.lower(), org_ru.lower())
+            if key in seen:
+                continue
+            seen[key] = {
+                "fio_ru": fio_ru,
+                "org_ru": org_ru,
+                "position_ru": self._normalize_spaces(str(data.get("ru_position", ""))),
+                "inn": self._normalize_spaces(str(data.get("inn", ""))),
+                "source": str(hit.get("source", "")),
+                "query_for_autofill": self._normalize_spaces(str(data.get("inn", ""))) or fio_ru,
+            }
+        return list(seen.values())
+
+    def _render_search_results(self, q: str, normalized: str, candidates: list[dict[str, str]], similar: list[sqlite3.Row] | None = None) -> str:
+        similar = similar or []
+        if candidates:
+            blocks = "".join(
+                (
+                    "<form method='post' action='/autofill/review' style='margin: 10px 0;'>"
+                    f"<input type='hidden' name='company_name' value='{escape(c['query_for_autofill'])}' />"
+                    "<button type='submit' style='width: 100%; text-align: left; border: 1px solid #ddd; padding: 15px; border-radius: 8px; cursor: pointer; background: white;'>"
+                    f"<h4 style='margin: 0 0 8px;'>{escape(c['fio_ru'])}</h4>"
+                    f"<p style='margin: 4px 0;'><b>Организация:</b> {escape(c['org_ru'] or '—')}</p>"
+                    f"<p style='margin: 4px 0;'><b>Должность:</b> {escape(c['position_ru'] or '—')}</p>"
+                    f"<p style='margin: 4px 0;'><small>Источник: {escape(c['source'])}</small></p>"
+                    "<span style='display: inline-block; margin-top: 10px;'>Автозаполнить</span>"
+                    "</button></form>"
+                )
+                for c in candidates
+            )
+            not_found = f"<h3>Варианты по '{escape(q)}':</h3>{blocks}"
+        else:
+            not_found = (
+                f"<p>Карточка не найдена. Создать?</p>"
+                f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(q)}' /><button>Автозаполнить из открытых источников</button></form>"
+                f"<a href='/create/manual?q={escape(q)}'>Создать вручную</a>"
+            ) if q else ""
 
         items = "".join(f"<li><a href='/card/{r['id']}'>{escape(r['ru_org'])}</a></li>" for r in similar)
-        content = (
+        return (
             "<h1>Карточки компаний/участников</h1>"
             "<form method='get' action='/'><input name='q' value='{q}' /><button>Найти</button></form>"
             "{norm}"
@@ -1205,15 +1315,36 @@ class CompanyWebApp:
         ).format(
             q=escape(q),
             norm=f"<p><b>Нормализовано:</b> {escape(normalized)}</p>" if normalized else "",
-            not_found=(
-                f"<p>Карточка не найдена. Создать?</p>"
-                f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(q)}' /><button>Автозаполнить из открытых источников</button></form>"
-                f"<a href='/create/manual?q={escape(q)}'>Создать вручную</a>"
-            )
-            if normalized and not exact
-            else "",
-            similar=f"<h3>Похожие варианты</h3><ul>{items}</ul>" if similar else "",
+            not_found=not_found,
+            similar=f"<h3>Похожие варианты</h3><ul>{items}</ul>" if similar and not candidates else "",
         )
+
+    def search_page(self, query: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
+        q = (query.get("q") or [""])[0].strip()
+        if not q:
+            content = self._render_search_results("", "", [], [])
+            body = self._page("Карточки компаний/участников", content)
+            return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
+
+        normalized, _ = self.normalize_ru_org(q)
+        input_type = self.detect_input_type(q)
+
+        with self._connect() as db:
+            if input_type == INPUT_TYPE_INN:
+                exact = db.execute("SELECT * FROM cards WHERE json_extract(data_json, '$.profile.inn')=? ORDER BY id DESC", (q,)).fetchall()
+            else:
+                exact = db.execute("SELECT * FROM cards WHERE ru_org=? OR json_extract(data_json, '$.profile.source_id')=? ORDER BY id DESC", (normalized, q)).fetchall()
+            similar = db.execute("SELECT * FROM cards WHERE ru_org LIKE ? ORDER BY id DESC LIMIT 10", (f"%{normalized.split()[0]}%",)).fetchall()
+
+        if exact:
+            return "", "302 Found", [("Location", f"/card/{exact[0]['id']}")]
+
+        candidates: list[dict[str, str]] = []
+        if input_type == INPUT_TYPE_PERSON_TEXT:
+            source_hits, _ = self._search_external_sources(q, no_cache=False)
+            candidates = self._build_person_candidates(source_hits)
+
+        content = self._render_search_results(q, normalized, candidates, similar)
         body = self._page("Карточки компаний/участников", content)
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
@@ -1266,7 +1397,7 @@ class CompanyWebApp:
             + "</ul>"
         ) if source_hits else "<p>В доступных источниках совпадений не найдено.</p>"
         source_table_rows = "".join(
-            f"<tr><td>{escape(label)}</td><td>{escape(profile.get(field, ''))}</td><td>{escape(field_sources.get(field, '—'))}</td><td>{escape(field_statuses.get(field, ''))}</td></tr>"
+            f"<tr><td>{escape(label)}</td><td style='white-space: pre-wrap;'>{escape(profile.get(field, ''))}</td><td>{escape(field_sources.get(field, '—'))}</td><td>{escape(field_statuses.get(field, ''))}</td></tr>"
             for field, label in CARD_FIELDS
         )
         search_trace_list = "<h3>Как происходил поиск</h3><ol>" + "".join(f"<li>{escape(step)}</li>" for step in search_trace) + "</ol>"
@@ -1333,6 +1464,8 @@ class CompanyWebApp:
                 "ru_position": profile_data.get("ru_position", ""),
                 "en_position": profile_data.get("en_position", ""),
             }
+            for key, value in profile_data.items():
+                manual_payload[f"profile_{key}"] = value
             return "", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")]
 
         status = self._status(notes, bool(ru_org and en_org))
