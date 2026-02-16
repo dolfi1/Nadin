@@ -143,6 +143,7 @@ CARD_FIELDS: list[tuple[str, str]] = [
     ("name_ru", "Имя"),
     ("middle_name_ru", "Отчество"),
     ("gender", "Пол"),
+    ("inn", "ИНН"),
     ("ru_org", "Организация"),
     ("en_org", "Organization"),
     ("ru_position", "Должность"),
@@ -153,7 +154,7 @@ CARD_FIELDS: list[tuple[str, str]] = [
 class CompanyWebApp:
     def __init__(self, db_path: str = "cards.db") -> None:
         self.db_path = Path(db_path)
-        self._source_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._source_cache: dict[str, dict[str, Any]] = {}
         self._source_cache_ttl = 300
         self._init_db()
 
@@ -380,19 +381,25 @@ class CompanyWebApp:
         return self._normalize_spaces(f"{name} {opf}" if opf else name), notes
 
     def _translit(self, token: str) -> str:
+        if not re.search(r"[A-Za-zА-Яа-яЁё]", token):
+            return ""
         out = "".join(PASSPORT_MAP.get(ch, PASSPORT_MAP.get(ch.upper(), ch)) for ch in token)
         return out[:1].upper() + out[1:].lower() if out else ""
 
     def normalize_en_org(self, raw: str, fallback_ru: str) -> tuple[str, list[str]]:
         notes: list[str] = []
         cleaned = self._normalize_spaces(self._strip_noise(raw))
-        if not cleaned:
+        if not cleaned and re.search(r"[A-Za-zА-Яа-яЁё]", fallback_ru):
             ru_parts = fallback_ru.split()
             opf_ru = ru_parts[-1] if ru_parts and ru_parts[-1] in RU_TO_EN_OPF else ""
             name_tokens = ru_parts[:-1] if opf_ru else ru_parts
             name = " ".join(self._translit(tok) for tok in name_tokens)
             cleaned = self._normalize_spaces(f"{name} {RU_TO_EN_OPF.get(opf_ru, '')}")
-            notes.append("Organization EN: сгенерировано транслитерацией, нужно проверить")
+            if cleaned:
+                notes.append("Organization EN: сгенерировано транслитерацией, нужно проверить")
+
+        if not cleaned:
+            return "", notes
 
         cleaned = unicodedata.normalize("NFKD", cleaned)
         cleaned = "".join(ch for ch in cleaned if ord(ch) < 128)
@@ -443,20 +450,39 @@ class CompanyWebApp:
             }
         return [provider for provider in SOURCE_PROVIDERS if provider["name"] in names]
 
-    def _cached_lookup(self, provider_name: str, key: str) -> list[dict[str, Any]] | None:
+    def _cached_lookup(self, provider_name: str, key: str) -> dict[str, Any] | None:
         cache_key = f"{provider_name}:{key}"
         cached = self._source_cache.get(cache_key)
         if not cached:
             return None
-        ts, value = cached
+        ts = float(cached.get("ts", 0))
         if time.time() - ts > self._source_cache_ttl:
             self._source_cache.pop(cache_key, None)
             return None
-        return value
+        return cached
 
-    def _save_cached_lookup(self, provider_name: str, key: str, value: list[dict[str, Any]]) -> None:
+    def _save_cached_lookup(
+        self,
+        provider_name: str,
+        key: str,
+        value: list[dict[str, Any]],
+        state: str,
+        reason: str = "",
+    ) -> None:
         cache_key = f"{provider_name}:{key}"
-        self._source_cache[cache_key] = (time.time(), value)
+        self._source_cache[cache_key] = {
+            "ts": time.time(),
+            "hits": value,
+            "state": state,
+            "reason": reason,
+        }
+
+    def _clear_cache_for_inn(self, inn: str) -> int:
+        key_fragment = f":inn:{inn}"
+        to_drop = [cache_key for cache_key in self._source_cache if key_fragment in cache_key]
+        for cache_key in to_drop:
+            self._source_cache.pop(cache_key, None)
+        return len(to_drop)
 
     def _search_in_catalog(self, provider_name: str, normalized: str, inn: str) -> list[dict[str, Any]]:
         if inn:
@@ -486,6 +512,7 @@ class CompanyWebApp:
         normalized: str,
         input_type: str,
         inn: str,
+        no_cache: bool = False,
     ) -> tuple[list[dict[str, Any]], str]:
         provider_name = provider["name"]
         if input_type == INPUT_TYPE_INN and not provider["supports_inn"]:
@@ -493,26 +520,37 @@ class CompanyWebApp:
         if input_type != INPUT_TYPE_INN and not provider["supports_name"]:
             return [], f"Источник: {provider_name} — пропущен (не поддерживает название)"
 
-        key = inn if inn else normalized.upper()
-        cached = self._cached_lookup(provider_name, key)
+        key = f"inn:{inn}" if inn else normalized.upper()
+        cached = None if no_cache else self._cached_lookup(provider_name, key)
         if cached is not None:
-            if cached:
-                return cached, f"Источник: {provider_name} — OK (cache)"
-            return [], f"Источник: {provider_name} — пусто (cache)"
+            hits = cached.get("hits", [])
+            state = cached.get("state", "ok")
+            if state == "ok" and hits:
+                return hits, f"Источник: {provider_name} — provider_cached_hit"
+            ttl_left = max(0, int(self._source_cache_ttl - (time.time() - float(cached.get('ts', 0)))))
+            reason = cached.get("reason", "")
+            suffix = f"; причина={reason}" if reason else ""
+            return [], f"Источник: {provider_name} — skipped_due_to_negative_cache (ttl={ttl_left}s{suffix})"
 
         if provider["kind"] == "checko":
-            checko_hit, checko_status = self._fetch_from_checko(raw_input, inn)
+            checko_hit, checko_state, checko_reason = self._fetch_from_checko(raw_input, inn)
             hits = [checko_hit] if checko_hit else []
-            self._save_cached_lookup(provider_name, key, hits)
-            return hits, f"Источник: {provider_name} — {checko_status}"
+            if hits:
+                self._save_cached_lookup(provider_name, key, hits, state="ok")
+                return hits, f"Источник: {provider_name} — provider_called_ok"
+            if checko_state == "error":
+                self._save_cached_lookup(provider_name, key, [], state="error", reason=checko_reason)
+                return [], f"Источник: {provider_name} — provider_error ({checko_reason})"
+            self._save_cached_lookup(provider_name, key, [], state="empty")
+            return [], f"Источник: {provider_name} — provider_called_empty"
 
         hits = self._search_in_catalog(provider_name, normalized, inn)
-        self._save_cached_lookup(provider_name, key, hits)
+        self._save_cached_lookup(provider_name, key, hits, state="ok" if hits else "empty")
         if hits:
-            return hits, f"Источник: {provider_name} — OK"
-        return [], f"Источник: {provider_name} — пусто"
+            return hits, f"Источник: {provider_name} — provider_called_ok"
+        return [], f"Источник: {provider_name} — provider_called_empty"
 
-    def _search_external_sources(self, company_name: str) -> tuple[list[dict[str, Any]], list[str]]:
+    def _search_external_sources(self, company_name: str, no_cache: bool = False) -> tuple[list[dict[str, Any]], list[str]]:
         input_type = self.detect_input_type(company_name)
         inn = self._extract_inn(company_name)
         normalization_seed = inn if inn else company_name
@@ -524,13 +562,14 @@ class CompanyWebApp:
         company_id = self._extract_checko_company_id(company_name)
         if inn:
             trace.append(f"ИНН: {inn}")
+            trace.append(f"Ключ поиска провайдеров: inn:{inn}")
         if company_id:
             trace.append(f"Выделен ID checko: {company_id}")
         hits: list[dict[str, Any]] = []
         providers = self._provider_chain(input_type, company_name)
         trace.append(f"Провайдеров в очереди: {len(providers)}")
         for provider in providers:
-            provider_hits, provider_status = self._run_provider(provider, company_name, normalized, input_type, inn)
+            provider_hits, provider_status = self._run_provider(provider, company_name, normalized, input_type, inn, no_cache=no_cache)
             trace.append(provider_status)
             if provider_hits:
                 hits.extend(provider_hits)
@@ -538,18 +577,18 @@ class CompanyWebApp:
             trace.append("Источники: не получено (в источниках нет данных по запросу)")
         return hits, trace
 
-    def _fetch_from_checko(self, raw_input: str, inn: str = "") -> tuple[dict[str, Any] | None, str]:
+    def _fetch_from_checko(self, raw_input: str, inn: str = "") -> tuple[dict[str, Any] | None, str, str]:
         parsed = urlparse(raw_input) if self.detect_input_type(raw_input) == INPUT_TYPE_URL else None
         host = (parsed.netloc.lower() if parsed else "")
 
         if host and host not in {"checko.ru", "www.checko.ru"}:
-            return None, "пропущен (домен не checko.ru)"
+            return None, "empty", "домен не checko.ru"
         if not inn and host:
             path_match = re.search(r"-(\d{10}|\d{12})/?$", parsed.path)
             if path_match:
                 inn = path_match.group(1)
         if not inn and not host:
-            return None, "пропущен (ИНН не найден во входе)"
+            return None, "empty", "ИНН не найден во входе"
 
         url = raw_input if host in {"checko.ru", "www.checko.ru"} else f"https://checko.ru/company/by-inn/{inn}"
         try:
@@ -557,12 +596,12 @@ class CompanyWebApp:
             with urlopen(req, timeout=8) as response:
                 html = response.read().decode("utf-8", errors="ignore")
         except TimeoutError:
-            return None, "ошибка timeout"
+            return None, "error", "timeout"
         except Exception as exc:  # noqa: BLE001
             reason = str(exc).strip() or exc.__class__.__name__
             if "429" in reason:
-                return None, "429 (пропущен)"
-            return None, f"ошибка ({reason})"
+                return None, "error", "429"
+            return None, "error", reason
 
         org_name = ""
         title_match = re.search(r"<title>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
@@ -577,7 +616,7 @@ class CompanyWebApp:
                 org_name = re.sub(r"<[^>]+>", "", h1_match.group(1)).strip()
 
         if not org_name:
-            return None, "пусто (parse error)"
+            return None, "error", "parse error"
 
         ru_org, _ = self.normalize_ru_org(org_name)
         en_org, _ = self.normalize_en_org("", ru_org)
@@ -588,7 +627,7 @@ class CompanyWebApp:
                 "ru_org": ru_org,
                 "en_org": en_org,
             },
-        }, "OK"
+        }, "ok", ""
 
     def _build_profile_from_sources(
         self,
@@ -609,13 +648,15 @@ class CompanyWebApp:
                     field_sources[field] = source_name
 
         if not profile["ru_org"]:
-            profile["ru_org"] = raw_name
-            field_sources["ru_org"] = "Нормализация запроса"
+            if input_type != INPUT_TYPE_INN:
+                profile["ru_org"] = raw_name
+                field_sources["ru_org"] = "Нормализация запроса"
 
         profile["ru_org"], _ = self.normalize_ru_org(profile["ru_org"])
-        if not profile["en_org"]:
+        if not profile["en_org"] and input_type != INPUT_TYPE_INN:
             profile["en_org"], _ = self.normalize_en_org("", profile["ru_org"])
-            field_sources["en_org"] = "Транслитерация из RU"
+            if profile["en_org"]:
+                field_sources["en_org"] = "Транслитерация из RU"
         else:
             profile["en_org"], _ = self.normalize_en_org(profile["en_org"], profile["ru_org"])
 
@@ -636,6 +677,12 @@ class CompanyWebApp:
                 profile["family_name"] = self._translit(sur)
             if nam:
                 profile["first_name"] = self._translit(nam)
+
+        input_inn = self._extract_inn(raw_name) if input_type == INPUT_TYPE_INN else ""
+        if input_inn and not profile.get("inn"):
+            profile["inn"] = input_inn
+        if profile.get("inn"):
+            field_sources["inn"] = "Ввод пользователя/ФНС" if input_inn else field_sources.get("inn", "ФНС")
 
         profile["salutation"] = self._derive_salutation(profile.get("gender", ""))
         profile["ru_position"], _ = self._normalize_positions_ru(profile.get("ru_position", ""))
@@ -692,8 +739,15 @@ class CompanyWebApp:
 
     def autofill_review(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         raw = self._get_one(form, "company_name")
+        no_cache = self._get_one(form, "no_cache") == "1"
         input_type = self.detect_input_type(raw)
-        source_hits, search_trace = self._search_external_sources(raw)
+        if self._get_one(form, "reset_inn_cache") == "1" and input_type == INPUT_TYPE_INN:
+            dropped = self._clear_cache_for_inn(self._extract_inn(raw))
+            reset_note = [f"Кэш по ИНН очищен: {dropped}"]
+        else:
+            reset_note = []
+        source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache)
+        search_trace = reset_note + search_trace
         profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type)
 
         ru_org, ru_notes = self.normalize_ru_org(profile["ru_org"])
@@ -751,6 +805,12 @@ class CompanyWebApp:
             "<button name='action' value='create'>✅ Создать карту</button>"
             "<button name='action' value='edit'>✏️ Отредактировать</button>"
             "<button name='action' value='cancel'>❌ Отмена</button></form>"
+            f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(raw)}'/><input type='hidden' name='no_cache' value='1'/><button>Повторить без кэша</button></form>"
+            + (
+                f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(raw)}'/><input type='hidden' name='reset_inn_cache' value='1'/><button>Сбросить кэш по ИНН</button></form>"
+                if input_type == INPUT_TYPE_INN
+                else ""
+            )
         )
         body = self._page("Автосбор: черновик", content, back_href="/")
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
