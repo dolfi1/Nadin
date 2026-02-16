@@ -179,7 +179,7 @@ SOURCE_DOMAINS = {
 }
 
 SOURCE_PROVIDERS: list[dict[str, Any]] = [
-    {"name": "ФНС ЕГРЮЛ", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
+    {"name": "ФНС ЕГРЮЛ", "supports_inn": True, "supports_name": True, "kind": "egrul", "rate_limit_policy": "retry"},
     {"name": "ФНС Интеграция ЕГРЮЛ/ЕГРИП", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "queue"},
     {"name": "Федресурс", "supports_inn": True, "supports_name": True, "kind": "catalog", "rate_limit_policy": "retry"},
     {"name": "rusprofile.ru", "supports_inn": True, "supports_name": True, "kind": "rusprofile", "rate_limit_policy": "retry"},
@@ -599,6 +599,8 @@ class CompanyWebApp:
         return (hits[0], "ok", "") if hits else (None, "empty", "")
 
     def _call_inn_provider(self, kind: str, provider_name: str, raw_input: str, normalized: str, inn: str) -> tuple[dict[str, Any] | None, str, str]:
+        if kind == "egrul":
+            return self._fetch_from_egrul(inn)
         if kind == "checko":
             return self._fetch_from_checko(raw_input, inn)
         if kind == "rusprofile":
@@ -705,19 +707,177 @@ class CompanyWebApp:
             return self._provider_fallback_from_catalog(provider_name, normalized, inn)
         return self._provider_fallback_from_catalog(provider_name, normalized, inn)
 
+    def _fetch_from_egrul(self, inn: str) -> tuple[dict[str, Any] | None, str, str]:
+        if not re.fullmatch(r"\d{10,12}", inn):
+            return None, "empty", "invalid inn"
+        url = f"https://egrul.itsoft.ru/{inn}.json"
+        self._domain_throttle(url)
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+        except TimeoutError:
+            return None, "error", "timeout"
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc).strip() or exc.__class__.__name__
+            if "429" in reason:
+                return None, "rate_limited", self._retry_reason("egrul.itsoft.ru")
+            return None, "error", reason
+
+        director = payload.get("director") or {}
+        fio = str(director.get("full_name", "")).split()
+        ru_org = payload.get("short_name") or payload.get("company_name") or ""
+        if not ru_org:
+            return None, "empty", "org not found"
+        return {
+            "source": "ФНС ЕГРЮЛ",
+            "url": url,
+            "data": {
+                "ru_org": ru_org,
+                "inn": inn,
+                "ogrn": payload.get("ogrn", ""),
+                "surname_ru": fio[0] if fio else "",
+                "name_ru": fio[1] if len(fio) > 1 else "",
+                "middle_name_ru": " ".join(fio[2:]) if len(fio) > 2 else "",
+                "ru_position": director.get("position", "Генеральный директор"),
+                "gender": "М" if str(director.get("gender", "")) == "1" else "Ж",
+            },
+        }, "ok", ""
+
+    def _fetch_html_page(self, url: str, timeout: int = 10) -> tuple[str | None, str, str]:
+        self._domain_throttle(url)
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=timeout) as response:
+                return response.read().decode("utf-8", errors="ignore"), "ok", ""
+        except TimeoutError:
+            return None, "error", "timeout"
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc).strip() or exc.__class__.__name__
+            if "429" in reason:
+                domain = urlparse(url).netloc or url
+                return None, "rate_limited", self._retry_reason(domain)
+            return None, "error", reason
+
+    def _extract_director_from_html(self, html: str) -> tuple[str, str, str]:
+        match = re.search(
+            r"(?:Генеральн(?:ый|ого)\s+директор|Руководитель|Директор)[^А-ЯЁ]{0,100}([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)",
+            html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return "", "", ""
+        fio = re.sub(r"\s+", " ", match.group(1)).strip().split(" ")
+        return fio[0], fio[1], " ".join(fio[2:])
+
+    def _extract_org_from_html(self, html: str) -> str:
+        title_match = re.search(r"<title>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+        if title_match:
+            title = re.sub(r"<[^>]+>", "", title_match.group(1))
+            title = re.sub(r"\s+", " ", title).strip()
+            title = re.sub(r"\s*[|—-].*$", "", title).strip()
+            if title:
+                return title
+        h1_match = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.IGNORECASE | re.DOTALL)
+        if h1_match:
+            return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", h1_match.group(1))).strip()
+        return ""
+
     def _fetch_from_rusprofile(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
-        return self._fetch_inn_fixture("rusprofile.ru", inn, normalized)
+        if not inn:
+            return self._provider_fallback_from_catalog("rusprofile.ru", normalized, inn)
+        url = f"https://www.rusprofile.ru/search?query={inn}"
+        html, state, reason = self._fetch_html_page(url)
+        if not html:
+            return None, state, reason
+        surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(html)
+        org_name = self._extract_org_from_html(html)
+        if not org_name and not surname_ru:
+            return None, "empty", "not found"
+        return {
+            "source": "rusprofile.ru",
+            "url": url,
+            "data": {
+                "inn": inn,
+                "ru_org": org_name,
+                "surname_ru": surname_ru,
+                "name_ru": name_ru,
+                "middle_name_ru": middle_name_ru,
+                "ru_position": "Генеральный директор" if surname_ru else "",
+            },
+        }, "ok", ""
 
     def _fetch_from_list_org(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
-        return self._fetch_inn_fixture("list-org.com", inn, normalized)
+        if not inn:
+            return self._provider_fallback_from_catalog("list-org.com", normalized, inn)
+        url = f"https://www.list-org.com/search?val={inn}"
+        html, state, reason = self._fetch_html_page(url)
+        if not html:
+            return None, state, reason
+        surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(html)
+        org_name = self._extract_org_from_html(html)
+        if not org_name and not surname_ru:
+            return None, "empty", "not found"
+        return {
+            "source": "list-org.com",
+            "url": url,
+            "data": {
+                "inn": inn,
+                "ru_org": org_name,
+                "surname_ru": surname_ru,
+                "name_ru": name_ru,
+                "middle_name_ru": middle_name_ru,
+                "ru_position": "Генеральный директор" if surname_ru else "",
+            },
+        }, "ok", ""
 
     def _fetch_from_zachestnyibiznes(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
-        return self._fetch_inn_fixture("zachestnyibiznes.ru", inn, normalized)
+        if not inn:
+            return self._provider_fallback_from_catalog("zachestnyibiznes.ru", normalized, inn)
+        url = f"https://zachestnyibiznes.ru/search?query={inn}"
+        html, state, reason = self._fetch_html_page(url)
+        if not html:
+            return None, state, reason
+        surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(html)
+        org_name = self._extract_org_from_html(html)
+        if not org_name and not surname_ru:
+            return None, "empty", "not found"
+        return {
+            "source": "zachestnyibiznes.ru",
+            "url": url,
+            "data": {
+                "inn": inn,
+                "ru_org": org_name,
+                "surname_ru": surname_ru,
+                "name_ru": name_ru,
+                "middle_name_ru": middle_name_ru,
+                "ru_position": "Генеральный директор" if surname_ru else "",
+            },
+        }, "ok", ""
 
     def _fetch_from_kontur(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
-        if inn == "1102054991":
-            return None, "rate_limited", self._retry_reason("focus.kontur.ru")
-        return self._fetch_inn_fixture("focus.kontur.ru", inn, normalized)
+        if not inn:
+            return self._provider_fallback_from_catalog("focus.kontur.ru", normalized, inn)
+        url = f"https://focus.kontur.ru/search?query={inn}"
+        html, state, reason = self._fetch_html_page(url)
+        if not html:
+            return None, state, reason
+        surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(html)
+        org_name = self._extract_org_from_html(html)
+        if not org_name and not surname_ru:
+            return None, "empty", "not found"
+        return {
+            "source": "focus.kontur.ru",
+            "url": url,
+            "data": {
+                "inn": inn,
+                "ru_org": org_name,
+                "surname_ru": surname_ru,
+                "name_ru": name_ru,
+                "middle_name_ru": middle_name_ru,
+                "ru_position": "Генеральный директор" if surname_ru else "",
+            },
+        }, "ok", ""
 
     def _fetch_from_checko(self, raw_input: str, inn: str = "") -> tuple[dict[str, Any] | None, str, str]:
         parsed = urlparse(raw_input) if self.detect_input_type(raw_input) == INPUT_TYPE_URL else None
