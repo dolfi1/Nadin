@@ -75,6 +75,13 @@ def test_csv_export_and_audit_log(tmp_path):
 
     _, _, card_page = call_app(app, "GET", headers["Location"])
     assert "Audit log" in card_page
+    assert "🏠 Главная" in card_page
+    assert "← Назад" in card_page
+    assert "Показать данные карточки на сайте" in card_page
+
+    _, _, preview_page = call_app(app, "GET", f"{headers['Location']}/export")
+    assert "Данные карточки" in preview_page
+    assert "Romashka LLC" in preview_page
 
     _, _, csv_body = call_app(app, "GET", f"{headers['Location']}/export.csv")
     assert "ru_org" in csv_body
