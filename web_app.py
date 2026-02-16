@@ -10,6 +10,7 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import as_completed
+from difflib import SequenceMatcher
 from urllib.request import Request
 from urllib.request import urlopen
 from datetime import datetime, timezone
@@ -493,6 +494,19 @@ class CompanyWebApp:
             db.commit()
             return len(dropped) + int(cur.rowcount)
 
+    def _clear_cache_for_person(self, query: str) -> int:
+        normalized = self._normalize_spaces(query).lower()
+        if not normalized:
+            return 0
+        key_fragment = f"person:{normalized}"
+        dropped = [k for k in self._source_cache if key_fragment in k.lower()]
+        for key in dropped:
+            self._source_cache.pop(key, None)
+        with self._connect() as db:
+            cur = db.execute("DELETE FROM source_cache WHERE lower(cache_key) LIKE ?", (f"%{key_fragment}%",))
+            db.commit()
+            return len(dropped) + int(cur.rowcount)
+
     def _should_call_provider(self, provider: dict[str, Any], input_type: str) -> bool:
         if input_type == INPUT_TYPE_INN:
             return bool(provider.get("supports_inn"))
@@ -530,17 +544,25 @@ class CompanyWebApp:
     def _score_hit(self, hit: dict[str, Any], query: str) -> float:
         data = hit.get("data", hit)
         q_norm = self._normalize_spaces(query.lower())
-        q_words = {w for w in q_norm.split() if w}
+        q_words_list = [w for w in q_norm.split() if w]
+        q_words = set(q_words_list)
         fio = " ".join(x for x in [data.get("surname_ru", ""), data.get("name_ru", ""), data.get("middle_name_ru", "")] if x).strip()
-        fio_words = {w for w in self._normalize_spaces(fio.lower()).split() if w}
+        fio_norm = self._normalize_spaces(fio.lower())
+        fio_words_list = [w for w in fio_norm.split() if w]
+        fio_words = set(fio_words_list)
 
         score = 0.0
-        if q_words and fio_words:
+        if q_words and fio_words and self.detect_input_type(query) == INPUT_TYPE_PERSON_TEXT:
             exact_match = len(q_words & fio_words) / len(q_words)
             if exact_match > 0.8:
                 score += 40
             if sorted(q_words) == sorted(fio_words):
                 score += 20
+            if sorted(q_words_list) == sorted(fio_words_list):
+                score += 60
+            ratio = SequenceMatcher(None, q_norm, fio_norm).ratio()
+            if ratio > 0.75:
+                score += 40
 
         revenue = int(data.get("revenue", 0) or 0)
         score += min(revenue / 1e5, 50)
@@ -595,8 +617,8 @@ class CompanyWebApp:
             return provider["name"], [], "provider_called_empty"
 
         active_providers = [provider for provider in providers if self._should_call_provider(provider, input_type)]
-        if input_type == INPUT_TYPE_PERSON_TEXT and active_providers:
-            with ThreadPoolExecutor(max_workers=min(3, len(active_providers))) as executor:
+        if active_providers:
+            with ThreadPoolExecutor(max_workers=min(4, len(active_providers))) as executor:
                 futures = {executor.submit(load_provider, provider): provider for provider in active_providers}
                 for future in as_completed(futures):
                     provider = futures[future]
@@ -610,19 +632,6 @@ class CompanyWebApp:
                         logger.error("Provider %s failed for %s: %s", provider.get("name"), raw, exc)
                         trace.append(f"Источник: {provider['name']} — provider_error ({exc})")
                         hits_by_provider[provider["name"]] = 0
-        else:
-            for provider in active_providers:
-                try:
-                    provider_name, provider_hits, state = load_provider(provider)
-                    if provider_hits:
-                        hits.extend(provider_hits)
-                    hits_by_provider[provider_name] = len(provider_hits)
-                    trace.append(f"Источник: {provider_name} — {state}")
-                except Exception as exc:  # noqa: BLE001
-                    logger.error("Provider %s failed for %s: %s", provider.get("name"), raw, exc)
-                    trace.append(f"Источник: {provider['name']} — provider_error ({exc})")
-                    hits_by_provider[provider["name"]] = 0
-
         for provider in providers:
             if not self._should_call_provider(provider, input_type):
                 continue
@@ -656,24 +665,45 @@ class CompanyWebApp:
             if not resp.ok or "json" not in resp.headers.get("content-type", ""):
                 return None
             data = resp.json()
+            sv_yul = data.get("СвЮЛ", {}) or {}
             company = data.get("company", {}) or {}
             director = data.get("director", {}) or {}
-            company_name = company.get("short_name") or company.get("name") or data.get("name", "") or data.get("ru_org", "")
+            directors = data.get("СведДолжнФЛ", []) or []
+            legacy_director = directors[0] if isinstance(directors, list) and directors else {}
+            legacy_fio = legacy_director.get("ФИО") or legacy_director.get("ФИОПолн") or ""
+            if not legacy_fio and isinstance(sv_yul, dict):
+                ruk = sv_yul.get("РукФЛ", {}) or {}
+                svfl = ruk.get("СвФЛ", {}) if isinstance(ruk, dict) else {}
+                legacy_fio = (svfl or {}).get("ФИОПолн") or (svfl or {}).get("ФИОРус") or ""
+            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(str(legacy_fio))
+
+            company_name = (
+                sv_yul.get("НаимСокр")
+                or data.get("НаимСокр")
+                or company.get("short_name")
+                or company.get("name")
+                or data.get("name", "")
+                or data.get("ru_org", "")
+            )
             ru_org = self._clean_ru_org_name(str(company_name).replace("ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "ПАО"))
             director_gender = str(director.get("gender", "")).strip().lower()
+            rev_raw = (
+                (data.get("ФинПоказ", {}) or {}).get("Выручка")
+                or data.get("revenue", 0)
+            )
             return {
                 "url": url,
-                "inn": company.get("inn") or data.get("inn") or query,
+                "inn": company.get("inn") or data.get("inn") or data.get("ИННЮЛ") or query,
                 "ogrn": data.get("ogrn"),
                 "ru_org": ru_org,
                 "en_org": data.get("en_org", ""),
-                "surname_ru": director.get("surname_ru", "") or director.get("surname", "") or data.get("surname_ru", ""),
-                "name_ru": director.get("name_ru", "") or director.get("name", "") or data.get("name_ru", ""),
-                "middle_name_ru": director.get("middle_name_ru", "") or director.get("patronymic", "") or data.get("middle_name_ru", ""),
+                "surname_ru": director.get("surname_ru", "") or director.get("surname", "") or data.get("surname_ru", "") or surname_ru,
+                "name_ru": director.get("name_ru", "") or director.get("name", "") or data.get("name_ru", "") or name_ru,
+                "middle_name_ru": director.get("middle_name_ru", "") or director.get("patronymic", "") or data.get("middle_name_ru", "") or middle_name_ru,
                 "gender": "М" if director_gender in {"1", "м", "мужской"} or "муж" in director_gender else ("Ж" if director_gender else ""),
-                "ru_position": director.get("position", "") or data.get("ru_position", "Генеральный директор"),
+                "ru_position": director.get("position", "") or legacy_director.get("Должность", "") or legacy_director.get("НаимДолжн", "") or data.get("ru_position", "Генеральный директор"),
                 "en_position": data.get("en_position", ""),
-                "revenue": int(data.get("revenue", 0) or 0),
+                "revenue": self._extract_revenue(str(rev_raw)),
             }
         except Exception as exc:  # noqa: BLE001
             logger.error("EGRUL parse failed for %s: %s", query, exc)
@@ -755,17 +785,25 @@ class CompanyWebApp:
                 return []
             soup = BeautifulSoup(search_resp.text, "lxml")
             hits: list[dict[str, Any]] = []
+            seen_urls: set[str] = set()
             for person_link in soup.select("a[href*='/person/']"):
                 if not isinstance(person_link, Tag):
                     continue
                 person_url = "https://www.rusprofile.ru" + str(person_link.get("href", ""))
+                if person_url in seen_urls:
+                    continue
+                seen_urls.add(person_url)
                 p_resp = self._request(person_url)
                 if not p_resp.ok:
                     continue
                 p_soup = BeautifulSoup(p_resp.text, "lxml")
                 fio = p_soup.find("h1").get_text(strip=True) if isinstance(p_soup.find("h1"), Tag) else person_link.get_text(" ", strip=True)
-                org_link = p_soup.find("a", href=re.compile(r"/(id|company)/\d+"))
-                org_name = org_link.get_text(strip=True) if isinstance(org_link, Tag) else ""
+                org_link = p_soup.find("a", href=re.compile(r"^/(id|company)/\d+"))
+                org_name = org_link.get_text(" ", strip=True) if isinstance(org_link, Tag) else ""
+                if not org_name:
+                    company_node = p_soup.select_one(".company-name")
+                    if isinstance(company_node, Tag):
+                        org_name = company_node.get_text(" ", strip=True)
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio)
                 ru_position = ""
                 text = p_soup.get_text(" ", strip=True)
@@ -779,6 +817,7 @@ class CompanyWebApp:
                     "name_ru": name_ru,
                     "middle_name_ru": middle_name_ru,
                     "ru_position": ru_position or ("Президент, Председатель правления" if "греф" in fio.lower() else "Генеральный директор"),
+                    "inn": self._extract_inn(text),
                     "revenue": self._extract_revenue_from_soup(p_soup),
                 })
                 fio_text = f"{surname_ru} {name_ru} {middle_name_ru}".strip().lower()
@@ -1422,8 +1461,24 @@ class CompanyWebApp:
             db.commit()
 
     def _build_person_candidates(self, hits: list[dict[str, Any]], query: str = "") -> list[dict[str, str]]:
+        query_words = {w for w in self._normalize_spaces(query.lower()).split() if w}
+        filtered_hits = hits
+        if query_words:
+            strict = []
+            for hit in hits:
+                data = hit.get("data", {})
+                fio_words = {
+                    w for w in self._normalize_spaces(
+                        " ".join(x for x in [data.get("surname_ru", ""), data.get("name_ru", ""), data.get("middle_name_ru", "")] if x).lower()
+                    ).split() if w
+                }
+                if query_words.issubset(fio_words):
+                    strict.append(hit)
+            if strict:
+                filtered_hits = strict
+
         seen: dict[tuple[str, str], dict[str, str]] = {}
-        for hit in hits:
+        for hit in filtered_hits:
             data = hit.get("data", {})
             fio_ru = " ".join(x for x in [data.get("surname_ru", ""), data.get("name_ru", ""), data.get("middle_name_ru", "")] if x).strip()
             if not fio_ru:
@@ -1549,6 +1604,9 @@ class CompanyWebApp:
         if self._get_one(form, "reset_inn_cache") == "1" and input_type == INPUT_TYPE_INN:
             dropped = self._clear_cache_for_inn(self._extract_inn(raw))
             reset_note = [f"Кэш по ИНН очищен: {dropped}"]
+        elif self._get_one(form, "reset_inn_cache") == "1" and input_type == INPUT_TYPE_PERSON_TEXT:
+            dropped = self._clear_cache_for_person(raw)
+            reset_note = [f"Кэш по персоне очищен: {dropped}"]
         else:
             reset_note = []
         source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache)

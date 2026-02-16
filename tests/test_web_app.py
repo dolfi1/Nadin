@@ -238,3 +238,61 @@ def test_person_search_cache_key_is_lowercase(tmp_path, monkeypatch):
 
     expected = sum(1 for provider in app._provider_chain(web_app.INPUT_TYPE_PERSON_TEXT, "Греф") if app._should_call_provider(provider, web_app.INPUT_TYPE_PERSON_TEXT))
     assert calls["count"] == expected
+
+
+def test_score_hit_reverse_exact_name_boost(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    sber_hit = {
+        "source": "rusprofile.ru",
+        "data": {
+            "surname_ru": "Греф",
+            "name_ru": "Герман",
+            "middle_name_ru": "Оскарович",
+            "ru_org": "ПАО Сбербанк",
+            "ru_position": "Президент",
+            "revenue": 5200000,
+        },
+    }
+    noise_hit = {
+        "source": "list-org.com",
+        "data": {
+            "surname_ru": "Юнусов",
+            "name_ru": "Герман",
+            "middle_name_ru": "Петрович",
+            "ru_org": "ООО Гермес",
+            "ru_position": "Директор",
+            "revenue": 0,
+        },
+    }
+
+    assert app._score_hit(sber_hit, "Герман Греф") > app._score_hit(noise_hit, "Герман Греф")
+
+
+def test_parse_egrul_supports_legacy_payload_fields(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_get(url, **_kwargs):
+        assert url == "https://egrul.itsoft.ru/7707083893.json"
+        return FakeResponse(
+            json_data={
+                "НаимСокр": "ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО СБЕРБАНК",
+                "ИННЮЛ": "7707083893",
+                "СведДолжнФЛ": [
+                    {
+                        "ФИО": "Греф Герман Оскарович",
+                        "Должность": "Президент",
+                    }
+                ],
+                "ФинПоказ": {"Выручка": "5 200 000"},
+            }
+        )
+
+    monkeypatch.setattr(web_app.requests, "get", fake_get)
+
+    data = app._parse_egrul("7707083893")
+    assert data is not None
+    assert data["inn"] == "7707083893"
+    assert data["ru_org"].startswith("ПАО")
+    assert data["surname_ru"] == "Греф"
+    assert data["name_ru"] == "Герман"
+    assert data["revenue"] == 5200000
