@@ -205,7 +205,7 @@ def test_checko_inn_lookup_uses_external_source(monkeypatch, tmp_path):
     )
     assert status.startswith("200")
     assert "Выделен ID checko: 1071102001651" in review
-    assert "Источник: checko.ru — OK" in review
+    assert "Источник: checko.ru — provider_called_ok" in review
     assert "<td>Источник</td><td>checko.ru</td>" not in review
 
 
@@ -256,6 +256,51 @@ def test_multisource_fallback_skips_checko_429_and_keeps_fns_data(monkeypatch, t
 
     status, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "7707083893"})
     assert status.startswith("200")
-    assert "Источник: ФНС ЕГРЮЛ — OK" in review
-    assert "Источник: checko.ru — 429 (пропущен)" in review
+    assert "Источник: ФНС ЕГРЮЛ — provider_called_ok" in review
+    assert "Источник: checko.ru — provider_error (429)" in review
     assert "<td>Организация</td><td>Сбербанк ПАО</td>" in review
+
+def test_inn_input_keeps_name_and_org_empty_without_source_data(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    _, _, review = call_app(app, "POST", "/autofill/review", form={"company_name": "1102054991"})
+    assert "Тип ввода: INN" in review
+    assert "Ключ поиска провайдеров: inn:1102054991" in review
+    assert "<td>ИНН</td><td>1102054991</td><td>Ввод пользователя/ФНС</td><td>Заполнено</td>" in review
+    assert "<td>Организация</td><td></td><td>—</td><td>Нужно заполнить</td>" in review
+    assert "<td>Organization</td><td></td><td>—</td><td>Нужно заполнить</td>" in review
+    assert "<td>Family name</td><td></td>" in review
+    assert "<td>First name</td><td></td>" in review
+
+
+def test_negative_cache_reporting_and_retry_controls(monkeypatch, tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_urlopen(*_args, **_kwargs):
+        raise RuntimeError("HTTP Error 429: Too Many Requests")
+
+    monkeypatch.setattr(web_app, "urlopen", fake_urlopen)
+
+    _, _, first_review = call_app(app, "POST", "/autofill/review", form={"company_name": "1102054991"})
+    assert "provider_error (429)" in first_review
+    assert "Повторить без кэша" in first_review
+    assert "Сбросить кэш по ИНН" in first_review
+
+    _, _, second_review = call_app(app, "POST", "/autofill/review", form={"company_name": "1102054991"})
+    assert "skipped_due_to_negative_cache" in second_review
+
+    _, _, no_cache_review = call_app(
+        app,
+        "POST",
+        "/autofill/review",
+        form={"company_name": "1102054991", "no_cache": "1"},
+    )
+    assert "provider_error (429)" in no_cache_review
+
+    _, _, reset_review = call_app(
+        app,
+        "POST",
+        "/autofill/review",
+        form={"company_name": "1102054991", "reset_inn_cache": "1"},
+    )
+    assert "Кэш по ИНН очищен:" in reset_review
