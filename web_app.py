@@ -161,6 +161,7 @@ class CompanyWebApp:
         self._domain_last_call: dict[str, float] = {}
         self._domain_throttle_seconds = 3
         self._add_enhanced_providers()
+        self._add_osint_providers()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -618,17 +619,18 @@ class CompanyWebApp:
         normalized = self._normalize_spaces(raw)
         inn = self._extract_inn(raw) if input_type == INPUT_TYPE_INN else None
         try:
-            return self._fetch_from_provider(provider, normalized, input_type, inn)
+            hits = self._fetch_from_provider(provider, normalized, input_type, inn)
+            if hits:
+                return hits
         except Exception as exc:  # noqa: BLE001
-            logger.error("Provider %s failed for %s: %s", provider.get("name"), raw, str(exc))
-            if self._is_blocking_error(exc):
-                fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn)
-                if not fallback_hits:
-                    return []
-                if provider.get("kind") == "egrul":
-                    return fallback_hits[0].get("data", {})
-                return [hit.get("data", {}) for hit in fallback_hits]
-        return None
+            logger.warning("Provider %s failed for %s: %s", provider.get("name"), raw, str(exc))
+
+        fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn)
+        if not fallback_hits:
+            return []
+        if provider.get("kind") == "egrul":
+            return fallback_hits[0].get("data", {})
+        return [hit.get("data", {}) for hit in fallback_hits]
 
     def _fetch_from_provider(self, provider: dict[str, Any], raw: str, input_type: str, inn: str | None) -> list[dict[str, Any]] | dict[str, Any] | None:
         kind = provider.get("kind")
@@ -642,6 +644,15 @@ class CompanyWebApp:
             return self._collect_rusprofile_profiles(raw, input_type, is_person=person_query)
         if kind == "kontur":
             return self._parse_kontur(raw)
+        if kind == "open_corporates" and inn:
+            url = provider.get("url_template", "").format(inn=inn)
+            return self._parse_open_corporates(url)
+        if kind == "sparks" and inn:
+            url = provider.get("url_template", "").format(inn=inn)
+            return self._parse_sparks(url)
+        if kind in {"sbis", "kontur_focus", "banki_ru"} and inn:
+            url = provider.get("url_template", "").format(inn=inn)
+            return self._parse_generic_osint(url, provider.get("name", kind))
         return None
 
     def _is_blocking_error(self, error: Exception) -> bool:
@@ -657,7 +668,7 @@ class CompanyWebApp:
         )
 
     def _try_fallback_providers(self, provider: dict[str, Any], query: str, input_type: str, inn: str | None) -> list[dict[str, Any]]:
-        fallback_providers = self._get_fallback_providers(provider.get("name", ""), query, input_type)
+        fallback_providers = self._get_fallback_providers(provider, query, input_type)
         hits: list[dict[str, Any]] = []
         for fallback in fallback_providers:
             try:
@@ -683,19 +694,15 @@ class CompanyWebApp:
             return bool(provider.get("supports_name", False))
         return bool(provider.get("supports_name", False) or provider.get("supports_inn", False))
 
-    def _get_fallback_providers(self, provider_name: str, query: str, input_type: str) -> list[dict[str, Any]]:
-        fallback_map = {
-            "list-org.com": ["zachestnyibiznes.ru", "focus.kontur.ru", "checko.ru", "ФНС ЕГРЮЛ"],
-            "rusprofile.ru": ["zachestnyibiznes.ru", "focus.kontur.ru", "checko.ru", "ФНС ЕГРЮЛ"],
-            "focus.kontur.ru": ["rusprofile.ru", "zachestnyibiznes.ru", "ФНС ЕГРЮЛ"],
-        }
-        fallback_providers = fallback_map.get(provider_name, [])
-        available_fallbacks: list[dict[str, Any]] = []
-        for fallback_name in fallback_providers:
-            fallback_provider = self._get_provider_by_name(fallback_name)
-            if fallback_provider and self._supports_input_type(fallback_provider, input_type, query):
-                available_fallbacks.append(fallback_provider)
-        return available_fallbacks
+    def _get_fallback_providers(self, provider: dict[str, Any], query: str, input_type: str) -> list[dict[str, Any]]:
+        return sorted(
+            [
+                p
+                for p in self.SOURCE_PROVIDERS
+                if p.get("name") != provider.get("name") and self._supports_input_type(p, input_type, query)
+            ],
+            key=lambda item: int(item.get("priority", 10)),
+        )
 
     def _get_provider_by_name(self, name: str) -> dict[str, Any] | None:
         for provider in self.SOURCE_PROVIDERS:
@@ -738,6 +745,21 @@ class CompanyWebApp:
         for provider in sorted(enhanced_providers, key=lambda p: int(p["priority"])):
             if not any(p["name"] == provider["name"] for p in self.SOURCE_PROVIDERS):
                 self.SOURCE_PROVIDERS.insert(0, provider)
+
+    def _add_osint_providers(self) -> None:
+        osint_providers = [
+            {"name": "open-corporates", "kind": "open_corporates", "url_template": "https://opencorporates.com/companies/ru_{inn}", "supports_inn": True, "supports_name": True, "priority": 5},
+            {"name": "sparks", "kind": "sparks", "url_template": "https://sparks.ru/company/{inn}", "supports_inn": True, "supports_name": True, "priority": 6},
+            {"name": "sbis", "kind": "sbis", "url_template": "https://sbis.ru/contragents/{inn}", "supports_inn": True, "supports_name": True, "priority": 7},
+            {"name": "kontur_focus", "kind": "kontur_focus", "url_template": "https://focus.kontur.ru/entity/{inn}", "supports_inn": True, "supports_name": True, "priority": 8},
+            {"name": "banki_ru", "kind": "banki_ru", "url_template": "https://www.banki.ru/company/{inn}/", "supports_inn": True, "supports_name": False, "priority": 9},
+        ]
+        for provider in osint_providers:
+            provider.setdefault("supports_url", False)
+            provider.setdefault("is_person_source", True)
+            if not any(p.get("name") == provider["name"] for p in self.SOURCE_PROVIDERS):
+                self.SOURCE_PROVIDERS.append(provider)
+        self.SOURCE_PROVIDERS.sort(key=lambda p: int(p.get("priority", 10)))
 
     def _extract_revenue(self, text: str) -> int:
         digits = re.sub(r"[^\d]", "", text or "")
@@ -860,19 +882,15 @@ class CompanyWebApp:
             time.sleep(wait_for)
         self._domain_last_call[host] = time.time()
 
-    def _fetch_page(self, url: str, timeout: int = 30, max_retries: int = 3) -> str:
+    def _fetch_page(self, url: str, timeout: int = 20, max_retries: int = 3) -> str | None:
         self._domain_throttle(url)
         if not self._is_localhost(url):
-            time.sleep(random.uniform(0.5, 2.0))
+            time.sleep(random.uniform(0.5, 2.5))
         for attempt in range(max_retries):
             try:
-                headers = {
-                    "User-Agent": self._get_random_user_agent(),
-                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "Connection": "keep-alive",
-                }
-                proxies = self._get_proxies() if attempt > 0 else None
+                user_agent = self._get_random_user_agent()
+                headers = self._get_random_headers(user_agent)
+                proxies = self._get_random_proxy() if attempt > 0 else None
                 response = requests.get(url, timeout=timeout, headers=headers, proxies=proxies)
                 status_code = getattr(response, "status_code", 200 if getattr(response, "ok", False) else 500)
                 if status_code == 200:
@@ -883,14 +901,14 @@ class CompanyWebApp:
                     time.sleep(wait_time)
                     continue
                 logger.error("Failed to fetch %s, status code: %d", url, status_code)
-                return ""
+                return None
             except Exception as exc:  # noqa: BLE001
                 logger.error("Fetch failed for %s (attempt %d/%d): %s", url, attempt + 1, max_retries, exc)
                 if attempt < max_retries - 1:
                     time.sleep((attempt + 1) * 2)
 
         logger.error("Failed to fetch %s after %d attempts", url, max_retries)
-        return ""
+        return None
 
     def _is_localhost(self, url: str) -> bool:
         host = urlparse(url).netloc.lower()
@@ -903,10 +921,31 @@ class CompanyWebApp:
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
             "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (Android 11; Mobile; rv:68.0) Gecko/68.0 Firefox/68.0",
         ]
         return random.choice(user_agents)
 
-    def _get_proxies(self) -> dict[str, str] | None:
+    def _get_random_headers(self, user_agent: str) -> dict[str, str]:
+        headers = {
+            "User-Agent": user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": random.choice(["ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7", "en-US,en;q=0.9,ru;q=0.8"]),
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        }
+        if random.random() > 0.5:
+            headers["Referer"] = random.choice(["https://www.google.com/", "https://yandex.ru/", "https://www.bing.com/"])
+        return headers
+
+    def _get_random_proxy(self) -> dict[str, str] | None:
+        free_proxies: list[str] = []
+        if free_proxies and random.random() > 0.3:
+            proxy = random.choice(free_proxies)
+            return {"http": proxy, "https": proxy}
         return None
 
     def _request(self, url: str, timeout: int = 10) -> requests.Response:
@@ -1446,6 +1485,58 @@ class CompanyWebApp:
             "middle_name_ru": middle_name_ru,
             "inn": self._extract_inn(query),
             "revenue": self._extract_revenue_from_soup(soup),
+        }
+
+    def _parse_open_corporates(self, url: str) -> dict[str, Any]:
+        html = self._fetch_page(url, timeout=20, max_retries=2)
+        if not html:
+            return {}
+        soup = BeautifulSoup(html, "lxml")
+        org_name = self._select_first_text(soup, [".company-name", ".company-header h1", "h1"])
+        director = self._select_first_text(soup, [".officer-name", ".director-name"])
+        position = self._select_first_text(soup, [".officer-role", ".director-position"])
+        return self._build_osint_profile(url, "open-corporates", org_name, director, position, soup.get_text(" ", strip=True))
+
+    def _parse_sparks(self, url: str) -> dict[str, Any]:
+        html = self._fetch_page(url, timeout=20, max_retries=2)
+        if not html:
+            return {}
+        soup = BeautifulSoup(html, "lxml")
+        org_name = self._select_first_text(soup, [".company-title", ".company-name h1", "h1"])
+        director = self._select_first_text(soup, [".director-name", ".company-director", ".company-head"])
+        position = self._select_first_text(soup, [".director-position", ".company-position"]) or "Генеральный директор"
+        return self._build_osint_profile(url, "sparks", org_name, director, position, soup.get_text(" ", strip=True))
+
+    def _parse_generic_osint(self, url: str, source: str) -> dict[str, Any]:
+        html = self._fetch_page(url, timeout=20, max_retries=2)
+        if not html:
+            return {}
+        soup = BeautifulSoup(html, "lxml")
+        org_name = self._select_first_text(soup, ["h1", ".company-name", ".org-name", ".entity-title"])
+        director = self._select_first_text(soup, [".director-name", ".company-director", ".manager-name"])
+        position = self._select_first_text(soup, [".director-position", ".manager-position", ".position"])
+        return self._build_osint_profile(url, source, org_name, director, position, soup.get_text(" ", strip=True))
+
+    def _build_osint_profile(self, url: str, source: str, org_name: str, director: str, position: str, page_text: str) -> dict[str, Any]:
+        surname_ru, name_ru, middle_name_ru = "", "", ""
+        if director:
+            parts = director.split()
+            surname_ru = parts[0] if parts else ""
+            name_ru = parts[1] if len(parts) > 1 else ""
+            middle_name_ru = parts[2] if len(parts) > 2 else ""
+        inn = ""
+        inn_match = re.search(r"ИНН[:\s]*(\d{10,12})", page_text)
+        if inn_match:
+            inn = inn_match.group(1)
+        return {
+            "url": url,
+            "source": source,
+            "ru_org": self._clean_ru_org_name(org_name),
+            "surname_ru": surname_ru,
+            "name_ru": name_ru,
+            "middle_name_ru": middle_name_ru,
+            "ru_position": position,
+            "inn": inn,
         }
 
     def _parse_url_detail(self, raw_url: str) -> dict[str, Any] | None:
@@ -2058,50 +2149,82 @@ class CompanyWebApp:
             db.commit()
 
     def _build_person_candidates(self, hits: list[dict[str, Any]], query: str = "") -> list[dict[str, str]]:
+        candidates: list[dict[str, Any]] = []
         query_words = [w for w in self._normalize_spaces(query.lower()).split() if w]
-        filtered_hits = hits
-        if query_words:
-            strict = []
-            for hit in hits:
-                data = hit.get("data", {})
-                surname = self._normalize_spaces(str(data.get("surname_ru", "")).lower())
-                fio = self._normalize_spaces(
-                    " ".join(x for x in [data.get("surname_ru", ""), data.get("name_ru", ""), data.get("middle_name_ru", "")] if x).lower()
-                )
-                if any(word in surname for word in query_words) or all(word in fio for word in query_words):
-                    strict.append(hit)
-            if strict:
-                filtered_hits = strict
 
-        seen: dict[tuple[str, str], dict[str, str]] = {}
-        for hit in filtered_hits:
+        for hit in hits:
             data = hit.get("data", {})
-            fio_ru = " ".join(x for x in [data.get("surname_ru", ""), data.get("name_ru", ""), data.get("middle_name_ru", "")] if x).strip()
-            if not fio_ru:
-                continue
-            org_ru = self._clean_ru_org_name(str(data.get("ru_org", "")))
-            key = (fio_ru.lower(), org_ru.lower())
-            if key in seen:
-                existing_score = float(seen[key].get("score", 0))
-                candidate_score = self._score_hit(hit, query)
-                if existing_score >= candidate_score:
+            normalized_data = dict(data)
+            if normalized_data.get("ru_org"):
+                normalized_data["ru_org"] = self._clean_ru_org_name(str(normalized_data["ru_org"]))
+            if normalized_data.get("ru_org") and not normalized_data.get("en_org"):
+                normalized_data["en_org"], _ = self.normalize_en_org(str(normalized_data["ru_org"]), str(normalized_data["ru_org"]))
+            elif normalized_data.get("en_org"):
+                normalized_data["en_org"], _ = self.normalize_en_org(str(normalized_data["en_org"]), str(normalized_data.get("ru_org", "")))
+
+            if normalized_data.get("ru_position"):
+                normalized_data["ru_position"] = self._normalize_position_ru(str(normalized_data["ru_position"]))
+            if normalized_data.get("ru_position") and not normalized_data.get("en_position"):
+                normalized_data["en_position"] = self._generate_en_position(str(normalized_data["ru_position"]))
+            elif normalized_data.get("en_position"):
+                normalized_data["en_position"], _ = self._normalize_positions_en(str(normalized_data["en_position"]))
+
+            if normalized_data.get("middle_name_ru") and not normalized_data.get("middle_name_en"):
+                normalized_data["middle_name_en"] = self._translit(str(normalized_data["middle_name_ru"]))
+            if normalized_data.get("gender") and not normalized_data.get("appeal"):
+                normalized_data["appeal"] = "Г-н" if normalized_data["gender"] == "М" else "Г-жа"
+
+            fio_ru = " ".join(x for x in [normalized_data.get("surname_ru", ""), normalized_data.get("name_ru", ""), normalized_data.get("middle_name_ru", "")] if x).strip()
+            if query_words and fio_ru:
+                fio_lower = self._normalize_spaces(fio_ru.lower())
+                surname = self._normalize_spaces(str(normalized_data.get("surname_ru", "")).lower())
+                if not (any(word in surname for word in query_words) or all(word in fio_lower for word in query_words)):
                     continue
-            score = self._score_hit(hit, query)
-            revenue = int(data.get("revenue", 0) or 0)
-            seen[key] = {
-                "fio_ru": fio_ru,
-                "org_ru": org_ru,
-                "position_ru": self._normalize_spaces(str(data.get("ru_position", ""))),
-                "inn": self._normalize_spaces(str(data.get("inn", ""))),
+
+            score = self._score_hit({"source": hit.get("source", ""), "data": normalized_data}, query)
+            candidates.append({
+                "data": normalized_data,
                 "source": str(hit.get("source", "")),
-                "query_for_autofill": self._normalize_spaces(str(data.get("inn", ""))) or fio_ru,
-                "score": f"{score:.2f}",
-                "revenue": str(revenue),
-            }
-        ranked = sorted(seen.values(), key=lambda c: float(c.get("score", 0)), reverse=True)[:6]
+                "url": str(hit.get("url", "")),
+                "score": score,
+                "fio_ru": fio_ru,
+                "org_ru": self._clean_ru_org_name(str(normalized_data.get("ru_org", ""))),
+                "position_ru": self._normalize_spaces(str(normalized_data.get("ru_position", ""))),
+                "inn": self._normalize_spaces(str(normalized_data.get("inn", ""))),
+                "query_for_autofill": self._normalize_spaces(str(normalized_data.get("inn", ""))) or fio_ru,
+                "revenue": str(int(normalized_data.get("revenue", 0) or 0)),
+            })
+
+        dedup: dict[tuple[str, str], dict[str, Any]] = {}
+        for candidate in candidates:
+            key = (candidate.get("fio_ru", "").lower(), candidate.get("org_ru", "").lower())
+            if key not in dedup or float(candidate.get("score", 0)) > float(dedup[key].get("score", 0)):
+                dedup[key] = candidate
+
+        ranked = sorted(dedup.values(), key=lambda x: float(x.get("score", 0)), reverse=True)[:6]
+        for item in ranked:
+            item["score"] = f"{float(item['score']):.2f}"
         if ranked:
             logger.info("Top candidate: %s", ranked[0].get("fio_ru", ""))
         return ranked
+
+    def _normalize_position_ru(self, position: str) -> str:
+        position = re.sub(r"(Факторы риска|Дисквалификация|Нахождение под)", "", position)
+        position = self._normalize_spaces(position)
+        position = re.sub(r"[,;:]+$", "", position)
+        parts = [part.strip() for part in position.split(",") if part.strip()]
+        normalized_parts: list[str] = []
+        stop_words = {"и", "на", "в", "по", "за", "с", "под", "над"}
+        for part in parts:
+            words = part.split()
+            normalized_words: list[str] = []
+            for idx, word in enumerate(words):
+                if idx == 0 or word.lower() not in stop_words:
+                    normalized_words.append(word.capitalize())
+                else:
+                    normalized_words.append(word.lower())
+            normalized_parts.append(" ".join(normalized_words))
+        return ", ".join(normalized_parts)
 
     def _revenue_billions(self, revenue_mln: int | str | None) -> str:
         revenue = int(revenue_mln or 0)
@@ -2200,9 +2323,55 @@ class CompanyWebApp:
 
     def _search_by_inn(self, inn: str) -> tuple[list[dict[str, Any]], list[str]]:
         trace = [f"Поиск по ИНН: {inn}"]
-        hits, source_trace = self._search_external_sources(inn, no_cache=False)
+        direct_hits, source_trace = self._search_external_sources(inn, no_cache=False)
         trace.extend(source_trace)
+        if direct_hits:
+            return direct_hits, trace
+
+        hits: list[dict[str, Any]] = []
+        input_type = INPUT_TYPE_INN
+        providers = sorted([p for p in self.SOURCE_PROVIDERS if p.get("supports_inn", False)], key=lambda p: int(p.get("priority", 10)))
+
+        for provider in providers:
+            trace.append(f"Запрос к источнику: {provider['name']}")
+            try:
+                data = self._call_provider_with_retry(provider, inn, input_type, max_retries=2)
+                if data:
+                    for item in data:
+                        hits.append({"source": provider["name"], "url": item.get("url", ""), "data": item})
+                    trace.append(f"Найдено {len(data)} записей в {provider['name']}")
+                    if int(provider.get("priority", 10)) <= 5:
+                        trace.append(f"Достаточно данных найдено в {provider['name']}, прекращаем поиск")
+                        break
+            except Exception as exc:  # noqa: BLE001
+                trace.append(f"Ошибка при запросе к {provider['name']}: {str(exc)}")
+
+        if not hits:
+            trace.append("Ничего не найдено, пробуем альтернативные написания ИНН")
+            for alt_inn in self._generate_inn_variants(inn):
+                if alt_inn == inn:
+                    continue
+                trace.append(f"Попытка поиска по альтернативному ИНН: {alt_inn}")
+                for provider in providers:
+                    try:
+                        data = self._call_provider_with_retry(provider, alt_inn, input_type, max_retries=1)
+                        if data:
+                            for item in data:
+                                hits.append({"source": f"{provider['name']} (альт. ИНН)", "url": item.get("url", ""), "data": item})
+                            trace.append(f"Найдено {len(data)} записей по альтернативному ИНН в {provider['name']}")
+                            break
+                    except Exception:
+                        continue
+
         return hits, trace
+
+    def _generate_inn_variants(self, inn: str) -> list[str]:
+        variants = [inn, inn.lstrip("0")]
+        if len(inn) == 10:
+            variants.extend([f"0{inn}", f"00{inn}"])
+        elif len(inn) == 11:
+            variants.append(f"0{inn}")
+        return list(dict.fromkeys(v for v in variants if v))
 
     def _search_by_person(self, full_name: str) -> tuple[list[dict[str, Any]], list[str]]:
         trace = [f"Поиск по персоне: {full_name}"]
