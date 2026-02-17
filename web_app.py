@@ -26,6 +26,8 @@ from urllib.parse import urlencode
 from urllib.parse import urlparse
 from wsgiref.simple_server import make_server
 
+from card_bot import Card
+
 logger = logging.getLogger(__name__)
 
 RU_TO_EN_OPF = {
@@ -114,7 +116,7 @@ CARD_FIELDS: list[tuple[str, str]] = [
     ("appeal", "Обращение"),
     ("family_name", "Family name"),
     ("first_name", "First name"),
-    ("middle_name", "Middle name"),
+    ("middle_name_en", "Middle name (EN)"),
     ("surname_ru", "Фамилия"),
     ("name_ru", "Имя"),
     ("middle_name_ru", "Отчество"),
@@ -125,6 +127,8 @@ CARD_FIELDS: list[tuple[str, str]] = [
     ("ru_position", "Должность"),
     ("position", "Position"),
     ("revenue_mln", "Выручка (млн руб)"),
+    ("is_media", "СМИ"),
+    ("is_ru_registered", "Зарегистрировано в РФ"),
 ]
 
 FIELD_PRIORITIES: dict[str, list[str]] = {
@@ -397,7 +401,7 @@ class CompanyWebApp:
             result = "Air" + result[3:]
         return result
 
-    def normalize_en_org(self, raw: str, fallback_ru: str) -> tuple[str, list[str]]:
+    def normalize_en_org(self, raw: str, fallback_ru: str, is_media: bool = False, is_ru_registered: bool = False) -> tuple[str, list[str]]:
         notes: list[str] = []
         cleaned = self._normalize_spaces(self._strip_noise(raw))
         if not cleaned and re.search(r"[A-Za-zА-Яа-яЁё]", fallback_ru):
@@ -407,7 +411,7 @@ class CompanyWebApp:
             name = " ".join(self._translit(tok) for tok in name_tokens)
             cleaned = self._normalize_spaces(f"{name} {RU_TO_EN_OPF.get(opf_ru, '')}")
             if cleaned:
-                notes.append("Organization EN: сгенерировано транслитерацией, нужно проверить")
+                notes.append("Organization EN: автотранслит — требует перевода или подтверждения" if not is_ru_registered else "Транслит допустим (зарегистрировано в РФ)")
 
         if not cleaned:
             return "", notes
@@ -424,7 +428,7 @@ class CompanyWebApp:
             notes.append("Organization EN: OPF should be at the end")
 
         name = " ".join(p.capitalize() for p in parts)
-        if name.startswith("The "):
+        if name.startswith("The ") and not is_media:
             notes.append("Organization EN: The в начале запрещен")
         return self._normalize_spaces(f"{name} {opf}" if opf else name), notes
 
@@ -433,6 +437,8 @@ class CompanyWebApp:
             return "Черновик / Нужно дополнить"
         if any("должна" in n.lower() or "forbidden" in n.lower() for n in notes):
             return "Ошибка формата"
+        if any("автотранслит" in n.lower() for n in notes):
+            return "Нужно проверить"
         if notes:
             return "Нужно проверить"
         return "Найдено"
@@ -1754,7 +1760,7 @@ class CompanyWebApp:
         profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type)
 
         ru_org, ru_notes = self.normalize_ru_org(profile["ru_org"])
-        en_org, en_notes = self.normalize_en_org(profile["en_org"], ru_org)
+        en_org, en_notes = self.normalize_en_org(profile["en_org"], ru_org, is_media=profile.get("is_media") in {True, "1", "true"}, is_ru_registered=profile.get("is_ru_registered") in {True, "1", "true"})
         ru_pos, ru_pos_notes = self._normalize_positions_ru(profile.get("ru_position", ""))
         en_pos, en_pos_notes = self._normalize_positions_en(profile.get("position", profile.get("en_position", "")))
         profile["ru_org"] = ru_org
@@ -1789,6 +1795,8 @@ class CompanyWebApp:
             + "</ul>"
         ) if source_hits else "<p>В доступных источниках совпадений не найдено.</p>"
         source_table_rows = self._render_profile(profile, field_sources, notes)
+        if any("автотранслит" in n.lower() for n in notes):
+            source_table_rows = "<div style='background:#fff7cc;padding:8px;border:1px solid #e0c95b'>⚠ Требуется ручная проверка перевода организации EN (автотранслит)</div>" + source_table_rows
         search_trace_list = "<h3>Как происходил поиск</h3><ol>" + "".join(f"<li>{escape(step)}</li>" for step in search_trace) + "</ol>"
         content = (
             "<h2>Автосбор: черновик</h2>"
@@ -1851,7 +1859,7 @@ class CompanyWebApp:
                 "q": q,
                 "en_org": en_org,
                 "person_ru": " ".join(x for x in [profile_data.get("surname_ru", ""), profile_data.get("name_ru", ""), profile_data.get("middle_name_ru", "")] if x).strip(),
-                "person_en": " ".join(x for x in [profile_data.get("family_name", ""), profile_data.get("first_name", ""), profile_data.get("middle_name", "")] if x).strip(),
+                "person_en": " ".join(x for x in [profile_data.get("family_name", ""), profile_data.get("first_name", ""), profile_data.get("middle_name_en", profile_data.get("middle_name", ""))] if x).strip(),
                 "gender": profile_data.get("gender", ""),
                 "ru_position": profile_data.get("ru_position", ""),
                 "en_position": profile_data.get("en_position", ""),
@@ -1860,6 +1868,10 @@ class CompanyWebApp:
                 manual_payload[f"profile_{key}"] = value
             return "", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")]
 
+        card_obj = Card.from_profile(profile_data)
+        profile_data["family_name"] = card_obj.family_name or profile_data.get("family_name", "")
+        profile_data["first_name"] = card_obj.first_name or profile_data.get("first_name", "")
+        profile_data["middle_name_en"] = card_obj.middle_name_en or profile_data.get("middle_name_en", profile_data.get("middle_name", ""))
         status = self._status(notes, bool(ru_org and en_org))
         with self._connect() as db:
             cur = db.execute(
@@ -1909,6 +1921,8 @@ class CompanyWebApp:
             f"<p>Пол <select name='gender'><option value=''>--</option><option{male_selected}>М</option><option{female_selected}>Ж</option></select></p>"
             f"<p>Должность RU <input name='ru_position' value='{escape(ru_position)}'></p>"
             f"<p>Position EN <input name='en_position' value='{escape(en_position)}'></p>"
+            "<p><label><input type='checkbox' name='is_media' value='1'> СМИ (разрешить The)</label></p>"
+            "<p><label><input type='checkbox' name='is_ru_registered' value='1'> Зарегистрировано в РФ</label></p>"
             "<button>Сохранить</button></form>"
         )
         body = self._page("Ручное создание", content, back_href="/")
@@ -1916,7 +1930,7 @@ class CompanyWebApp:
 
     def manual_post(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         ru_org, ru_notes = self.normalize_ru_org(self._get_one(form, "ru_org"))
-        en_org, en_notes = self.normalize_en_org(self._get_one(form, "en_org"), ru_org)
+        en_org, en_notes = self.normalize_en_org(self._get_one(form, "en_org"), ru_org, is_media=self._get_one(form, "is_media") == "1", is_ru_registered=self._get_one(form, "is_ru_registered") == "1")
         person_ru = self._get_one(form, "person_ru")
         gender = self._get_one(form, "gender")
         errors: list[str] = []
@@ -1934,6 +1948,8 @@ class CompanyWebApp:
             "gender": gender,
             "ru_position": self._get_one(form, "ru_position"),
             "en_position": self._get_one(form, "en_position"),
+            "is_media": self._get_one(form, "is_media") == "1",
+            "is_ru_registered": self._get_one(form, "is_ru_registered") == "1",
         }
         with self._connect() as db:
             cur = db.execute(
@@ -1996,7 +2012,7 @@ class CompanyWebApp:
 
     def card_edit_post(self, card_id: int, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         ru_org, ru_notes = self.normalize_ru_org(self._get_one(form, "ru_org"))
-        en_org, en_notes = self.normalize_en_org(self._get_one(form, "en_org"), ru_org)
+        en_org, en_notes = self.normalize_en_org(self._get_one(form, "en_org"), ru_org, is_media=self._get_one(form, "is_media") == "1", is_ru_registered=self._get_one(form, "is_ru_registered") == "1")
         notes = ru_notes + en_notes
         status = self._status(notes, bool(ru_org and en_org))
 

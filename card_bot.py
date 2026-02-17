@@ -25,42 +25,23 @@ RU_TO_EN_OPF: Dict[str, str] = {
 EN_TO_RU_OPF: Dict[str, str] = {v: k for k, v in RU_TO_EN_OPF.items()}
 
 PASSPORT_MAP = {
-    "А": "A",
-    "Б": "B",
-    "В": "V",
-    "Г": "G",
-    "Д": "D",
-    "Е": "E",
-    "Ё": "YO",
-    "Ж": "ZH",
-    "З": "Z",
-    "И": "I",
-    "Й": "Y",
-    "К": "K",
-    "Л": "L",
-    "М": "M",
-    "Н": "N",
-    "О": "O",
-    "П": "P",
-    "Р": "R",
-    "С": "S",
-    "Т": "T",
-    "У": "U",
-    "Ф": "F",
-    "Х": "KH",
-    "Ц": "TS",
-    "Ч": "CH",
-    "Ш": "SH",
-    "Щ": "SHCH",
-    "Ъ": "",
-    "Ы": "Y",
-    "Ь": "",
-    "Э": "E",
-    "Ю": "YU",
-    "Я": "YA",
+    "А": "A", "Б": "B", "В": "V", "Г": "G", "Д": "D", "Е": "E", "Ё": "YO", "Ж": "ZH", "З": "Z",
+    "И": "I", "Й": "Y", "К": "K", "Л": "L", "М": "M", "Н": "N", "О": "O", "П": "P", "Р": "R",
+    "С": "S", "Т": "T", "У": "U", "Ф": "F", "Х": "KH", "Ц": "TS", "Ч": "CH", "Ш": "SH", "Щ": "SHCH",
+    "Ъ": "", "Ы": "Y", "Ь": "", "Э": "E", "Ю": "YU", "Я": "YA",
 }
-
 EN_SMALL_WORDS = {"a", "an", "the", "and", "or", "of", "for", "to", "in", "on", "at", "by"}
+SURNAME_PARTICLES = {"von", "van", "de", "du", "der", "den", "la", "le", "di", "da", "dos", "des"}
+EN_POSITION_ABBREVIATIONS = {
+    "CEO", "CFO", "CTO", "COO", "CMO", "CIO", "CHRO", "CSO", "CPO", "CCO", "CLO", "CDO", "CISO", "MD", "VP", "EVP", "SVP", "GM",
+}
+APPEAL_MAP = {"М": "Г-н", "Ж": "Г-жа"}
+UMLAUT_MAP = {"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"}
+EN_TO_RU_TRANSLIT = {
+    "A": "А", "B": "Б", "C": "К", "D": "Д", "E": "Е", "F": "Ф", "G": "Г", "H": "Х", "I": "И", "J": "Дж", "K": "К", "L": "Л",
+    "M": "М", "N": "Н", "O": "О", "P": "П", "Q": "К", "R": "Р", "S": "С", "T": "Т", "U": "У", "V": "В", "W": "В", "X": "Кс",
+    "Y": "Й", "Z": "З",
+}
 
 
 @dataclass
@@ -72,18 +53,41 @@ class Card:
     patronymic_ru: str = ""
     surname_en: str = ""
     name_en: str = ""
-    patronymic_en: str = ""
+    appeal: str = ""
+    family_name: str = ""
+    first_name: str = ""
+    middle_name_en: str = ""
     gender: str = ""
+    inn: str = ""
     ru_org: str = ""
     en_org: str = ""
     ru_position: str = ""
     en_position: str = ""
+    is_media: bool = False
+    is_ru_registered: bool = False
     status: str = "OK"
     quality_notes: List[str] = field(default_factory=list)
     created_at: str = ""
     created_by: str = "system"
     confirmed_at: str = ""
     confirmed_by: str = ""
+
+    @property
+    def patronymic_en(self) -> str:
+        return self.middle_name_en
+
+    @patronymic_en.setter
+    def patronymic_en(self, value: str) -> None:
+        self.middle_name_en = value
+
+    @classmethod
+    def from_profile(cls, profile: dict) -> "Card":
+        payload = {field: profile.get(field, "") for field in cls.__dataclass_fields__}
+        payload["middle_name_en"] = profile.get("middle_name_en") or profile.get("middle_name", "")
+        payload["patronymic_ru"] = profile.get("patronymic_ru") or profile.get("middle_name_ru", "")
+        payload["surname_en"] = profile.get("surname_en") or profile.get("family_name", "")
+        payload["name_en"] = profile.get("name_en") or profile.get("first_name", "")
+        return cls(**payload)
 
 
 class CardBot:
@@ -96,22 +100,27 @@ class CardBot:
         card = Card(created_by=created_by, created_at=self._now())
         card.ru_fio = self._normalize_spaces(data.get("ru_fio", ""))
         card.gender = self._normalize_gender(data.get("gender", ""))
+        card.appeal = APPEAL_MAP.get(card.gender, "")
         card.ru_org = self._normalize_spaces(data.get("ru_org", ""))
         card.en_org = self._normalize_spaces(data.get("en_org", ""))
         card.ru_position = self._normalize_spaces(data.get("ru_position", ""))
         card.en_position = self._normalize_spaces(data.get("en_position", ""))
+        card.inn = self._normalize_spaces(data.get("inn", ""))
+        card.is_media = str(data.get("is_media", "")).lower() in {"1", "true", "on", "yes"}
+        card.is_ru_registered = str(data.get("is_ru_registered", "")).lower() in {"1", "true", "on", "yes"}
 
         if not card.ru_fio and data.get("en_fio"):
             card.en_fio = self._normalize_spaces(data["en_fio"])
         self._build_fio(card)
 
         card.ru_org, ru_org_notes = self.normalize_ru_org(card.ru_org)
-        card.en_org, en_org_notes = self.normalize_en_org(card.en_org)
+        card.en_org, en_org_notes = self.normalize_en_org(card.en_org, is_media=card.is_media, is_ru_registered=card.is_ru_registered)
 
         card.ru_position, ru_pos_notes = self.normalize_ru_position(card.ru_position)
         card.en_position, en_pos_notes = self.normalize_en_position(card.en_position)
 
         notes = []
+        notes.extend(card.quality_notes)
         notes.extend(self._validate_required(card))
         notes.extend(ru_org_notes)
         notes.extend(en_org_notes)
@@ -132,14 +141,20 @@ class CardBot:
         before = Card(**asdict(card))
         for key, value in updates.items():
             if hasattr(card, key):
-                setattr(card, key, self._normalize_spaces(value))
+                if isinstance(getattr(card, key), bool):
+                    setattr(card, key, str(value).lower() in {"1", "true", "on", "yes"})
+                else:
+                    setattr(card, key, self._normalize_spaces(value))
 
+        card.gender = self._normalize_gender(card.gender)
+        card.appeal = APPEAL_MAP.get(card.gender, "")
         self._build_fio(card)
         card.ru_org, ru_org_notes = self.normalize_ru_org(card.ru_org)
-        card.en_org, en_org_notes = self.normalize_en_org(card.en_org)
+        card.en_org, en_org_notes = self.normalize_en_org(card.en_org, is_media=card.is_media, is_ru_registered=card.is_ru_registered)
         card.ru_position, ru_pos_notes = self.normalize_ru_position(card.ru_position)
         card.en_position, en_pos_notes = self.normalize_en_position(card.en_position)
         notes = []
+        notes.extend(card.quality_notes)
         notes.extend(self._validate_required(card))
         notes.extend(ru_org_notes + en_org_notes + ru_pos_notes + en_pos_notes)
         if card.gender not in {"М", "Ж"}:
@@ -163,23 +178,9 @@ class CardBot:
             writer = csv.DictWriter(
                 f,
                 fieldnames=[
-                    "surname_ru",
-                    "name_ru",
-                    "patronymic_ru",
-                    "surname_en",
-                    "name_en",
-                    "patronymic_en",
-                    "gender",
-                    "ru_org",
-                    "en_org",
-                    "ru_position",
-                    "en_position",
-                    "status",
-                    "quality_notes",
-                    "created_by",
-                    "created_at",
-                    "confirmed_by",
-                    "confirmed_at",
+                    "surname_ru", "name_ru", "patronymic_ru", "appeal", "surname_en", "name_en", "family_name", "first_name", "middle_name_en",
+                    "gender", "inn", "ru_org", "en_org", "ru_position", "en_position", "is_media", "is_ru_registered", "status", "quality_notes",
+                    "created_by", "created_at", "confirmed_by", "confirmed_at",
                 ],
             )
             writer.writeheader()
@@ -197,12 +198,13 @@ class CardBot:
             f"Имя: {card.name_ru}\n"
             f"Отчество: {card.patronymic_ru or '—'}\n"
             f"Пол: {card.gender}\n"
+            f"Обращение: {card.appeal or '—'}\n"
             f"Организация: {card.ru_org}\n"
             f"Должность: {card.ru_position}\n\n"
             "[EN]\n"
-            f"Surname: {card.surname_en}\n"
-            f"Name: {card.name_en}\n"
-            f"Patronymic: {card.patronymic_en or '—'}\n"
+            f"Surname: {card.family_name or card.surname_en}\n"
+            f"Name: {card.first_name or card.name_en}\n"
+            f"Middle name (EN): {card.middle_name_en or '—'}\n"
             f"Organization: {card.en_org}\n"
             f"Position: {card.en_position}\n\n"
             f"Статус: {card.status}\n"
@@ -237,7 +239,7 @@ class CardBot:
             notes.append("RU организация: двойное название")
         return cleaned, self._unique(notes)
 
-    def normalize_en_org(self, org: str) -> Tuple[str, List[str]]:
+    def normalize_en_org(self, org: str, is_media: bool = False, is_ru_registered: bool = False) -> Tuple[str, List[str]]:
         notes: List[str] = []
         cleaned = self._strip_punct(org, russian=False)
         if cleaned != org:
@@ -245,7 +247,7 @@ class CardBot:
 
         opf, name = self._extract_opf_any_en(cleaned)
         name = self._title_case_en(name)
-        if name.startswith("The "):
+        if name.startswith("The ") and not is_media:
             notes.append("EN organization: The в начале запрещен")
         if self._contains_non_ascii_letters(name):
             notes.append("EN organization: диакритика/не-ASCII запрещены")
@@ -254,7 +256,11 @@ class CardBot:
             cleaned = f"{name} {opf}".strip()
         else:
             cleaned = name
-            notes.append("EN organization: OPF should be at the end")
+            if is_ru_registered:
+                notes.append("Транслит допустим (зарегистрировано в РФ)")
+            else:
+                notes.append("Organization EN: автотранслит — требует перевода или подтверждения")
+                notes.append("EN organization: OPF should be at the end")
 
         return cleaned, self._unique(notes)
 
@@ -265,8 +271,9 @@ class CardBot:
             notes.append("RU должность: запрещенные символы удалены")
         if cleaned and not re.fullmatch(r"[А-Яа-яЁё\- ,]+", cleaned):
             notes.append("RU должность: только русский язык")
-        if re.search(r"\b[А-ЯЁ]{2,}\b", cleaned):
-            notes.append("RU должность: сокращения запрещены")
+        abbrev_tokens = [tok for tok in cleaned.split() if re.fullmatch(r"[А-ЯЁ]{2,5}", tok)]
+        if abbrev_tokens:
+            notes.append(f"RU должность: сокращения запрещены ({', '.join(abbrev_tokens)})")
         if " и " in cleaned:
             notes.append("RU должность: несколько ролей только через запятую")
         return self._sentence_case_ru_list(cleaned), self._unique(notes)
@@ -283,41 +290,79 @@ class CardBot:
         return self._title_case_en_positions(cleaned), self._unique(notes)
 
     def _build_fio(self, card: Card) -> None:
+        card.quality_notes = []
         if card.ru_fio:
             ru_parts = self._split_fio(card.ru_fio)
             card.surname_ru, card.name_ru, card.patronymic_ru = ru_parts
-            card.surname_en = self._transliterate_token(card.surname_ru)
-            card.name_en = self._transliterate_token(card.name_ru)
-            card.patronymic_en = self._transliterate_token(card.patronymic_ru) if card.patronymic_ru else ""
-            card.en_fio = " ".join(x for x in [card.surname_en, card.name_en, card.patronymic_en] if x)
+            card.surname_en = self._sanitize_latin_name(self._transliterate_token(card.surname_ru))
+            card.name_en = self._sanitize_latin_name(self._transliterate_token(card.name_ru))
+            card.middle_name_en = ""
+            card.family_name = self._apply_surname_particles([card.surname_en])[0] if card.surname_en else ""
+            card.first_name = card.name_en
+            card.en_fio = " ".join(x for x in [card.family_name, card.first_name] if x)
             card.ru_fio = " ".join(x for x in [card.surname_ru, card.name_ru, card.patronymic_ru] if x)
         elif card.en_fio:
             en_parts = self._split_fio(card.en_fio)
-            card.surname_en, card.name_en, card.patronymic_en = en_parts
-            card.en_fio = " ".join(x for x in [card.surname_en, card.name_en, card.patronymic_en] if x)
+            card.family_name, card.first_name, card.middle_name_en = en_parts
+            card.surname_en = self._sanitize_latin_name(card.family_name)
+            card.name_en = self._sanitize_latin_name(card.first_name)
+            sanitized_middle = self._sanitize_latin_name(card.middle_name_en)
+            if sanitized_middle != card.middle_name_en or card.surname_en != card.family_name or card.name_en != card.first_name:
+                card.quality_notes.append("EN имя: диакритика удалена")
+            card.family_name = self._apply_surname_particles([card.surname_en])[0] if card.surname_en else ""
+            card.first_name = card.name_en
+            card.middle_name_en = sanitized_middle
+            if card.middle_name_en and all(ord(ch) < 128 for ch in card.middle_name_en):
+                card.patronymic_ru = self.transliterate_en_to_ru(card.middle_name_en)
+                card.quality_notes.append("Middle name RU: транслитерирован с английского, требует проверки")
+            card.en_fio = " ".join(x for x in [card.family_name, card.first_name, card.middle_name_en] if x)
 
     def _split_fio(self, fio: str) -> Tuple[str, str, str]:
         parts = [p for p in self._normalize_spaces(fio).split(" ") if p]
         if len(parts) < 2:
             return (parts[0] if parts else "", "", "")
-        if len(parts) == 2:
-            return parts[0].title(), parts[1].title(), ""
-        return parts[0].title(), parts[1].title(), parts[2].title()
+
+        def _norm(tok: str) -> str:
+            return tok.lower() if tok.lower() in SURNAME_PARTICLES else tok[:1].upper() + tok[1:].lower()
+
+        norm = [_norm(p) for p in parts[:3]]
+        if len(norm) == 2:
+            return norm[0], norm[1], ""
+        return norm[0], norm[1], norm[2]
+
+    def _apply_surname_particles(self, tokens: list[str]) -> list[str]:
+        out = []
+        for idx, tok in enumerate(tokens):
+            if idx > 0 and tok.lower() in SURNAME_PARTICLES:
+                out.append(tok.lower())
+            else:
+                out.append(tok)
+        return out
+
+    def _sanitize_latin_name(self, token: str) -> str:
+        for source, target in UMLAUT_MAP.items():
+            token = token.replace(source, target)
+        normalized = unicodedata.normalize("NFKD", token)
+        return "".join(ch for ch in normalized if ord(ch) < 128)
+
+    def transliterate_en_to_ru(self, token: str) -> str:
+        chars: list[str] = []
+        for ch in token:
+            mapped = EN_TO_RU_TRANSLIT.get(ch.upper())
+            if mapped:
+                chars.append(mapped.lower() if ch.islower() else mapped)
+            elif ch.isascii():
+                chars.append(ch)
+        return "".join(chars)
 
     def _parse_user_input(self, text: str) -> Dict[str, str]:
         text = text.strip()
         if not text:
             return {}
 
-        # Labeled block mode
         labels = {
-            "фио": "ru_fio",
-            "пол": "gender",
-            "организация": "ru_org",
-            "organization": "en_org",
-            "должность": "ru_position",
-            "position": "en_position",
-            "name": "en_fio",
+            "фио": "ru_fio", "пол": "gender", "организация": "ru_org", "organization": "en_org", "должность": "ru_position",
+            "position": "en_position", "name": "en_fio", "inn": "inn", "is_media": "is_media", "is_ru_registered": "is_ru_registered",
         }
         result: Dict[str, str] = {}
         for raw_line in [ln.strip() for ln in re.split(r"[\n]+", text) if ln.strip()]:
@@ -330,7 +375,6 @@ class CardBot:
         if result:
             return result
 
-        # Compact one-line mode
         parts = [p.strip() for p in re.split(r"[;|]+", text) if p.strip()]
         fields = ["ru_fio", "gender", "ru_org", "en_org", "ru_position", "en_position"]
         out: Dict[str, str] = {}
@@ -342,7 +386,7 @@ class CardBot:
 
     def _validate_required(self, card: Card) -> List[str]:
         notes = []
-        if not card.surname_ru or not card.name_ru:
+        if not card.surname_ru and not card.family_name:
             notes.append("ФИО: фамилия и имя обязательны")
         if not card.gender:
             notes.append("Пол обязателен")
@@ -359,16 +403,8 @@ class CardBot:
     def _normalize_gender(self, value: str) -> str:
         norm = value.strip().lower()
         mapping = {
-            "м": "М",
-            "муж": "М",
-            "мужской": "М",
-            "m": "М",
-            "male": "М",
-            "ж": "Ж",
-            "жен": "Ж",
-            "женский": "Ж",
-            "f": "Ж",
-            "female": "Ж",
+            "м": "М", "муж": "М", "мужской": "М", "m": "М", "male": "М",
+            "ж": "Ж", "жен": "Ж", "женский": "Ж", "f": "Ж", "female": "Ж",
         }
         return mapping.get(norm, value.strip().upper())
 
@@ -439,7 +475,9 @@ class CardBot:
         for chunk in chunks:
             words = []
             for i, w in enumerate(chunk.split()):
-                if w.isupper() and len(w) <= 6:
+                if w.upper() in EN_POSITION_ABBREVIATIONS:
+                    words.append(w.upper())
+                elif w.isupper() and len(w) <= 6:
                     words.append(w)
                 elif i > 0 and w.lower() in EN_SMALL_WORDS:
                     words.append(w.lower())
