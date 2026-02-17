@@ -8,6 +8,7 @@ import re
 import sqlite3
 import time
 import unicodedata
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from concurrent.futures import as_completed
@@ -716,8 +717,8 @@ class CompanyWebApp:
                             hits_by_provider[provider_name] = len(provider_hits)
                             trace.append(f"Источник: {provider_name} — {state}")
                         except Exception as exc:  # noqa: BLE001
-                            logger.error("Provider %s failed for %s: %s", provider.get("name"), raw, exc)
-                            trace.append(f"Источник: {provider['name']} — provider_error ({exc})")
+                            reason = self._handle_provider_error(provider.get("name", "unknown"), exc)
+                            trace.append(f"Источник: {provider['name']} — {reason}")
                             hits_by_provider[provider["name"]] = 0
                 except FuturesTimeoutError:
                     trace.append("Источники: global_timeout (15s)")
@@ -1003,8 +1004,15 @@ class CompanyWebApp:
         is_person = "/person/" in url or "/ip/" in url
 
         if is_person:
-            h1 = soup.find("h1")
-            full_name = self._normalize_spaces(h1.get_text(" ", strip=True)) if isinstance(h1, Tag) else ""
+            full_name = self._select_first_text(
+                soup,
+                [
+                    "h1.company-name",
+                    "h1[itemprop='name']",
+                    ".company-header__title",
+                    "h1",
+                ],
+            )
             parts = full_name.split()
             profile["surname_ru"] = parts[0] if parts else ""
             profile["name_ru"] = parts[1] if len(parts) > 1 else ""
@@ -1014,15 +1022,31 @@ class CompanyWebApp:
             inn_match = re.search(r"ИНН[:\s]*(\d{10,12})", page_text)
             profile["inn"] = inn_match.group(1) if inn_match else ""
 
-            org_match = re.search(r"\b(ПАО|АО|ООО|ОАО|ЗАО|ФГУП|ФГБУ|АНО|МУП|НКО|ИП)\s+[«\"]?([А-ЯЁа-яёA-Za-z0-9\-]+(?:\s+[А-ЯЁа-яёA-Za-z0-9\-]+)*)[»\"]?", page_text)
+            org_text = self._select_first_text(
+                soup,
+                [
+                    "a[href^='/id/']",
+                    ".company-links a[href^='/id/']",
+                    ".company-card__title a[href^='/id/']",
+                ],
+            )
+            org_match = re.search(r"\b(ПАО|АО|ООО|ОАО|ЗАО|ФГУП|ФГБУ|АНО|МУП|НКО|ИП)\s+[«\"]?([А-ЯЁа-яёA-Za-z0-9\-]+(?:\s+[А-ЯЁа-яёA-Za-z0-9\-]+)*)[»\"]?", org_text or page_text)
             if org_match:
                 raw_org = f"{org_match.group(1)} {org_match.group(2).strip()}"
                 if not re.search(r"^(НЕ|НЕТ|ЛИКВИДИРОВАНО)", raw_org, flags=re.IGNORECASE) and not RUSPROFILE_NOISE_RE.search(raw_org):
                     profile["ru_org"] = self._clean_ru_org_name(raw_org)
 
+            position_text = self._select_first_text(
+                soup,
+                [
+                    ".person-main-info__position",
+                    ".company-main-info__position",
+                    "[data-test='position']",
+                ],
+            )
             pos_match = re.search(
                 r"(Генеральный директор|Президент|Председатель правления|Председатель|Директор|Руководитель|Заместитель)\s*([А-ЯЁа-яё\s,]{0,40}?)",
-                page_text,
+                position_text or page_text,
                 flags=re.IGNORECASE,
             )
             if pos_match:
@@ -1031,6 +1055,9 @@ class CompanyWebApp:
                     pos_text = re.sub(r"(Факторы риска|Дисквалификация|Нахождение под|Общие сведения|Связи|Регион регистрации)", "", pos_text, flags=re.IGNORECASE).strip()
                     pos_text = re.sub(r"[.,]+$", "", pos_text)
                     profile["ru_position"] = pos_text
+
+            if not (profile.get("surname_ru") and profile.get("ru_org")):
+                logger.warning("rusprofile structure drift suspected for %s", url)
 
             rev_match = re.search(r"([\d\s]+(?:[.,]\d+)?)\s*млн\s*руб", page_text)
             if rev_match:
@@ -1051,6 +1078,24 @@ class CompanyWebApp:
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
                 profile.update({"surname_ru": surname_ru, "name_ru": name_ru, "middle_name_ru": middle_name_ru})
         return profile
+
+    def _select_first_text(self, soup: BeautifulSoup, selectors: list[str]) -> str:
+        for selector in selectors:
+            node = soup.select_one(selector)
+            if isinstance(node, Tag):
+                text = self._normalize_spaces(node.get_text(" ", strip=True))
+                if text:
+                    return text
+        return ""
+
+    def _handle_provider_error(self, provider_name: str, error: Exception) -> str:
+        error_id = str(uuid.uuid4())
+        logger.error("Provider %s failed (%s): %s", provider_name, error_id, error, exc_info=True)
+        if isinstance(error, requests.HTTPError) and getattr(error.response, "status_code", None) == 429:
+            return f"provider_error:{error_id}:rate_limited"
+        if isinstance(error, requests.ConnectionError):
+            return f"provider_error:{error_id}:connection_error"
+        return f"provider_error:{error_id}:{type(error).__name__}"
 
     def _collect_rusprofile_profiles(self, query: str, input_type: str, is_person: bool = False) -> list[dict[str, Any]] | dict[str, Any] | None:
         person_mode = is_person or input_type == INPUT_TYPE_PERSON_TEXT or is_person_query(query)
