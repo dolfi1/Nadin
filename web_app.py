@@ -154,11 +154,13 @@ FIELD_PRIORITIES: dict[str, list[str]] = {
 class CompanyWebApp:
     def __init__(self, db_path: str = "cards.db") -> None:
         self.db_path = Path(db_path)
+        self.SOURCE_PROVIDERS = [dict(provider) for provider in SOURCE_PROVIDERS]
         self._source_cache: dict[str, dict[str, Any]] = {}
         self._positive_cache_ttl = 30 * 24 * 60 * 60
         self._negative_cache_ttl = 4 * 60 * 60
         self._domain_last_call: dict[str, float] = {}
         self._domain_throttle_seconds = 3
+        self._add_enhanced_providers()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -506,7 +508,7 @@ class CompanyWebApp:
     def _provider_chain(self, input_type: str, raw: str) -> list[dict[str, Any]]:
         if input_type == INPUT_TYPE_PERSON_TEXT:
             names = ["rusprofile.ru", "ФНС ЕГРЮЛ", "list-org.com"]
-            provider_map = {provider["name"]: provider for provider in SOURCE_PROVIDERS}
+            provider_map = {provider["name"]: provider for provider in self.SOURCE_PROVIDERS}
             return [provider_map[name] for name in names if name in provider_map]
         if self._is_foreign_query(raw):
             names = [
@@ -549,7 +551,7 @@ class CompanyWebApp:
                 "ЕИС Закупки",
                 "Банк России",
             ]
-        provider_map = {provider["name"]: provider for provider in SOURCE_PROVIDERS}
+        provider_map = {provider["name"]: provider for provider in self.SOURCE_PROVIDERS}
         return [provider_map[name] for name in names if name in provider_map]
 
     def _get_cache(self, cache_key: str) -> list[dict[str, Any]] | None:
@@ -613,19 +615,129 @@ class CompanyWebApp:
         return bool(provider.get("supports_name"))
 
     def _call_provider(self, provider: dict[str, Any], raw: str, input_type: str) -> list[dict[str, Any]] | dict[str, Any] | None:
+        normalized = self._normalize_spaces(raw)
+        inn = self._extract_inn(raw) if input_type == INPUT_TYPE_INN else None
+        try:
+            return self._fetch_from_provider(provider, normalized, input_type, inn)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Provider %s failed for %s: %s", provider.get("name"), raw, str(exc))
+            if self._is_blocking_error(exc):
+                fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn)
+                if not fallback_hits:
+                    return []
+                if provider.get("kind") == "egrul":
+                    return fallback_hits[0].get("data", {})
+                return [hit.get("data", {}) for hit in fallback_hits]
+        return None
+
+    def _fetch_from_provider(self, provider: dict[str, Any], raw: str, input_type: str, inn: str | None) -> list[dict[str, Any]] | dict[str, Any] | None:
         kind = provider.get("kind")
         person_query = input_type == INPUT_TYPE_PERSON_TEXT or is_person_query(raw)
         if kind == "egrul":
-            inn = raw if input_type == INPUT_TYPE_INN else self._extract_inn(raw)
-            parsed = self._parse_egrul(inn)
+            parsed = self._parse_egrul(inn or raw)
             return parsed
-        if kind == "list_org":
+        if kind in {"list_org", "list_org_enhanced"}:
             return self._parse_list_org(raw)
-        if kind == "rusprofile":
+        if kind in {"rusprofile", "rusprofile_enhanced"}:
             return self._collect_rusprofile_profiles(raw, input_type, is_person=person_query)
         if kind == "kontur":
             return self._parse_kontur(raw)
         return None
+
+    def _is_blocking_error(self, error: Exception) -> bool:
+        error_str = str(error).lower()
+        return any(
+            [
+                "429" in error_str,
+                "rate limit" in error_str,
+                "blocked" in error_str,
+                "timeout" in error_str and "10060" in error_str,
+                "connection refused" in error_str,
+            ]
+        )
+
+    def _try_fallback_providers(self, provider: dict[str, Any], query: str, input_type: str, inn: str | None) -> list[dict[str, Any]]:
+        fallback_providers = self._get_fallback_providers(provider.get("name", ""), query, input_type)
+        hits: list[dict[str, Any]] = []
+        for fallback in fallback_providers:
+            try:
+                logger.info("Trying fallback provider %s for %s", fallback["name"], query)
+                fallback_result = self._fetch_from_provider(fallback, query, input_type, inn)
+                fallback_hits: list[dict[str, Any]] = []
+                if isinstance(fallback_result, list):
+                    fallback_hits = [{"source": fallback["name"], "url": item.get("url", ""), "data": item} for item in fallback_result if item]
+                elif isinstance(fallback_result, dict) and fallback_result:
+                    fallback_hits = [{"source": fallback["name"], "url": fallback_result.get("url", ""), "data": fallback_result}]
+                if fallback_hits:
+                    hits.extend(fallback_hits)
+                    logger.info("Successfully retrieved %d results from %s", len(fallback_hits), fallback["name"])
+                    break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Fallback provider %s failed: %s", fallback["name"], str(exc))
+        return hits
+
+    def _supports_input_type(self, provider: dict[str, Any], input_type: str, _query: str) -> bool:
+        if input_type == INPUT_TYPE_INN:
+            return bool(provider.get("supports_inn", False))
+        if input_type == INPUT_TYPE_PERSON_TEXT:
+            return bool(provider.get("supports_name", False))
+        return bool(provider.get("supports_name", False) or provider.get("supports_inn", False))
+
+    def _get_fallback_providers(self, provider_name: str, query: str, input_type: str) -> list[dict[str, Any]]:
+        fallback_map = {
+            "list-org.com": ["zachestnyibiznes.ru", "focus.kontur.ru", "checko.ru", "ФНС ЕГРЮЛ"],
+            "rusprofile.ru": ["zachestnyibiznes.ru", "focus.kontur.ru", "checko.ru", "ФНС ЕГРЮЛ"],
+            "focus.kontur.ru": ["rusprofile.ru", "zachestnyibiznes.ru", "ФНС ЕГРЮЛ"],
+        }
+        fallback_providers = fallback_map.get(provider_name, [])
+        available_fallbacks: list[dict[str, Any]] = []
+        for fallback_name in fallback_providers:
+            fallback_provider = self._get_provider_by_name(fallback_name)
+            if fallback_provider and self._supports_input_type(fallback_provider, input_type, query):
+                available_fallbacks.append(fallback_provider)
+        return available_fallbacks
+
+    def _get_provider_by_name(self, name: str) -> dict[str, Any] | None:
+        for provider in self.SOURCE_PROVIDERS:
+            if provider["name"] == name:
+                return provider
+        return None
+
+    def _add_enhanced_providers(self) -> None:
+        if any(p["name"] == "enhanced_rusprofile" for p in self.SOURCE_PROVIDERS):
+            return
+        enhanced_providers = [
+            {
+                "name": "enhanced_rusprofile",
+                "kind": "rusprofile_enhanced",
+                "supports_inn": True,
+                "supports_name": True,
+                "supports_url": True,
+                "is_person_source": True,
+                "priority": 95,
+            },
+            {
+                "name": "enhanced_list_org",
+                "kind": "list_org_enhanced",
+                "supports_inn": True,
+                "supports_name": True,
+                "supports_url": False,
+                "is_person_source": True,
+                "priority": 85,
+            },
+            {
+                "name": "bank_of_russia",
+                "kind": "bank_russia",
+                "supports_inn": True,
+                "supports_name": False,
+                "supports_url": False,
+                "is_person_source": False,
+                "priority": 75,
+            },
+        ]
+        for provider in sorted(enhanced_providers, key=lambda p: int(p["priority"])):
+            if not any(p["name"] == provider["name"] for p in self.SOURCE_PROVIDERS):
+                self.SOURCE_PROVIDERS.insert(0, provider)
 
     def _extract_revenue(self, text: str) -> int:
         digits = re.sub(r"[^\d]", "", text or "")
@@ -749,9 +861,19 @@ class CompanyWebApp:
         self._domain_last_call[host] = time.time()
 
     def _fetch_page(self, url: str, timeout: int = 30, max_retries: int = 3) -> str:
+        self._domain_throttle(url)
+        if not self._is_localhost(url):
+            time.sleep(random.uniform(0.5, 2.0))
         for attempt in range(max_retries):
             try:
-                response = self._request(url, timeout=timeout)
+                headers = {
+                    "User-Agent": self._get_random_user_agent(),
+                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Connection": "keep-alive",
+                }
+                proxies = self._get_proxies() if attempt > 0 else None
+                response = requests.get(url, timeout=timeout, headers=headers, proxies=proxies)
                 status_code = getattr(response, "status_code", 200 if getattr(response, "ok", False) else 500)
                 if status_code == 200:
                     return response.text
@@ -769,6 +891,23 @@ class CompanyWebApp:
 
         logger.error("Failed to fetch %s after %d attempts", url, max_retries)
         return ""
+
+    def _is_localhost(self, url: str) -> bool:
+        host = urlparse(url).netloc.lower()
+        return host.startswith("localhost") or host.startswith("127.0.0.1")
+
+    def _get_random_user_agent(self) -> str:
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
+        ]
+        return random.choice(user_agents)
+
+    def _get_proxies(self) -> dict[str, str] | None:
+        return None
 
     def _request(self, url: str, timeout: int = 10) -> requests.Response:
         self._domain_throttle(url)
@@ -1019,7 +1158,7 @@ class CompanyWebApp:
         return hits[:10]
 
     def _parse_rusprofile(self, url: str) -> dict[str, Any]:
-        html = self._fetch_page(url, timeout=15)
+        html = self._fetch_page(url, timeout=20, max_retries=2)
         if not html:
             return {}
         soup = BeautifulSoup(html, "lxml")
@@ -1028,28 +1167,13 @@ class CompanyWebApp:
         is_person = "/person/" in url or "/ip/" in url
 
         if is_person:
-            h1 = soup.find("h1", class_=re.compile(r"(fio|person-name)", re.IGNORECASE))
-            if not h1:
-                h1 = soup.find("div", class_=re.compile(r"(fio|person-name)", re.IGNORECASE))
-            full_name = self._normalize_spaces(h1.get_text(" ", strip=True)) if isinstance(h1, Tag) else ""
-            if not full_name:
-                name_element = soup.find("div", {"itemprop": "name"})
-                if name_element:
-                    full_name = self._normalize_spaces(name_element.get_text(" ", strip=True))
-            if not full_name:
-                full_name = self._select_first_text(
-                    soup,
-                    [
-                        "h1.company-name",
-                        "h1[itemprop='name']",
-                        ".company-header__title",
-                        "h1",
-                    ],
-                )
-            parts = full_name.split()
-            profile["surname_ru"] = parts[0] if parts else ""
-            profile["name_ru"] = parts[1] if len(parts) > 1 else ""
-            profile["middle_name_ru"] = parts[2] if len(parts) > 2 else ""
+            structure = self._detect_page_structure(soup)
+            if structure == "old":
+                self._parse_rusprofile_old(soup, profile)
+            elif structure == "new":
+                self._parse_rusprofile_new(soup, profile)
+            else:
+                self._parse_rusprofile_fallback(soup, profile)
             patronymic = profile["middle_name_ru"]
             profile["gender"] = "М" if patronymic.lower().endswith(("вич", "ич")) else "Ж" if patronymic.lower().endswith("вна") else ""
             inn_match = re.search(r"ИНН[:\s]*(\d{10,12})", page_text)
@@ -1144,6 +1268,48 @@ class CompanyWebApp:
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
                 profile.update({"surname_ru": surname_ru, "name_ru": name_ru, "middle_name_ru": middle_name_ru})
         return profile
+
+    def _detect_page_structure(self, soup: BeautifulSoup) -> str:
+        if soup.find("h1", class_="fio-element") or soup.find("div", class_="fio-element"):
+            return "old"
+        if soup.find("div", class_="person-main-info-position") or soup.find("div", class_="person-main-info__position"):
+            return "new"
+        return "unknown"
+
+    def _parse_rusprofile_old(self, soup: BeautifulSoup, profile: dict[str, Any]) -> None:
+        h1 = soup.find("h1", class_=re.compile(r"(fio|person-name)", re.IGNORECASE))
+        if not h1:
+            h1 = soup.find("div", class_=re.compile(r"(fio|person-name)", re.IGNORECASE))
+        full_name = self._normalize_spaces(h1.get_text(" ", strip=True)) if isinstance(h1, Tag) else ""
+        parts = full_name.split()
+        profile["surname_ru"] = parts[0] if parts else ""
+        profile["name_ru"] = parts[1] if len(parts) > 1 else ""
+        profile["middle_name_ru"] = parts[2] if len(parts) > 2 else ""
+
+    def _parse_rusprofile_new(self, soup: BeautifulSoup, profile: dict[str, Any]) -> None:
+        name_element = soup.find("div", class_=re.compile(r"person-main-info", re.IGNORECASE))
+        full_name = self._normalize_spaces(name_element.get_text(" ", strip=True)) if isinstance(name_element, Tag) else ""
+        parts = full_name.split()
+        profile["surname_ru"] = parts[0] if parts else ""
+        profile["name_ru"] = parts[1] if len(parts) > 1 else ""
+        profile["middle_name_ru"] = parts[2] if len(parts) > 2 else ""
+        position_element = soup.find("div", class_=re.compile(r"position", re.IGNORECASE))
+        if isinstance(position_element, Tag):
+            profile["ru_position"] = self._normalize_spaces(position_element.get_text(" ", strip=True))
+
+    def _parse_rusprofile_fallback(self, soup: BeautifulSoup, profile: dict[str, Any]) -> None:
+        possible_name_selectors = ["h1.fio-element", "div.person-main-info-position", "div.fio", "div.person-name", "h1"]
+        for selector in possible_name_selectors:
+            name_element = soup.select_one(selector)
+            if not isinstance(name_element, Tag):
+                continue
+            full_name = self._normalize_spaces(name_element.get_text(" ", strip=True))
+            parts = full_name.split()
+            if len(parts) >= 2:
+                profile["surname_ru"] = parts[0]
+                profile["name_ru"] = parts[1]
+                profile["middle_name_ru"] = parts[2] if len(parts) > 2 else ""
+                break
 
     def _normalize_for_comparison(self, text: str) -> str:
         normalized = text.lower()
@@ -1647,7 +1813,7 @@ class CompanyWebApp:
         }, "ok", ""
 
     def _source_is_person_eligible(self, source_name: str, source_data: dict[str, Any]) -> bool:
-        providers = {item["name"]: item for item in SOURCE_PROVIDERS}
+        providers = {item["name"]: item for item in self.SOURCE_PROVIDERS}
         provider = providers.get(source_name, {})
         if provider.get("is_person_source"):
             return True
@@ -1720,17 +1886,51 @@ class CompanyWebApp:
         return merged, merged_sources
 
     def _merge_profiles(self, hits: list[dict[str, Any]], query: str) -> dict[str, Any]:
-        """Универсальная логика объединения данных из нескольких источников."""
+        """Объединяет данные из нескольких источников в один профиль."""
         if not hits:
             return {}
-        ranked_hits = sorted(hits, key=lambda item: self._score_hit(item, query), reverse=True)
-        best_data = dict(ranked_hits[0].get("data", ranked_hits[0]))
+        ranked_hits = sorted(
+            hits,
+            key=lambda item: self._get_provider_priority(str(item.get("source", ""))),
+            reverse=True,
+        )
+        best_hit = ranked_hits[0]
+        merged_data = dict(best_hit.get("data", best_hit))
         for hit in ranked_hits[1:]:
-            data = hit.get("data", hit)
+            data = hit.get("data", {})
             for field in ["ru_org", "en_org", "ru_position", "en_position", "middle_name_ru", "middle_name_en"]:
-                if not best_data.get(field) and data.get(field):
-                    best_data[field] = data[field]
-        return best_data
+                if not merged_data.get(field) and data.get(field):
+                    merged_data[field] = data[field]
+            if merged_data.get("inn") and data.get("inn") and merged_data["inn"] == data["inn"]:
+                for field in ["surname_ru", "name_ru", "middle_name_ru", "gender"]:
+                    if not merged_data.get(field) and data.get(field):
+                        merged_data[field] = data[field]
+        self._enrich_merged_data(merged_data)
+        return merged_data
+
+    def _get_provider_priority(self, provider_name: str) -> int:
+        priority_map = {
+            "ФНС ЕГРЮЛ": 100,
+            "enhanced_rusprofile": 95,
+            "rusprofile.ru": 90,
+            "enhanced_list_org": 85,
+            "list-org.com": 80,
+            "bank_of_russia": 75,
+            "zachestnyibiznes.ru": 70,
+            "focus.kontur.ru": 65,
+            "checko.ru": 60,
+        }
+        return priority_map.get(provider_name, 50)
+
+    def _enrich_merged_data(self, data: dict[str, Any]) -> None:
+        if data.get("ru_position") and not data.get("position") and not data.get("en_position"):
+            data["position"] = self._generate_en_position(str(data["ru_position"]))
+        if data.get("middle_name_ru") and not data.get("middle_name_en"):
+            data["middle_name_en"] = self._translit(str(data["middle_name_ru"]))
+        if data.get("gender") and not data.get("appeal"):
+            data["appeal"] = "Г-н" if data["gender"] == "М" else "Г-жа"
+        if data.get("ru_org") and "Сбербанк" in str(data["ru_org"]) and "ПАО" not in str(data["ru_org"]):
+            data["ru_org"] = f"{data['ru_org']} ПАО"
 
     def _normalize_card_data(self, profile: dict[str, str], field_sources: dict[str, str]) -> dict[str, str]:
         """Универсальная нормализация данных карточки."""
