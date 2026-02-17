@@ -112,6 +112,7 @@ class CardBot:
         if not card.ru_fio and data.get("en_fio"):
             card.en_fio = self._normalize_spaces(data["en_fio"])
         self._build_fio(card)
+        self._enrich_card(card)
 
         card.ru_org, ru_org_notes = self.normalize_ru_org(card.ru_org)
         card.en_org, en_org_notes = self.normalize_en_org(card.en_org, is_media=card.is_media, is_ru_registered=card.is_ru_registered)
@@ -121,7 +122,7 @@ class CardBot:
 
         notes = []
         notes.extend(card.quality_notes)
-        notes.extend(self._validate_required(card))
+        notes.extend(self._validate_card(card))
         notes.extend(ru_org_notes)
         notes.extend(en_org_notes)
         notes.extend(ru_pos_notes)
@@ -149,13 +150,14 @@ class CardBot:
         card.gender = self._normalize_gender(card.gender)
         card.appeal = APPEAL_MAP.get(card.gender, "")
         self._build_fio(card)
+        self._enrich_card(card)
         card.ru_org, ru_org_notes = self.normalize_ru_org(card.ru_org)
         card.en_org, en_org_notes = self.normalize_en_org(card.en_org, is_media=card.is_media, is_ru_registered=card.is_ru_registered)
         card.ru_position, ru_pos_notes = self.normalize_ru_position(card.ru_position)
         card.en_position, en_pos_notes = self.normalize_en_position(card.en_position)
         notes = []
         notes.extend(card.quality_notes)
-        notes.extend(self._validate_required(card))
+        notes.extend(self._validate_card(card))
         notes.extend(ru_org_notes + en_org_notes + ru_pos_notes + en_pos_notes)
         if card.gender not in {"М", "Ж"}:
             notes.append("Пол должен быть М или Ж")
@@ -289,6 +291,42 @@ class CardBot:
             notes.append("EN position: multiple roles must be comma-separated")
         return self._title_case_en_positions(cleaned), self._unique(notes)
 
+    def _generate_en_position(self, ru_position: str) -> str:
+        position_map = {
+            "Президент": "President",
+            "Председатель правления": "Chairman of the Board",
+            "Генеральный директор": "CEO",
+            "Директор": "Director",
+            "Руководитель": "Head",
+            "Исполнительный директор": "Executive Director",
+            "Главный исполнительный директор": "Chief Executive Officer",
+            "Главный финансовый директор": "Chief Financial Officer",
+        }
+        positions = [p.strip() for p in self._normalize_spaces(ru_position).split(",") if p.strip()]
+        en_positions: List[str] = []
+        for pos in positions:
+            translated = ""
+            for ru_title, en_title in position_map.items():
+                if ru_title.lower() in pos.lower():
+                    translated = en_title
+                    break
+            en_positions.append(translated or self.transliterate_ru_to_en_fio(pos))
+        return ", ".join(en_positions)
+
+    def _generate_middle_name_en(self, middle_name_ru: str) -> str:
+        value = self._normalize_spaces(middle_name_ru)
+        if not value or value == "—":
+            return ""
+        return self.transliterate_ru_to_en_fio(value)
+
+    def _enrich_card(self, card: Card) -> None:
+        if card.ru_position and not card.en_position:
+            card.en_position = self._generate_en_position(card.ru_position)
+        if card.patronymic_ru and not card.middle_name_en:
+            card.middle_name_en = self._generate_middle_name_en(card.patronymic_ru)
+        if card.gender and not card.appeal:
+            card.appeal = APPEAL_MAP.get(card.gender, "")
+
     def _build_fio(self, card: Card) -> None:
         card.quality_notes = []
         if card.ru_fio:
@@ -384,12 +422,20 @@ class CardBot:
             out = {"ru_fio": parts[0], "ru_org": parts[1]}
         return out
 
-    def _validate_required(self, card: Card) -> List[str]:
+    def _is_valid_en_organization(self, value: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z0-9&.,'\- ]+", value))
+
+    def _is_valid_ru_organization(self, value: str) -> bool:
+        return bool(re.fullmatch(r"[А-Яа-яЁё0-9«»\"'().,\- ]+", value))
+
+    def _validate_card(self, card: Card) -> List[str]:
         notes = []
-        if not card.surname_ru and not card.family_name:
-            notes.append("ФИО: фамилия и имя обязательны")
-        if not card.gender:
-            notes.append("Пол обязателен")
+        if not card.surname_ru:
+            notes.append("Фамилия RU обязательна")
+        if not card.name_ru:
+            notes.append("Имя RU обязательно")
+        if not card.gender or card.gender not in {"М", "Ж"}:
+            notes.append("Пол должен быть М или Ж")
         if not card.ru_org:
             notes.append("Организация RU обязательна")
         if not card.en_org:
@@ -398,6 +444,13 @@ class CardBot:
             notes.append("Должность RU обязательна")
         if not card.en_position:
             notes.append("Position EN обязательна")
+        if card.middle_name_en and not card.patronymic_ru:
+            card.patronymic_ru = self.transliterate_en_to_ru(card.middle_name_en)
+            notes.append("Middle name RU: транслитерирован с английского, требует проверки")
+        if card.en_org and not self._is_valid_en_organization(card.en_org):
+            notes.append("Organization EN: нарушены правила написания")
+        if card.ru_org and not self._is_valid_ru_organization(card.ru_org):
+            notes.append("Организация RU: нарушены правила написания")
         return notes
 
     def _normalize_gender(self, value: str) -> str:
