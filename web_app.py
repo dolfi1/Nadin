@@ -9,6 +9,7 @@ import sqlite3
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from concurrent.futures import as_completed
 from difflib import SequenceMatcher
 from urllib.request import Request
@@ -370,7 +371,8 @@ class CompanyWebApp:
 
     def normalize_ru_org(self, raw: str) -> tuple[str, list[str]]:
         notes: list[str] = []
-        cleaned = self._normalize_spaces(self._strip_noise(raw.upper()))
+        cleaned = re.sub(r"\b(НЕ|НЕТ)\s+(ООО|АО|ПАО|ИП|ЗАО|ОАО)\b", r"\2", raw, flags=re.IGNORECASE)
+        cleaned = self._normalize_spaces(self._strip_noise(cleaned.upper()))
         for full, short in FULL_RU_OPF.items():
             if full in cleaned:
                 cleaned = cleaned.replace(full, short)
@@ -605,15 +607,22 @@ class CompanyWebApp:
                 score += 30
 
         revenue = int(data.get("revenue", 0) or 0)
-        score += min(revenue / 1e5, 50)
+        if revenue > 1_000_000_000_000:
+            score += 100
+        elif revenue > 100_000_000_000:
+            score += 80
+        else:
+            score += min(revenue / 1e5, 50)
 
         org = self._normalize_spaces(str(data.get("ru_org", ""))).lower()
-        if any(token in org for token in ("сбер", "втб", "газпром")):
-            score += 40
+        if "сбер" in org:
+            score += 150
+        if any(token in org for token in ("втб", "газпром", "роснефть")):
+            score += 100
 
         pos = self._normalize_spaces(str(data.get("ru_position", "")).lower())
-        if "президент" in pos:
-            score += 10
+        if "президент" in pos or "председатель правления" in pos:
+            score += 50
 
         if hit.get("source") == "ФНС ЕГРЮЛ":
             score += 25
@@ -662,20 +671,27 @@ class CompanyWebApp:
 
         active_providers = [provider for provider in providers if self._should_call_provider(provider, input_type)]
         if active_providers:
-            with ThreadPoolExecutor(max_workers=min(3, len(active_providers))) as executor:
+            with ThreadPoolExecutor(max_workers=min(5, len(active_providers))) as executor:
                 futures = {executor.submit(load_provider, provider): provider for provider in active_providers}
-                for future in as_completed(futures):
-                    provider = futures[future]
-                    try:
-                        provider_name, provider_hits, state = future.result()
-                        if provider_hits:
-                            hits.extend(provider_hits)
-                        hits_by_provider[provider_name] = len(provider_hits)
-                        trace.append(f"Источник: {provider_name} — {state}")
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error("Provider %s failed for %s: %s", provider.get("name"), raw, exc)
-                        trace.append(f"Источник: {provider['name']} — provider_error ({exc})")
-                        hits_by_provider[provider["name"]] = 0
+                try:
+                    for future in as_completed(futures, timeout=15):
+                        provider = futures[future]
+                        try:
+                            provider_name, provider_hits, state = future.result()
+                            if provider_hits:
+                                hits.extend(provider_hits)
+                            hits_by_provider[provider_name] = len(provider_hits)
+                            trace.append(f"Источник: {provider_name} — {state}")
+                        except Exception as exc:  # noqa: BLE001
+                            logger.error("Provider %s failed for %s: %s", provider.get("name"), raw, exc)
+                            trace.append(f"Источник: {provider['name']} — provider_error ({exc})")
+                            hits_by_provider[provider["name"]] = 0
+                except FuturesTimeoutError:
+                    trace.append("Источники: global_timeout (15s)")
+                    for future, provider in futures.items():
+                        if not future.done():
+                            trace.append(f"Источник: {provider['name']} — global_timeout")
+                            hits_by_provider[provider["name"]] = 0
         for provider in providers:
             if not self._should_call_provider(provider, input_type):
                 continue
@@ -944,13 +960,15 @@ class CompanyWebApp:
         return hits[:10]
 
     def _parse_rusprofile(self, url: str) -> dict[str, Any]:
-        html = self._fetch_page(url, timeout=30)
+        html = self._fetch_page(url, timeout=15)
         if not html:
             return {}
         soup = BeautifulSoup(html, "lxml")
         profile: dict[str, Any] = {"url": url, "source": "rusprofile.ru"}
         page_text = soup.get_text(" ", strip=True)
-        if "/person/" in url or "/ip/" in url:
+        is_person = "/person/" in url or "/ip/" in url
+
+        if is_person:
             h1 = soup.find("h1")
             full_name = self._normalize_spaces(h1.get_text(" ", strip=True)) if isinstance(h1, Tag) else ""
             parts = full_name.split()
@@ -962,15 +980,21 @@ class CompanyWebApp:
             inn_match = re.search(r"ИНН[:\s]*(\d{10,12})", page_text)
             profile["inn"] = inn_match.group(1) if inn_match else ""
 
-            org_match = re.search(r"\b(ПАО|АО|ООО|ОАО|ЗАО|ФГУП|ФГБУ|АНО|МУП|НКО|ИП)\s+[«\"]?([А-ЯЁа-яёA-Za-z0-9 \-]+?)[»\"]?\b", page_text)
-            profile["ru_org"] = self._clean_ru_org_name(f"{org_match.group(1)} {org_match.group(2).strip()}") if org_match else ""
+            org_match = re.search(r"\b(ПАО|АО|ООО|ОАО|ЗАО|ФГУП|ФГБУ|АНО|МУП|НКО|ИП)\s+[«\"]?([А-ЯЁа-яёA-Za-z0-9\-]+(?:\s+[А-ЯЁа-яёA-Za-z0-9\-]+)*)[»\"]?", page_text)
+            if org_match:
+                raw_org = f"{org_match.group(1)} {org_match.group(2).strip()}"
+                if not re.search(r"^(НЕ|НЕТ|ЛИКВИДИРОВАНО)", raw_org, flags=re.IGNORECASE):
+                    profile["ru_org"] = self._clean_ru_org_name(raw_org)
 
             pos_match = re.search(
-                r"(Генеральный директор|Президент|Председатель[^,\n]{0,60}|Директор|Руководитель)[^,\n]{0,80}",
+                r"(Генеральный директор|Президент|Председатель правления|Председатель|Директор|Руководитель|Заместитель)\s*([А-ЯЁа-яё\s,]{0,40}?)",
                 page_text,
                 flags=re.IGNORECASE,
             )
-            profile["ru_position"] = pos_match.group(0).strip() if pos_match else ""
+            if pos_match:
+                pos_text = pos_match.group(0).strip()
+                if not any(x in pos_text for x in ["Факторы риска", "История", "Связи", "Общие сведения", "Показать"]):
+                    profile["ru_position"] = pos_text.split(".")[0].split(",")[0]
 
             rev_match = re.search(r"([\d\s]+(?:[.,]\d+)?)\s*млн\s*руб", page_text)
             if rev_match:
@@ -986,6 +1010,10 @@ class CompanyWebApp:
             inn_match = re.search(r"ИНН[:\s]*(\d{10})", page_text)
             profile["inn"] = inn_match.group(1) if inn_match else ""
             profile["revenue"] = self._extract_revenue_from_soup(soup)
+            fio_match = re.search(r"Руководитель[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", page_text)
+            if fio_match:
+                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
+                profile.update({"surname_ru": surname_ru, "name_ru": name_ru, "middle_name_ru": middle_name_ru})
         return profile
 
     def _collect_rusprofile_profiles(self, query: str, input_type: str, is_person: bool = False) -> list[dict[str, Any]] | dict[str, Any] | None:
