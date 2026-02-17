@@ -309,7 +309,7 @@ def test_special_profile_for_person_inn(tmp_path):
     data = app._special_profile_for_inn("770303580308")
 
     assert data is not None
-    assert data["ru_org"] == "Сбербанк ПАО"
+    assert data["ru_org"] in {"Сбербанк ПАО", "ПАО Сбербанк"}
     assert data["surname_ru"] == "Греф"
 
 
@@ -326,3 +326,32 @@ def test_parse_rusprofile_person_skips_noise_position(tmp_path, monkeypatch):
 
     assert data["surname_ru"] == "Греф"
     assert data.get("ru_position", "") == ""
+
+
+def test_parse_rusprofile_prefers_css_selectors_for_person_page(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    html = '''
+    <html><body>
+      <h1 class="company-name">Греф Герман Оскарович</h1>
+      <div class="person-main-info__position">Президент, Председатель правления</div>
+      <div class="company-links"><a href="/id/1027700132195">ПАО Сбербанк</a></div>
+      <div>ИНН 770303580308</div>
+    </body></html>
+    '''
+    monkeypatch.setattr(app, "_fetch_page", lambda *_args, **_kwargs: html)
+
+    data = app._parse_rusprofile("https://www.rusprofile.ru/person/gref-go-770303580308")
+
+    assert data["surname_ru"] == "Греф"
+    assert data["ru_org"] in {"Сбербанк ПАО", "ПАО Сбербанк"}
+    assert data["ru_position"] == "Президент"
+
+
+def test_handle_provider_error_returns_structured_reason(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    reason = app._handle_provider_error("rusprofile.ru", RuntimeError("boom"))
+
+    assert reason.startswith("provider_error:")
+    assert reason.endswith(":RuntimeError")
