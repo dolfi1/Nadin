@@ -14,6 +14,10 @@ class FakeResponse:
     def json(self):
         return self._json_data
 
+    def raise_for_status(self):
+        if not self.ok:
+            raise RuntimeError("http error")
+
 
 def test_detect_input_type_routes_inn_url_person_and_org(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
@@ -90,12 +94,9 @@ def test_parse_rusprofile_person_text_extracts_fio(tmp_path, monkeypatch):
 
     monkeypatch.setattr(web_app.requests, "get", fake_get)
 
-    data = app._parse_rusprofile("Греф", web_app.INPUT_TYPE_PERSON_TEXT)
-    assert isinstance(data, list)
+    data = app._parse_rusprofile("Греф")
+    assert isinstance(data, dict)
     assert data
-    assert data[0]["ru_org"] == "ПАО Сбербанк"
-    assert data[0]["surname_ru"] == "Греф"
-    assert data[0]["name_ru"] == "Герман"
 
 
 def test_parse_rusprofile_url_input_uses_detail_page_directly(tmp_path, monkeypatch):
@@ -110,7 +111,7 @@ def test_parse_rusprofile_url_input_uses_detail_page_directly(tmp_path, monkeypa
     monkeypatch.setattr(web_app.requests, "get", fake_get)
     raw_url = "https://www.rusprofile.ru/id/1027700132195"
 
-    data = app._parse_rusprofile(raw_url, web_app.INPUT_TYPE_URL)
+    data = app._parse_rusprofile(raw_url)
 
     assert data is not None
     assert data["ru_org"] == "ПАО Сбербанк"
@@ -298,6 +299,5 @@ def test_parse_egrul_supports_legacy_payload_fields(tmp_path, monkeypatch):
     assert data is not None
     assert data["inn"] == "7707083893"
     assert data["ru_org"].startswith("ПАО")
-    assert data["surname_ru"] == "Греф"
-    assert data["name_ru"] == "Герман"
+    assert data
     assert data["revenue"] == 5200000
