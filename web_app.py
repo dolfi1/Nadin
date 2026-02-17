@@ -96,6 +96,11 @@ RUSPROFILE_NOISE_RE = re.compile(
 def is_person_query(raw: str) -> bool:
     """Определяет, является ли запрос по человеку (ФИО, ИНН 12 цифр, URL /person/)."""
     value = raw.strip().lower()
+    company_markers = {
+        "ооо", "пао", "ао", "оао", "зао", "ип", "фгбу", "фгуп", "муп", "ltd", "llc", "inc", "corp", "company",
+    }
+    if any(re.search(rf"\b{marker}\b", value) for marker in company_markers):
+        return False
     if re.fullmatch(r"\d{12}", value):
         return True
     if re.match(r"^[а-яё\s-]{3,}$", value):
@@ -882,7 +887,7 @@ class CompanyWebApp:
             time.sleep(wait_for)
         self._domain_last_call[host] = time.time()
 
-    def _fetch_page(self, url: str, timeout: int = 20, max_retries: int = 3) -> str | None:
+    def _fetch_page(self, url: str, timeout: int = 10, max_retries: int = 1) -> str | None:
         self._domain_throttle(url)
         if not self._is_localhost(url):
             time.sleep(random.uniform(0.5, 2.5))
@@ -896,7 +901,7 @@ class CompanyWebApp:
                 if status_code == 200:
                     return response.text
                 if status_code == 429:
-                    wait_time = (attempt + 1) * 5
+                    wait_time = (attempt + 1) * 3
                     logger.warning("Received 429 from %s, waiting %d seconds before retry", url, wait_time)
                     time.sleep(wait_time)
                     continue
@@ -905,7 +910,7 @@ class CompanyWebApp:
             except Exception as exc:  # noqa: BLE001
                 logger.error("Fetch failed for %s (attempt %d/%d): %s", url, attempt + 1, max_retries, exc)
                 if attempt < max_retries - 1:
-                    time.sleep((attempt + 1) * 2)
+                    time.sleep((attempt + 1) * 1)
 
         logger.error("Failed to fetch %s after %d attempts", url, max_retries)
         return None
@@ -1381,7 +1386,7 @@ class CompanyWebApp:
                 return any(variant in normalized_org for variant in opf_variants)
         return False
 
-    def _call_provider_with_retry(self, provider: dict[str, Any], query: str, input_type: str, max_retries: int = 2) -> list[dict[str, Any]]:
+    def _call_provider_with_retry(self, provider: dict[str, Any], query: str, input_type: str, max_retries: int = 0) -> list[dict[str, Any]]:
         for attempt in range(max_retries + 1):
             try:
                 result = self._call_provider(provider, query, input_type)
@@ -2335,7 +2340,7 @@ class CompanyWebApp:
         for provider in providers:
             trace.append(f"Запрос к источнику: {provider['name']}")
             try:
-                data = self._call_provider_with_retry(provider, inn, input_type, max_retries=2)
+                data = self._call_provider_with_retry(provider, inn, input_type, max_retries=0)
                 if data:
                     for item in data:
                         hits.append({"source": provider["name"], "url": item.get("url", ""), "data": item})
@@ -2354,7 +2359,7 @@ class CompanyWebApp:
                 trace.append(f"Попытка поиска по альтернативному ИНН: {alt_inn}")
                 for provider in providers:
                     try:
-                        data = self._call_provider_with_retry(provider, alt_inn, input_type, max_retries=1)
+                        data = self._call_provider_with_retry(provider, alt_inn, input_type, max_retries=0)
                         if data:
                             for item in data:
                                 hits.append({"source": f"{provider['name']} (альт. ИНН)", "url": item.get("url", ""), "data": item})
@@ -2389,7 +2394,7 @@ class CompanyWebApp:
             if not self._should_call_provider(provider, input_type):
                 continue
             trace.append(f"Запрос к источнику: {provider['name']}")
-            data = self._call_provider_with_retry(provider, company_name, input_type, max_retries=2)
+            data = self._call_provider_with_retry(provider, company_name, input_type, max_retries=0)
             if data:
                 hits.extend({"source": provider["name"], "url": item.get("url", ""), "data": item} for item in data)
                 trace.append(f"Найдено {len(data)} записей в {provider['name']}")
@@ -2401,7 +2406,7 @@ class CompanyWebApp:
                 for provider in providers:
                     if not self._should_call_provider(provider, input_type):
                         continue
-                    data = self._call_provider_with_retry(provider, alt_name, input_type, max_retries=1)
+                    data = self._call_provider_with_retry(provider, alt_name, input_type, max_retries=0)
                     if data:
                         hits.extend({"source": provider["name"], "url": item.get("url", ""), "data": item} for item in data)
                         trace.append(f"Найдено {len(data)} записей по альтернативному написанию в {provider['name']}")
