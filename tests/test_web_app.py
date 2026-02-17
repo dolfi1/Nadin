@@ -274,6 +274,39 @@ def test_score_hit_reverse_exact_name_boost(tmp_path):
     assert app._score_hit(sber_hit, "Герман Греф") > app._score_hit(noise_hit, "Герман Греф")
 
 
+def test_call_provider_uses_fallback_on_blocking_error(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    provider = {"name": "list-org.com", "kind": "list_org", "supports_name": True, "supports_inn": True}
+    fallback_provider = {"name": "focus.kontur.ru", "kind": "kontur", "supports_name": True, "supports_inn": True}
+
+    monkeypatch.setattr(app, "_get_fallback_providers", lambda *_args, **_kwargs: [fallback_provider])
+
+    def fake_fetch(current_provider, *_args, **_kwargs):
+        if current_provider["name"] == "list-org.com":
+            raise RuntimeError("timeout 10060")
+        return {"url": "https://example.org", "ru_org": "ПАО Сбербанк"}
+
+    monkeypatch.setattr(app, "_fetch_from_provider", fake_fetch)
+
+    result = app._call_provider(provider, "7707083893", web_app.INPUT_TYPE_INN)
+    assert isinstance(result, list)
+    assert result[0]["ru_org"] == "ПАО Сбербанк"
+
+
+def test_parse_rusprofile_fallback_structure_extracts_name(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(
+        app,
+        "_fetch_page",
+        lambda *_args, **_kwargs: '<div class="person-name">Греф Герман Оскарович</div>',
+    )
+
+    data = app._parse_rusprofile("https://www.rusprofile.ru/person/gref-go-770303580308")
+    assert data["surname_ru"] == "Греф"
+    assert data["name_ru"] == "Герман"
+
+
 def test_parse_egrul_supports_legacy_payload_fields(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
