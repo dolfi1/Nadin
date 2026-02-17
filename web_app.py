@@ -1728,8 +1728,21 @@ class CompanyWebApp:
             return "—"
         return f"{revenue / 1000:.2f}"
 
-    def _render_search_results(self, q: str, normalized: str, candidates: list[dict[str, str]], similar: list[sqlite3.Row] | None = None) -> str:
+    def _render_search_results(
+        self,
+        q: str,
+        normalized: str,
+        candidates: list[dict[str, str]],
+        similar: list[sqlite3.Row] | None = None,
+        form_values: dict[str, str] | None = None,
+    ) -> str:
         similar = similar or []
+        form_values = form_values or {}
+        surname = form_values.get("surname", "")
+        name = form_values.get("name", "")
+        middle_name = form_values.get("middle_name", "")
+        inn = form_values.get("inn", "")
+        company = form_values.get("company", "")
         if candidates:
             blocks = "".join(
                 (
@@ -1758,48 +1771,79 @@ class CompanyWebApp:
         items = "".join(f"<li><a href='/card/{r['id']}'>{escape(r['ru_org'])}</a></li>" for r in similar)
         return (
             "<h1>Карточки компаний/участников</h1>"
-            "<form method='get' action='/'><input name='q' value='{q}' /><button>Найти</button></form>"
+            "<form method='get' action='/' style='margin-bottom: 16px;'>"
+            "<div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 12px;'>"
+            "<div><label style='display:block; margin-bottom:4px;'>Фамилия</label><input name='surname' value='{surname}' style='width:100%;'/></div>"
+            "<div><label style='display:block; margin-bottom:4px;'>Имя</label><input name='name' value='{name}' style='width:100%;'/></div>"
+            "<div><label style='display:block; margin-bottom:4px;'>Отчество</label><input name='middle_name' value='{middle_name}' style='width:100%;'/></div>"
+            "<div><label style='display:block; margin-bottom:4px;'>ИНН</label><input name='inn' value='{inn}' style='width:100%;'/></div>"
+            "<div><label style='display:block; margin-bottom:4px;'>Название компании</label><input name='company' value='{company}' style='width:100%;'/></div>"
+            "</div>"
+            "<details style='margin-bottom: 10px;'><summary>Общий запрос (обратная совместимость)</summary>"
+            "<input name='q' value='{q}' style='margin-top: 8px; width: 100%;'/>"
+            "</details>"
+            "<button>Найти</button></form>"
             "{norm}"
             "{not_found}"
             "{similar}"
         ).format(
             q=escape(q),
+            surname=escape(surname),
+            name=escape(name),
+            middle_name=escape(middle_name),
+            inn=escape(inn),
+            company=escape(company),
             norm=f"<p><b>Нормализовано:</b> {escape(normalized)}</p>" if normalized else "",
             not_found=not_found,
             similar=f"<h3>Похожие варианты</h3><ul>{items}</ul>" if similar and not candidates else "",
         )
 
-    def search_page(self, query: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
-        q = (query.get("q") or [""])[0].strip()
-        if not q:
-            content = self._render_search_results("", "", [], [])
-            body = self._page("Карточки компаний/участников", content)
-            return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
+    def _search_by_inn(self, inn: str) -> tuple[list[dict[str, Any]], list[str]]:
+        trace = [f"Поиск по ИНН: {inn}"]
+        hits, source_trace = self._search_external_sources(inn, no_cache=False)
+        trace.extend(source_trace)
+        return hits, trace
 
-        normalized, _ = self.normalize_ru_org(q)
-        input_type = self.detect_input_type(q)
+    def _search_by_person(self, full_name: str) -> tuple[list[dict[str, Any]], list[str]]:
+        trace = [f"Поиск по персоне: {full_name}"]
+        hits, source_trace = self._search_external_sources(full_name, no_cache=False)
+        trace.extend(source_trace)
+        return hits, trace
 
-        with self._connect() as db:
-            if input_type == INPUT_TYPE_INN:
-                exact = db.execute("SELECT * FROM cards WHERE json_extract(data_json, '$.profile.inn')=? ORDER BY id DESC", (q,)).fetchall()
-            else:
-                exact = db.execute("SELECT * FROM cards WHERE ru_org=? OR json_extract(data_json, '$.profile.source_id')=? ORDER BY id DESC", (normalized, q)).fetchall()
-            similar = db.execute("SELECT * FROM cards WHERE ru_org LIKE ? ORDER BY id DESC LIMIT 10", (f"%{normalized.split()[0]}%",)).fetchall()
+    def _search_by_company(self, company_name: str) -> tuple[list[dict[str, Any]], list[str]]:
+        trace = [f"Поиск по компании: {company_name}"]
+        hits, source_trace = self._search_external_sources(company_name, no_cache=False)
+        trace.extend(source_trace)
+        return hits, trace
 
-        if exact:
-            return "", "302 Found", [("Location", f"/card/{exact[0]['id']}")]
-
-        candidates: list[dict[str, str]] = []
+    def _search_by_criteria(self, params: dict[str, str]) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[str]]:
+        trace: list[str] = []
         source_hits: list[dict[str, Any]] = []
-        source_hits, _ = self._search_external_sources(q, no_cache=False)
-        if input_type == INPUT_TYPE_URL and not source_hits:
-            url_hit = self._parse_url_detail(q)
-            if url_hit:
-                source_hits = [{"source": "URL detail", "url": q, "data": url_hit}]
-        if input_type == INPUT_TYPE_PERSON_TEXT:
-            candidates = self._build_person_candidates(source_hits, q)
-        elif source_hits:
-            best_hit = max(source_hits, key=lambda h: self._score_hit(h, q))
+        candidates: list[dict[str, str]] = []
+
+        if params.get("inn"):
+            source_hits, source_trace = self._search_by_inn(params["inn"])
+            trace.extend(source_trace)
+        elif params.get("surname") or params.get("name") or params.get("middle_name"):
+            full_name = " ".join(filter(None, [params.get("surname", ""), params.get("name", ""), params.get("middle_name", "")]))
+            source_hits, source_trace = self._search_by_person(full_name)
+            trace.extend(source_trace)
+            if params.get("company"):
+                company_query = params["company"].lower()
+                source_hits = [
+                    hit for hit in source_hits if company_query in str(hit.get("data", {}).get("ru_org", "")).lower()
+                ]
+                trace.append(f"Фильтрация по компании: {params['company']}")
+            candidates = self._build_person_candidates(source_hits, full_name)
+        elif params.get("company"):
+            source_hits, source_trace = self._search_by_company(params["company"])
+            trace.extend(source_trace)
+
+        if not candidates and source_hits:
+            primary_query = params.get("inn") or params.get("company") or " ".join(
+                filter(None, [params.get("surname", ""), params.get("name", ""), params.get("middle_name", "")])
+            )
+            best_hit = max(source_hits, key=lambda h: self._score_hit(h, primary_query))
             profile = dict(best_hit.get("data", {}))
             candidates = [{
                 "fio_ru": " ".join(x for x in [profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")] if x).strip(),
@@ -1808,10 +1852,73 @@ class CompanyWebApp:
                 "inn": profile.get("inn", ""),
                 "revenue": str(profile.get("revenue", 0) or 0),
                 "source": best_hit.get("source", ""),
-                "query_for_autofill": profile.get("inn", "") or q,
+                "query_for_autofill": profile.get("inn", "") or primary_query,
             }]
 
-        content = self._render_search_results(q, normalized, candidates, similar)
+        return source_hits, candidates, trace
+
+    def search_page(self, query: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
+        q = (query.get("q") or [""])[0].strip()
+        surname = (query.get("surname") or [""])[0].strip()
+        name = (query.get("name") or [""])[0].strip()
+        middle_name = (query.get("middle_name") or [""])[0].strip()
+        inn = (query.get("inn") or [""])[0].strip()
+        company = (query.get("company") or [""])[0].strip()
+
+        if q and not any([surname, name, middle_name, inn, company]):
+            input_type = self.detect_input_type(q)
+            if input_type == INPUT_TYPE_INN:
+                inn = q
+            elif input_type == INPUT_TYPE_PERSON_TEXT:
+                surname, name, middle_name = self._split_fio_ru(q)
+            else:
+                company = q
+
+        if not any([q, surname, name, middle_name, inn, company]):
+            content = self._render_search_results("", "", [], [], form_values={})
+            body = self._page("Карточки компаний/участников", content)
+            return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
+
+        person_query = " ".join(filter(None, [surname, name, middle_name]))
+        db_query = inn or company or person_query or q
+        normalized = ""
+        if company:
+            normalized, _ = self.normalize_ru_org(company)
+        elif db_query:
+            normalized, _ = self.normalize_ru_org(db_query)
+
+        with self._connect() as db:
+            if inn:
+                exact = db.execute("SELECT * FROM cards WHERE json_extract(data_json, '$.profile.inn')=? ORDER BY id DESC", (inn,)).fetchall()
+            else:
+                exact = db.execute("SELECT * FROM cards WHERE ru_org=? OR json_extract(data_json, '$.profile.source_id')=? ORDER BY id DESC", (normalized, db_query)).fetchall()
+            token = (normalized or db_query).split()[0] if (normalized or db_query) else ""
+            similar = db.execute("SELECT * FROM cards WHERE ru_org LIKE ? ORDER BY id DESC LIMIT 10", (f"%{token}%",)).fetchall() if token else []
+
+        if exact:
+            return "", "302 Found", [("Location", f"/card/{exact[0]['id']}")]
+
+        _, candidates, _ = self._search_by_criteria({
+            "surname": surname,
+            "name": name,
+            "middle_name": middle_name,
+            "inn": inn,
+            "company": company,
+        })
+
+        content = self._render_search_results(
+            q,
+            normalized,
+            candidates,
+            similar,
+            form_values={
+                "surname": surname,
+                "name": name,
+                "middle_name": middle_name,
+                "inn": inn,
+                "company": company,
+            },
+        )
         body = self._page("Карточки компаний/участников", content)
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
