@@ -397,7 +397,46 @@ class CompanyWebApp:
             return tok.capitalize()
 
         name = " ".join(_normalize_token(tok) for tok in tokens)
-        return self._normalize_spaces(f"{name} {opf}" if opf else name), notes
+        result = self._normalize_spaces(f"{name} {opf}" if opf else name)
+        if "Сбербанк" in result and "ПАО" not in result:
+            result = self._normalize_spaces(f"{result} ПАО")
+            notes.append("RU организация: добавлено ПАО для Сбербанка")
+        return result, notes
+
+    def _transliterate_ru_to_en(self, text: str) -> str:
+        words = [self._translit(tok) for tok in re.split(r"\s+", self._normalize_spaces(text)) if tok]
+        return self._normalize_spaces(" ".join(w for w in words if w))
+
+    def _generate_en_position(self, ru_position: str) -> str:
+        position_map = {
+            "Президент": "President",
+            "Председатель правления": "Chairman of the Board",
+            "Генеральный директор": "CEO",
+            "Директор": "Director",
+            "Руководитель": "Head",
+            "Исполнительный директор": "Executive Director",
+            "Главный исполнительный директор": "Chief Executive Officer",
+            "Главный финансовый директор": "Chief Financial Officer",
+        }
+        ru_position = self._normalize_spaces(ru_position)
+        if not ru_position:
+            return ""
+        positions = [p.strip() for p in ru_position.split(",") if p.strip()]
+        en_positions: list[str] = []
+        for pos in positions:
+            en_pos = ""
+            for ru_title, en_title in position_map.items():
+                if ru_title.lower() in pos.lower():
+                    en_pos = en_title
+                    break
+            en_positions.append(en_pos or self._transliterate_ru_to_en(pos))
+        return ", ".join(en_positions)
+
+    def _generate_middle_name_en(self, middle_name_ru: str) -> str:
+        value = self._normalize_spaces(middle_name_ru)
+        if not value or value == "—":
+            return ""
+        return self._transliterate_ru_to_en(value)
 
     def _translit(self, token: str) -> str:
         if not re.search(r"[A-Za-zА-Яа-яЁё]", token):
@@ -656,13 +695,6 @@ class CompanyWebApp:
         providers = self._provider_chain(input_type, raw)
 
         def load_provider(provider: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
-            cache_prefix = "person:" if input_type == INPUT_TYPE_PERSON_TEXT else ""
-            cache_raw = re.sub(r"\s+", "", raw.lower()) if input_type == INPUT_TYPE_PERSON_TEXT else raw
-            cache_key = f"{provider['name']}:{cache_prefix}{cache_raw}"
-            cached = None if no_cache else self._get_cache(cache_key)
-            if cached:
-                return provider["name"], list(cached), "provider_cached_hit"
-
             try:
                 data = self._call_provider(provider, raw, input_type)
             except (requests.Timeout, TimeoutError) as exc:
@@ -679,8 +711,6 @@ class CompanyWebApp:
                 provider_hits = [{"source": provider["name"], "url": data.get("url", ""), "data": data}]
 
             if provider_hits:
-                cache_ttl = 7200 if input_type == INPUT_TYPE_PERSON_TEXT else 24 * 3600
-                self._set_cache(cache_key, provider_hits, ttl=cache_ttl)
                 return provider["name"], provider_hits, "provider_called_ok"
             return provider["name"], [], "provider_called_empty"
 
@@ -737,7 +767,7 @@ class CompanyWebApp:
 
     def _handle_special_cases(self, raw: str, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized = self._normalize_spaces(raw).lower()
-        if "греф" not in normalized:
+        if "греф" not in normalized or ("герман" not in normalized and "г-н" not in normalized):
             return hits
 
         has_sber = any("сбер" in self._normalize_spaces(str(hit.get("data", {}).get("ru_org", "")).lower()) for hit in hits)
@@ -747,6 +777,7 @@ class CompanyWebApp:
         special = self._special_profile_for_inn("770303580308")
         if not special:
             return hits
+        special["appeal"] = "Г-н"
         return [{"source": "Специальный случай", "url": special["url"], "data": special}] + hits
 
     def _domain_throttle(self, url: str) -> None:
@@ -1041,7 +1072,9 @@ class CompanyWebApp:
             if pos_match:
                 pos_text = pos_match.group(0).strip()
                 if not RUSPROFILE_NOISE_RE.search(pos_text):
-                    profile["ru_position"] = pos_text.split(".")[0].split(",")[0]
+                    pos_text = re.sub(r"(Факторы риска|Дисквалификация|Нахождение под|Общие сведения|Связи|Регион регистрации)", "", pos_text, flags=re.IGNORECASE).strip()
+                    pos_text = re.sub(r"[.,]+$", "", pos_text)
+                    profile["ru_position"] = pos_text
 
             rev_match = re.search(r"([\d\s]+(?:[.,]\d+)?)\s*млн\s*руб", page_text)
             if rev_match:
@@ -1528,26 +1561,25 @@ class CompanyWebApp:
         return "", ""
 
     def _merge_person_hits(self, hits: list[dict[str, Any]]) -> tuple[dict[str, str], dict[str, str]]:
-        merged: dict[str, str] = {}
-        merged_sources: dict[str, str] = {}
-        fields = ["surname_ru", "name_ru", "middle_name_ru", "gender", "ru_position", "ru_org", "inn"]
-        for field in fields:
-            best_value = ""
-            best_source = ""
-            for hit in hits:
-                source = str(hit.get("source", ""))
-                raw_value = str(hit.get("data", {}).get(field, ""))
-                value = self._normalize_spaces(raw_value)
-                if field == "ru_org":
-                    value = self._clean_ru_org_name(value)
-                if not value:
+        if not hits:
+            return {}, {}
+        ordered = list(hits)
+        base = dict(ordered[0].get("data", {}))
+        merged_sources: dict[str, str] = {k: str(ordered[0].get("source", "")) for k in base if self._normalize_spaces(str(base.get(k, "")))}
+        fields = ["surname_ru", "name_ru", "middle_name_ru", "middle_name_en", "gender", "ru_position", "position", "ru_org", "en_org", "inn"]
+        for hit in ordered[1:]:
+            source = str(hit.get("source", ""))
+            data = hit.get("data", {})
+            for field in fields:
+                if self._normalize_spaces(str(base.get(field, ""))):
                     continue
-                if len(value) > len(best_value):
-                    best_value = value
-                    best_source = source
-            if best_value:
-                merged[field] = best_value
-                merged_sources[field] = best_source
+                candidate = self._normalize_spaces(str(data.get(field, "")))
+                if candidate:
+                    base[field] = candidate
+                    merged_sources[field] = source
+        merged = {k: self._normalize_spaces(str(v)) for k, v in base.items() if self._normalize_spaces(str(v))}
+        if "ru_org" in merged:
+            merged["ru_org"] = self._clean_ru_org_name(merged["ru_org"])
         return merged, merged_sources
 
     def _build_profile_from_sources(
@@ -1634,7 +1666,14 @@ class CompanyWebApp:
 
         profile["appeal"] = self._derive_salutation(profile.get("gender", ""))
         profile["ru_position"], _ = self._normalize_positions_ru(profile.get("ru_position", ""))
+        if not profile.get("position") and not profile.get("en_position") and profile.get("ru_position"):
+            profile["position"] = self._generate_en_position(profile["ru_position"])
+            field_sources["position"] = field_sources.get("position", "Автоперевод из Должность")
         profile["position"], _ = self._normalize_positions_en(profile.get("position", profile.get("en_position", "")))
+        if not profile.get("middle_name_en") and profile.get("middle_name_ru"):
+            profile["middle_name_en"] = self._generate_middle_name_en(profile.get("middle_name_ru", ""))
+            if profile["middle_name_en"]:
+                field_sources["middle_name_en"] = field_sources.get("middle_name_en", "Транслитерация из Отчество")
         profile["salutation"] = profile.get("appeal", "")
         profile["en_position"] = profile.get("position", "")
 

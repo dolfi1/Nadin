@@ -112,6 +112,7 @@ class CardBot:
         if not card.ru_fio and data.get("en_fio"):
             card.en_fio = self._normalize_spaces(data["en_fio"])
         self._build_fio(card)
+        self._enrich_card(card)
 
         card.ru_org, ru_org_notes = self.normalize_ru_org(card.ru_org)
         card.en_org, en_org_notes = self.normalize_en_org(card.en_org, is_media=card.is_media, is_ru_registered=card.is_ru_registered)
@@ -149,6 +150,7 @@ class CardBot:
         card.gender = self._normalize_gender(card.gender)
         card.appeal = APPEAL_MAP.get(card.gender, "")
         self._build_fio(card)
+        self._enrich_card(card)
         card.ru_org, ru_org_notes = self.normalize_ru_org(card.ru_org)
         card.en_org, en_org_notes = self.normalize_en_org(card.en_org, is_media=card.is_media, is_ru_registered=card.is_ru_registered)
         card.ru_position, ru_pos_notes = self.normalize_ru_position(card.ru_position)
@@ -288,6 +290,42 @@ class CardBot:
         if " and " in cleaned.lower() or "&" in cleaned:
             notes.append("EN position: multiple roles must be comma-separated")
         return self._title_case_en_positions(cleaned), self._unique(notes)
+
+    def _generate_en_position(self, ru_position: str) -> str:
+        position_map = {
+            "Президент": "President",
+            "Председатель правления": "Chairman of the Board",
+            "Генеральный директор": "CEO",
+            "Директор": "Director",
+            "Руководитель": "Head",
+            "Исполнительный директор": "Executive Director",
+            "Главный исполнительный директор": "Chief Executive Officer",
+            "Главный финансовый директор": "Chief Financial Officer",
+        }
+        positions = [p.strip() for p in self._normalize_spaces(ru_position).split(",") if p.strip()]
+        en_positions: List[str] = []
+        for pos in positions:
+            translated = ""
+            for ru_title, en_title in position_map.items():
+                if ru_title.lower() in pos.lower():
+                    translated = en_title
+                    break
+            en_positions.append(translated or self.transliterate_ru_to_en_fio(pos))
+        return ", ".join(en_positions)
+
+    def _generate_middle_name_en(self, middle_name_ru: str) -> str:
+        value = self._normalize_spaces(middle_name_ru)
+        if not value or value == "—":
+            return ""
+        return self.transliterate_ru_to_en_fio(value)
+
+    def _enrich_card(self, card: Card) -> None:
+        if card.ru_position and not card.en_position:
+            card.en_position = self._generate_en_position(card.ru_position)
+        if card.patronymic_ru and not card.middle_name_en:
+            card.middle_name_en = self._generate_middle_name_en(card.patronymic_ru)
+        if card.gender and not card.appeal:
+            card.appeal = APPEAL_MAP.get(card.gender, "")
 
     def _build_fio(self, card: Card) -> None:
         card.quality_notes = []
