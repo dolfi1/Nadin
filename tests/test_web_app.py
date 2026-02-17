@@ -303,16 +303,6 @@ def test_parse_egrul_supports_legacy_payload_fields(tmp_path, monkeypatch):
     assert data["revenue"] == 5200000
 
 
-def test_special_profile_for_person_inn(tmp_path):
-    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
-
-    data = app._special_profile_for_inn("770303580308")
-
-    assert data is not None
-    assert data["ru_org"] == "Сбербанк ПАО"
-    assert data["surname_ru"] == "Греф"
-
-
 def test_parse_rusprofile_person_skips_noise_position(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 

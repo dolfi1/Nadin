@@ -261,6 +261,10 @@ class CompanyWebApp:
     def _strip_noise(self, text: str) -> str:
         return re.sub(r"[\"'“”«»()\[\]{}.,;:!?]", " ", text)
 
+    def _strip_punct(self, text: str, russian: bool = False) -> str:
+        allowed = "A-Za-z0-9А-Яа-яЁё -" if russian else "A-Za-z0-9 -"
+        return re.sub(rf"[^{allowed}]", "", text)
+
     def detect_input_type(self, raw: str) -> str:
         value = self._normalize_spaces(raw)
         if re.fullmatch(r"\d{10,12}", value):
@@ -376,7 +380,8 @@ class CompanyWebApp:
 
     def normalize_ru_org(self, raw: str) -> tuple[str, list[str]]:
         notes: list[str] = []
-        cleaned = re.sub(r"\b(НЕ|НЕТ)\s+(ООО|АО|ПАО|ИП|ЗАО|ОАО)\b", r"\2", raw, flags=re.IGNORECASE)
+        cleaned = self._strip_punct(raw, russian=True)
+        cleaned = re.sub(r"\b(НЕ|НЕТ)\s+(ООО|АО|ПАО|ИП|ЗАО|ОАО)\b", r"\2", cleaned, flags=re.IGNORECASE)
         cleaned = self._normalize_spaces(self._strip_noise(cleaned.upper()))
         for full, short in FULL_RU_OPF.items():
             if full in cleaned:
@@ -611,9 +616,7 @@ class CompanyWebApp:
         if kind == "egrul":
             inn = raw if input_type == INPUT_TYPE_INN else self._extract_inn(raw)
             parsed = self._parse_egrul(inn)
-            if parsed:
-                return parsed
-            return self._special_profile_for_inn(inn)
+            return parsed
         if kind == "list_org":
             return self._parse_list_org(raw)
         if kind == "rusprofile":
@@ -650,8 +653,6 @@ class CompanyWebApp:
                 score += 60
             if SequenceMatcher(None, q_lower, fio_lower).ratio() > 0.8:
                 score += 60
-            if all(word in fio_lower for word in q_lower.split()):
-                score += 30
 
         revenue = int(data.get("revenue", 0) or 0)
         if revenue > 1_000_000_000_000:
@@ -661,22 +662,9 @@ class CompanyWebApp:
         else:
             score += min(revenue / 1e5, 50)
 
-        org = self._normalize_spaces(str(data.get("ru_org", ""))).lower()
-        if "сбер" in org:
-            score += 150
-        if "сбербанк" in org:
-            score += 100
-        if any(token in org for token in ("втб", "газпром", "роснефть")):
-            score += 100
-
         pos = self._normalize_spaces(str(data.get("ru_position", "")).lower())
-        if "президент" in pos or "председатель правления" in pos:
+        if "президент" in pos or "председатель" in pos or "директор" in pos:
             score += 50
-
-        name_ru = self._normalize_spaces(str(data.get("name_ru", "")).lower())
-        surname_ru = self._normalize_spaces(str(data.get("surname_ru", "")).lower())
-        if name_ru == "герман" and surname_ru == "греф":
-            score += 300
 
         if hit.get("source") == "ФНС ЕГРЮЛ":
             score += 25
@@ -743,42 +731,10 @@ class CompanyWebApp:
             hits_by_provider.setdefault(provider["name"], 0)
 
         trace.append("hits_by_provider: " + ", ".join(f"{k}={v}" for k, v in hits_by_provider.items()))
-        hits = self._handle_special_cases(raw, hits)
         hits.sort(key=lambda item: self._score_hit(item, raw), reverse=True)
         if not hits:
             trace.append("Источники: не получено")
         return hits, trace
-
-    def _special_profile_for_inn(self, inn: str) -> dict[str, Any] | None:
-        if inn != "770303580308":
-            return None
-        return {
-            "url": f"https://www.rusprofile.ru/person/gref-go-{inn}",
-            "inn": inn,
-            "ru_org": "Сбербанк ПАО",
-            "en_org": "Sberbank PJSC",
-            "surname_ru": "Греф",
-            "name_ru": "Герман",
-            "middle_name_ru": "Оскарович",
-            "gender": "М",
-            "ru_position": "Президент, Председатель правления",
-            "revenue": 3_500_000_000_000,
-        }
-
-    def _handle_special_cases(self, raw: str, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        normalized = self._normalize_spaces(raw).lower()
-        if "греф" not in normalized or ("герман" not in normalized and "г-н" not in normalized):
-            return hits
-
-        has_sber = any("сбер" in self._normalize_spaces(str(hit.get("data", {}).get("ru_org", "")).lower()) for hit in hits)
-        if has_sber:
-            return hits
-
-        special = self._special_profile_for_inn("770303580308")
-        if not special:
-            return hits
-        special["appeal"] = "Г-н"
-        return [{"source": "Специальный случай", "url": special["url"], "data": special}] + hits
 
     def _domain_throttle(self, url: str) -> None:
         host = urlparse(url).netloc.lower()
@@ -1582,6 +1538,34 @@ class CompanyWebApp:
             merged["ru_org"] = self._clean_ru_org_name(merged["ru_org"])
         return merged, merged_sources
 
+    def _merge_profiles(self, hits: list[dict[str, Any]], query: str) -> dict[str, Any]:
+        """Универсальная логика объединения данных из нескольких источников."""
+        if not hits:
+            return {}
+        ranked_hits = sorted(hits, key=lambda item: self._score_hit(item, query), reverse=True)
+        best_data = dict(ranked_hits[0].get("data", ranked_hits[0]))
+        for hit in ranked_hits[1:]:
+            data = hit.get("data", hit)
+            for field in ["ru_org", "en_org", "ru_position", "en_position", "middle_name_ru", "middle_name_en"]:
+                if not best_data.get(field) and data.get(field):
+                    best_data[field] = data[field]
+        return best_data
+
+    def _normalize_card_data(self, profile: dict[str, str], field_sources: dict[str, str]) -> dict[str, str]:
+        """Универсальная нормализация данных карточки."""
+        if profile.get("ru_position") and not profile.get("en_position"):
+            profile["en_position"], _ = self._normalize_positions_en(profile["ru_position"])
+            if profile.get("en_position"):
+                field_sources.setdefault("en_position", "Автогенерация из RU")
+        if profile.get("middle_name_ru") and not profile.get("middle_name_en"):
+            profile["middle_name_en"] = self._translit(profile["middle_name_ru"])
+            if profile.get("middle_name_en"):
+                field_sources.setdefault("middle_name_en", "Транслитерация из RU")
+        if not profile.get("appeal") and profile.get("gender"):
+            profile["appeal"] = "Г-н" if profile["gender"] == "М" else "Г-жа"
+            field_sources.setdefault("appeal", "Автоопределение")
+        return profile
+
     def _build_profile_from_sources(
         self,
         source_hits: list[dict[str, Any]],
@@ -1602,6 +1586,10 @@ class CompanyWebApp:
             merged_person, merged_sources = self._merge_person_hits(source_hits)
             profile.update(merged_person)
             field_sources.update({k: v for k, v in merged_sources.items() if v})
+            merged_profile = self._merge_profiles(source_hits, raw_name)
+            for key in ["ru_org", "en_org", "ru_position", "en_position", "middle_name_ru", "middle_name_en"]:
+                if not profile.get(key) and merged_profile.get(key):
+                    profile[key] = str(merged_profile[key])
 
         if source_hits:
             best_revenue_hit = max(source_hits, key=lambda item: int(item.get("data", {}).get("revenue", 0) or 0))
@@ -1676,6 +1664,7 @@ class CompanyWebApp:
                 field_sources["middle_name_en"] = field_sources.get("middle_name_en", "Транслитерация из Отчество")
         profile["salutation"] = profile.get("appeal", "")
         profile["en_position"] = profile.get("position", "")
+        profile = self._normalize_card_data(profile, field_sources)
 
         return profile, field_sources
 
