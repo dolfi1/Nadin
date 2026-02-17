@@ -58,7 +58,7 @@ def test_parse_egrul_maps_real_fields(tmp_path, monkeypatch):
     assert data["gender"] == "М"
 
 
-def test_search_external_sources_without_cache_always_calls_providers(tmp_path, monkeypatch):
+def test_search_external_sources_always_uses_fresh_data(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
     calls = {"count": 0}
@@ -74,7 +74,7 @@ def test_search_external_sources_without_cache_always_calls_providers(tmp_path, 
 
     assert first_hits
     assert second_hits
-    assert calls["count"] == 2 * len(web_app.SOURCE_PROVIDERS)
+    assert calls["count"] == len(web_app.SOURCE_PROVIDERS) * 2
     assert not any("provider_cached_hit" in line for line in second_trace)
     assert any("hits_by_provider:" in line for line in first_trace)
 
@@ -229,7 +229,7 @@ def test_german_gref_prioritizes_sber(tmp_path):
     assert candidates[0]["org_ru"] == "ПАО Сбербанк"
 
 
-def test_person_search_calls_provider_each_time_without_cache(tmp_path, monkeypatch):
+def test_person_search_case_variants_always_refetch(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
     calls = {"count": 0}
 
@@ -316,3 +316,32 @@ def test_parse_rusprofile_person_skips_noise_position(tmp_path, monkeypatch):
 
     assert data["surname_ru"] == "Греф"
     assert data.get("ru_position", "") == ""
+
+
+def test_build_profile_generates_position_and_middle_name_en(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    hits = [{
+        "source": "rusprofile.ru",
+        "data": {
+            "surname_ru": "Греф",
+            "name_ru": "Герман",
+            "middle_name_ru": "Оскарович",
+            "ru_position": "Президент, Председатель правления",
+            "ru_org": "ПАО Сбербанк",
+        },
+    }]
+
+    profile, _sources = app._build_profile_from_sources(hits, "Греф Герман", web_app.INPUT_TYPE_PERSON_TEXT)
+
+    assert profile["position"] == "President, Chairman Of The Board"
+    assert profile["middle_name_en"] == "Oskarovich"
+
+
+def test_handle_special_cases_requires_name_context(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    assert app._handle_special_cases("Греф", []) == []
+    enriched = app._handle_special_cases("Греф Герман", [])
+    assert enriched
+    assert enriched[0]["data"]["appeal"] == "Г-н"
