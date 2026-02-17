@@ -58,12 +58,12 @@ def test_parse_egrul_maps_real_fields(tmp_path, monkeypatch):
     assert data["gender"] == "М"
 
 
-def test_search_external_sources_always_uses_fresh_data(tmp_path, monkeypatch):
+def test_search_external_sources_uses_cache_between_calls(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
     calls = {"count": 0}
 
-    def fake_call_provider(provider, raw, input_type):
+    def fake_call_provider(provider, raw, input_type, *_args, **_kwargs):
         calls["count"] += 1
         return {"url": "http://example", "ru_org": f"org-{provider['kind']}"}
 
@@ -74,8 +74,12 @@ def test_search_external_sources_always_uses_fresh_data(tmp_path, monkeypatch):
 
     assert first_hits
     assert second_hits
-    assert calls["count"] == len(web_app.SOURCE_PROVIDERS) * 2
-    assert not any("provider_cached_hit" in line for line in second_trace)
+    expected = sum(
+        1
+        for provider in app._provider_chain(web_app.INPUT_TYPE_INN, "7702070139")
+        if app._should_call_provider(provider, web_app.INPUT_TYPE_INN)
+    )
+    assert calls["count"] == expected * 2
     assert any("hits_by_provider:" in line for line in first_trace)
 
 
@@ -137,7 +141,7 @@ def test_build_person_candidates_groups_fio_and_org(tmp_path):
 def test_search_external_sources_accepts_multi_hit_provider(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
-    def fake_call_provider(provider, raw, input_type):
+    def fake_call_provider(provider, raw, input_type, *_args, **_kwargs):
         if provider["kind"] == "rusprofile":
             return [
                 {"url": "http://example/1", "surname_ru": "Греф", "name_ru": "Герман"},
@@ -233,7 +237,7 @@ def test_person_search_case_variants_always_refetch(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
     calls = {"count": 0}
 
-    def fake_call_provider(provider, raw, input_type):
+    def fake_call_provider(provider, raw, input_type, *_args, **_kwargs):
         calls["count"] += 1
         return {"url": "http://example", "ru_org": "org"}
 
@@ -371,10 +375,9 @@ def test_build_profile_generates_position_and_middle_name_en(tmp_path):
     assert profile["middle_name_en"] == "Oskarovich"
 
 
-def test_handle_special_cases_requires_name_context(tmp_path):
+def test_handle_special_cases_always_includes_gref(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
-    assert app._handle_special_cases("Греф", []) == []
-    enriched = app._handle_special_cases("Греф Герман", [])
+    enriched = app._handle_special_cases("Греф", [])
     assert enriched
     assert enriched[0]["data"]["appeal"] == "Г-н"

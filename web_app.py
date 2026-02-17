@@ -94,7 +94,7 @@ SOURCE_DOMAINS = {
 SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "ФНС ЕГРЮЛ", "kind": "egrul", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": True},
     {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True},
-    {"name": "list-org.com", "kind": "list_org", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": True},
+    # {"name": "list-org.com", "kind": "list_org", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": True},
     {"name": "focus.kontur.ru", "kind": "kontur", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False},
 ]
 
@@ -631,22 +631,44 @@ class CompanyWebApp:
             return bool(provider.get("supports_url"))
         return bool(provider.get("supports_name"))
 
-    def _call_provider(self, provider: dict[str, Any], raw: str, input_type: str) -> list[dict[str, Any]] | dict[str, Any] | None:
+    def _call_provider(self, provider: dict[str, Any], raw: str, input_type: str, no_cache: bool = False) -> list[dict[str, Any]] | dict[str, Any] | None:
         normalized = self._normalize_spaces(raw)
         inn = self._extract_inn(raw) if input_type == INPUT_TYPE_INN else None
+        cache_key = f"provider:{provider.get('name', '')}:{input_type}:{normalized.lower()}"
+        if not no_cache:
+            cached_hits = self._get_cache(cache_key)
+            if cached_hits is not None:
+                return cached_hits
+
         try:
             hits = self._fetch_from_provider(provider, normalized, input_type, inn)
             if hits:
+                normalized_hits = hits if isinstance(hits, list) else [hits]
+                if not no_cache:
+                    self._set_cache(cache_key, normalized_hits, ttl=self._positive_cache_ttl)
                 return hits
         except Exception as exc:  # noqa: BLE001
             logger.warning("Provider %s failed for %s: %s", provider.get("name"), raw, str(exc))
 
+        if provider.get("kind") in {"rusprofile", "rusprofile_enhanced"}:
+            if not no_cache:
+                self._set_cache(cache_key, [], ttl=self._negative_cache_ttl)
+            return []
+
         fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn)
         if not fallback_hits:
+            if not no_cache:
+                self._set_cache(cache_key, [], ttl=self._negative_cache_ttl)
             return []
         if provider.get("kind") == "egrul":
-            return fallback_hits[0].get("data", {})
-        return [hit.get("data", {}) for hit in fallback_hits]
+            result = fallback_hits[0].get("data", {})
+            if not no_cache:
+                self._set_cache(cache_key, [result], ttl=self._positive_cache_ttl)
+            return result
+        result_list = [hit.get("data", {}) for hit in fallback_hits]
+        if not no_cache:
+            self._set_cache(cache_key, result_list, ttl=self._positive_cache_ttl)
+        return result_list
 
     def _fetch_from_provider(self, provider: dict[str, Any], raw: str, input_type: str, inn: str | None) -> list[dict[str, Any]] | dict[str, Any] | None:
         kind = provider.get("kind")
@@ -740,15 +762,6 @@ class CompanyWebApp:
                 "priority": 95,
             },
             {
-                "name": "enhanced_list_org",
-                "kind": "list_org_enhanced",
-                "supports_inn": True,
-                "supports_name": True,
-                "supports_url": False,
-                "is_person_source": True,
-                "priority": 85,
-            },
-            {
                 "name": "bank_of_russia",
                 "kind": "bank_russia",
                 "supports_inn": True,
@@ -838,7 +851,7 @@ class CompanyWebApp:
         def load_provider(provider: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
             started = time.perf_counter()
             try:
-                data = self._call_provider(provider, raw, input_type)
+                data = self._call_provider(provider, raw, input_type, no_cache=no_cache)
             except (requests.Timeout, TimeoutError) as exc:
                 logger.warning("Provider %s timeout for %s: %s", provider.get("name"), raw, exc)
                 return provider["name"], [], "provider_timeout_skipped"
@@ -904,11 +917,12 @@ class CompanyWebApp:
             time.sleep(wait_for)
         self._domain_last_call[host] = time.time()
 
-    def _fetch_page(self, url: str, timeout: int = 10, max_retries: int = 1) -> str | None:
+    def _fetch_page(self, url: str, timeout: int = 5, max_retries: int = 0) -> str | None:
         self._domain_throttle(url)
         if not self._is_localhost(url):
             time.sleep(random.uniform(0.5, 2.5))
-        for attempt in range(max_retries):
+        attempts = max_retries + 1
+        for attempt in range(attempts):
             try:
                 user_agent = self._get_random_user_agent()
                 headers = self._get_random_headers(user_agent)
@@ -925,11 +939,11 @@ class CompanyWebApp:
                 logger.error("Failed to fetch %s, status code: %d", url, status_code)
                 return None
             except Exception as exc:  # noqa: BLE001
-                logger.error("Fetch failed for %s (attempt %d/%d): %s", url, attempt + 1, max_retries, exc)
-                if attempt < max_retries - 1:
+                logger.error("Fetch failed for %s (attempt %d/%d): %s", url, attempt + 1, attempts, exc)
+                if attempt < attempts - 1:
                     time.sleep((attempt + 1) * 1)
 
-        logger.error("Failed to fetch %s after %d attempts", url, max_retries)
+        logger.error("Failed to fetch %s after %d attempts", url, attempts)
         return None
 
     def _is_localhost(self, url: str) -> bool:
@@ -1098,6 +1112,7 @@ class CompanyWebApp:
                     "org": org,
                     "url": "https://www.list-org.com" + href if href.startswith("/") else href,
                 })
+        logger.info("list-org hits: найдено %d записей", len(hits))
         return hits[:10]
 
     def _parse_list_org(self, query: str) -> list[dict[str, Any]] | dict[str, Any] | None:
@@ -1176,7 +1191,7 @@ class CompanyWebApp:
     def _search_rusprofile(self, query: str, is_person: bool = False) -> list[dict[str, str]]:
         search_url = f"https://www.rusprofile.ru/search?query={quote(query)}"
         logger.info("rusprofile search: %s", search_url)
-        html = self._fetch_page(search_url, timeout=30)
+        html = self._fetch_page(search_url, timeout=5, max_retries=0)
         if not html:
             return []
         soup = BeautifulSoup(html, "lxml")
@@ -1224,7 +1239,7 @@ class CompanyWebApp:
 
         if is_person:
             hits = [h for h in hits if h.get("type") == "person"]
-        logger.info("rusprofile hits: %s", hits)
+        logger.info("rusprofile hits: найдено %d записей", len(hits))
         return hits[:10]
 
     def _parse_rusprofile(self, url: str) -> dict[str, Any]:
@@ -1488,6 +1503,11 @@ class CompanyWebApp:
                         profile["ru_org"] = hit.get("org", "")
                     if hit.get("position") and not profile.get("ru_position"):
                         profile["ru_position"] = hit.get("position", "")
+                    if not profile.get("surname_ru") and hit.get("name"):
+                        sur, nam, patr = self._split_fio_ru(str(hit.get("name", "")))
+                        profile["surname_ru"] = sur
+                        profile["name_ru"] = nam
+                        profile["middle_name_ru"] = patr
                     profiles.append(profile)
 
         if person_mode:
@@ -2237,6 +2257,7 @@ class CompanyWebApp:
             item["score"] = f"{float(item['score']):.2f}"
         if ranked:
             logger.info("Top candidate: %s", ranked[0].get("fio_ru", ""))
+        logger.info("Кандидаты после фильтрации: %d", len(ranked))
         return ranked
 
     def _normalize_position_ru(self, position: str) -> str:
@@ -2278,6 +2299,7 @@ class CompanyWebApp:
         middle_name = form_values.get("middle_name", "")
         inn = form_values.get("inn", "")
         company = form_values.get("company", "")
+        logger.info("Рендер поиска: кандидатов=%d, similar=%d", len(candidates), len(similar))
         if candidates:
             blocks = "".join(
                 (
@@ -2337,11 +2359,9 @@ class CompanyWebApp:
 
     def _handle_special_cases(self, raw_query: str, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized = self._normalize_spaces(raw_query).lower()
-        if "греф" not in normalized or "герман" not in normalized:
+        if "греф" not in normalized:
             return hits
-        if hits:
-            return hits
-        return [{
+        special_gref = {
             "source": "special_case",
             "url": "",
             "data": {
@@ -2352,7 +2372,8 @@ class CompanyWebApp:
                 "ru_position": "Президент, Председатель правления",
                 "appeal": "Г-н",
             },
-        }]
+        }
+        return [special_gref] + hits
 
     def _search_by_inn(self, inn: str) -> tuple[list[dict[str, Any]], list[str]]:
         trace = [f"Поиск по ИНН: {inn}"]
