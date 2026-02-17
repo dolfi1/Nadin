@@ -27,11 +27,22 @@ from urllib.parse import parse_qs
 from urllib.parse import quote
 from urllib.parse import urlencode
 from urllib.parse import urlparse
-from wsgiref.simple_server import make_server
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import WSGIServer, make_server
 
 from card_bot import Card
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+
 logger = logging.getLogger(__name__)
+
+
+class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
 
 RU_TO_EN_OPF = {
     "ООО": "LLC",
@@ -818,12 +829,14 @@ class CompanyWebApp:
 
     def _search_external_sources(self, raw: str, no_cache: bool = False) -> tuple[list[dict[str, Any]], list[str]]:
         input_type = self.detect_input_type(raw)
+        logger.info("🔍 НАЧАЛО ПОИСКА: '%s' (Тип: %s)", raw, input_type)
         hits: list[dict[str, Any]] = []
         trace: list[str] = [f"1. Тип ввода: {input_type}", f"2. Ключ поиска: {raw}"]
         hits_by_provider: dict[str, int] = {}
         providers = self._provider_chain(input_type, raw)
 
         def load_provider(provider: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
+            started = time.perf_counter()
             try:
                 data = self._call_provider(provider, raw, input_type)
             except (requests.Timeout, TimeoutError) as exc:
@@ -839,6 +852,9 @@ class CompanyWebApp:
             elif data:
                 provider_hits = [{"source": provider["name"], "url": data.get("url", ""), "data": data}]
 
+            elapsed = time.perf_counter() - started
+            logger.info("✅ %s нашел %d записей (%.2f сек)", provider["name"], len(provider_hits), elapsed)
+
             if provider_hits:
                 return provider["name"], provider_hits, "provider_called_ok"
             return provider["name"], [], "provider_called_empty"
@@ -848,7 +864,7 @@ class CompanyWebApp:
             with ThreadPoolExecutor(max_workers=min(5, len(active_providers))) as executor:
                 futures = {executor.submit(load_provider, provider): provider for provider in active_providers}
                 try:
-                    for future in as_completed(futures, timeout=15):
+                    for future in as_completed(futures, timeout=5):
                         provider = futures[future]
                         try:
                             provider_name, provider_hits, state = future.result()
@@ -861,7 +877,7 @@ class CompanyWebApp:
                             trace.append(f"Источник: {provider['name']} — {reason}")
                             hits_by_provider[provider["name"]] = 0
                 except FuturesTimeoutError:
-                    trace.append("Источники: global_timeout (15s)")
+                    trace.append("Источники: global_timeout (5s)")
                     for future, provider in futures.items():
                         if not future.done():
                             trace.append(f"Источник: {provider['name']} — global_timeout")
@@ -875,6 +891,7 @@ class CompanyWebApp:
         hits.sort(key=lambda item: self._score_hit(item, raw), reverse=True)
         if not hits:
             trace.append("Источники: не получено")
+        logger.info("🏁 ПОИСК ЗАВЕРШЕН: Всего найдено %d записей", len(hits))
         return hits, trace
 
     def _domain_throttle(self, url: str) -> None:
@@ -1063,7 +1080,7 @@ class CompanyWebApp:
         type_param = "fio" if is_person else "all"
         url = f"https://www.list-org.com/search?type={type_param}&name={quote(query)}"
         logger.info("list-org search: %s", url)
-        html = self._fetch_page(url, timeout=30)
+        html = self._fetch_page(url, timeout=5)
         if not html:
             return []
         soup = BeautifulSoup(html, "lxml")
@@ -1091,11 +1108,16 @@ class CompanyWebApp:
                 person_url = item.get("url", "")
                 if not person_url:
                     continue
-                detail_html = self._fetch_page(person_url, timeout=30)
+                detail_html = self._fetch_page(person_url, timeout=5)
                 if not detail_html:
                     continue
                 detail_soup = BeautifulSoup(detail_html, "lxml")
-                text = detail_soup.get_text(" ", strip=True)
+                content = detail_soup.select_one("main") or detail_soup.select_one("#main") or detail_soup.select_one(".content") or detail_soup
+                for node in content.select("script, style, noscript, .adv, .banner, .advert, .ads, [class*='adv'], [id*='adv']"):
+                    node.decompose()
+                text = content.get_text(" ", strip=True)
+                if not text or any(marker in text.lower() for marker in ("реклама", "cookie", "политика конфиденциальности")):
+                    continue
                 fio = item.get("name", "")
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio)
                 org_match = re.search(r'(ПАО|АО|ООО|ИП|КХ|СПК|ЗАО)\s*[«"]?[^,.]+', text)
@@ -1113,10 +1135,11 @@ class CompanyWebApp:
                 })
                 if len(hits) >= 5:
                     break
+            logger.info("list-org: найдено %d записей", len(hits))
             return hits
 
         search_url = f"https://www.list-org.com/search?val={quote(query)}"
-        search_html = self._fetch_page(search_url, timeout=30)
+        search_html = self._fetch_page(search_url, timeout=5)
         if not search_html:
             return None
         soup = BeautifulSoup(search_html, "lxml")
@@ -1124,13 +1147,16 @@ class CompanyWebApp:
         if not isinstance(company_link, Tag):
             return None
         company_url = "https://www.list-org.com" + str(company_link.get("href", ""))
-        detail_html = self._fetch_page(company_url, timeout=30)
+        detail_html = self._fetch_page(company_url, timeout=5)
         if not detail_html:
             return None
         detail_soup = BeautifulSoup(detail_html, "lxml")
         h1 = detail_soup.find("h1")
         ru_org = self._clean_ru_org_name(h1.get_text(strip=True) if isinstance(h1, Tag) else "")
-        text = detail_soup.get_text(" ", strip=True)
+        content = detail_soup.select_one("main") or detail_soup.select_one("#main") or detail_soup.select_one(".content") or detail_soup
+        for node in content.select("script, style, noscript, .adv, .banner, .advert, .ads, [class*='adv'], [id*='adv']"):
+            node.decompose()
+        text = content.get_text(" ", strip=True)
         fio_match = re.search(r"Руководитель[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", text)
         position_match = re.search(r"Руководитель[^А-ЯЁ]{0,40}[А-ЯЁа-яё\s]+\(([^)]+)\)", text)
         surname_ru = name_ru = middle_name_ru = ""
@@ -2270,18 +2296,20 @@ class CompanyWebApp:
                 for c in candidates
             )
             not_found = f"<h3>Варианты по '{escape(q)}':</h3>{blocks}"
-        else:
+        elif q:
             not_found = (
                 f"<p>Нет данных. Создать вручную?</p>"
                 f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(q)}' /><button>Автозаполнить из открытых источников</button></form>"
                 f"<a href='/create/manual?q={escape(q)}'>Создать вручную</a>"
-            ) if q else ""
+            )
+        else:
+            not_found = ""
 
         items = "".join(f"<li><a href='/card/{r['id']}'>{escape(r['ru_org'])}</a></li>" for r in similar)
         return (
             "<h1>Карточки компаний/участников</h1>"
             "<form method='get' action='/' style='margin-bottom: 16px;'>"
-            "<div style='display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 12px;'>"
+            "<div style='display: flex; flex-direction: column; gap: 12px; margin-bottom: 12px;'>"
             "<div><label style='display:block; margin-bottom:4px;'>Фамилия</label><input name='surname' value='{surname}' style='width:100%;'/></div>"
             "<div><label style='display:block; margin-bottom:4px;'>Имя</label><input name='name' value='{name}' style='width:100%;'/></div>"
             "<div><label style='display:block; margin-bottom:4px;'>Отчество</label><input name='middle_name' value='{middle_name}' style='width:100%;'/></div>"
@@ -2867,7 +2895,7 @@ class CompanyWebApp:
 
 def run_server(db_path: str = "cards.db", host: str = "0.0.0.0", port: int = 8000) -> None:
     app = CompanyWebApp(db_path=db_path)
-    with make_server(host, port, app) as httpd:
+    with make_server(host, port, app, server_class=ThreadingWSGIServer) as httpd:
         browser_host = "localhost" if host == "0.0.0.0" else host
         print(f"Running on http://{browser_host}:{port} (bound to {host}:{port})")
         httpd.serve_forever()
