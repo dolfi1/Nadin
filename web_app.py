@@ -715,67 +715,90 @@ class CompanyWebApp:
             return None
         url = f"https://egrul.itsoft.ru/{query}.json"
         try:
-            resp = self._request(url)
-            if not resp.ok or "json" not in resp.headers.get("content-type", ""):
+            resp = self._request(url, timeout=10)
+            if not resp.ok:
+                return None
+            content_type = resp.headers.get("content-type", "")
+            if "json" not in content_type and "javascript" not in content_type:
                 return None
             data = resp.json()
-            sv_yul = data.get("СвЮЛ", {}) or {}
-            company = data.get("company", {}) or {}
-
-            company_name = (
-                sv_yul.get("НаимСокр")
-                or data.get("НаимСокр")
-                or company.get("short_name")
-                or company.get("name")
-                or data.get("name", "")
-                or data.get("ru_org", "")
+            sv_yul = data.get("СвЮЛ") or {}
+            company = data.get("company") or {}
+            ru_org_raw = (
+                data.get("НаимСокр")
+                or data.get("name")
+                or (sv_yul.get("НаимСокр") if isinstance(sv_yul, dict) else "")
+                or (company.get("short_name") if isinstance(company, dict) else "")
+                or (company.get("name") if isinstance(company, dict) else "")
+                or data.get("ru_org")
+                or ""
             )
-            ru_org = self._clean_ru_org_name(str(company_name).replace("ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "ПАО"))
+            ru_org = self._clean_ru_org_name(str(ru_org_raw).replace("ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "ПАО"))
 
-            head: dict[str, Any] = {}
-            sv_dol = sv_yul.get("СведДолжнФЛ") if isinstance(sv_yul, dict) else None
-            if isinstance(sv_dol, list) and sv_dol:
-                head = sv_dol[0] or {}
-            elif isinstance(data.get("СведДолжнФЛ"), list) and data["СведДолжнФЛ"]:
-                head = data["СведДолжнФЛ"][0] or {}
+            director = data.get("director") or {}
+            surname_ru = str(director.get("surname") or director.get("surname_ru") or "")
+            name_ru = str(director.get("name") or director.get("name_ru") or "")
+            middle_name_ru = str(director.get("patronymic") or director.get("middle_name_ru") or "")
+            position = str(director.get("position") or data.get("ru_position") or "")
 
-            sv_fl = head.get("СвФЛ", {}) if isinstance(head, dict) else {}
-            director = data.get("director", {}) or {}
-            fio_raw = head.get("ФИО") or head.get("ФИОПолн") or (sv_fl.get("ФИОПолн") if isinstance(sv_fl, dict) else "") or ""
-            if not fio_raw and isinstance(sv_yul, dict):
-                ruk = sv_yul.get("РукФЛ", {}) or {}
-                ruk_fl = ruk.get("СвФЛ", {}) if isinstance(ruk, dict) else {}
-                fio_raw = (ruk_fl.get("ФИОПолн") if isinstance(ruk_fl, dict) else "") or ""
-            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(str(fio_raw))
-            surname_ru = str(director.get("surname") or director.get("surname_ru") or data.get("surname_ru") or surname_ru)
-            name_ru = str(director.get("name") or director.get("name_ru") or data.get("name_ru") or name_ru)
-            middle_name_ru = str(director.get("patronymic") or director.get("middle_name_ru") or data.get("middle_name_ru") or middle_name_ru)
+            if not surname_ru:
+                dol_list = data.get("СведДолжнФЛ") or (sv_yul.get("СведДолжнФЛ") if isinstance(sv_yul, dict) else []) or []
+                if isinstance(dol_list, list) and dol_list:
+                    head = dol_list[0] or {}
+                    fio_str = str(head.get("ФИО") or head.get("ФИОПолн") or "")
+                    if fio_str:
+                        surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_str)
+                    else:
+                        sv_fl = head.get("СвФЛ") or {}
+                        if isinstance(sv_fl, dict):
+                            fio_full = str(sv_fl.get("ФИОПолн") or "")
+                            if fio_full:
+                                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_full)
+                            else:
+                                surname_ru = str(sv_fl.get("Фамилия") or "").capitalize()
+                                name_ru = str(sv_fl.get("Имя") or "").capitalize()
+                                middle_name_ru = str(sv_fl.get("Отчество") or "").capitalize()
+                    if not position:
+                        dolzhn = head.get("СвДолжн") or {}
+                        position = str((dolzhn.get("НаимДолжн") if isinstance(dolzhn, dict) else "") or head.get("Должность") or "")
 
-            position = head.get("Должность") or head.get("НаимДолжн") or director.get("position") or data.get("ru_position", "")
+            inn = str(
+                (company.get("inn") if isinstance(company, dict) else "")
+                or data.get("inn")
+                or data.get("ИННЮЛ")
+                or data.get("ИНН")
+                or query
+            )
             rev_raw = (
-                ((sv_yul.get("ФинПоказ", {}) or {}).get("Выручка") if isinstance(sv_yul, dict) else None)
-                or (data.get("ФинПоказ", {}) or {}).get("Выручка")
-                or data.get("revenue", 0)
+                data.get("revenue")
+                or (data.get("ФинПоказ") or {}).get("Выручка")
+                or ((sv_yul.get("ФинПоказ") if isinstance(sv_yul, dict) else {}) or {}).get("Выручка")
+                or 0
             )
-            gender_raw = str(data.get("gender", "") or director.get("gender", "")).strip().lower()
-            gender = "М" if gender_raw in {"1", "м", "m", "male", "мужской"} or "муж" in gender_raw else ("Ж" if gender_raw in {"2", "ж", "f", "female", "женский"} or "жен" in gender_raw else "")
+            gender_raw = str(data.get("gender") or director.get("gender") or "").strip().lower()
+            if gender_raw in {"1", "м", "m", "male", "мужской"} or "муж" in gender_raw:
+                gender = "М"
+            elif gender_raw in {"2", "ж", "f", "female", "женский"} or "жен" in gender_raw:
+                gender = "Ж"
+            else:
+                gender = self._infer_gender(middle_name_ru, position)
 
             return {
                 "url": url,
-                "inn": company.get("inn") or data.get("inn") or data.get("ИННЮЛ") or query,
-                "ogrn": data.get("ogrn") or data.get("ОГРН"),
+                "inn": inn,
+                "ogrn": str(data.get("ogrn") or data.get("ОГРН") or ""),
                 "ru_org": ru_org,
-                "en_org": data.get("en_org", ""),
+                "en_org": str(data.get("en_org") or ""),
                 "surname_ru": surname_ru,
                 "name_ru": name_ru,
                 "middle_name_ru": middle_name_ru,
                 "gender": gender,
                 "ru_position": position or "Генеральный директор",
-                "en_position": data.get("en_position", ""),
+                "en_position": str(data.get("en_position") or ""),
                 "revenue": self._extract_revenue(str(rev_raw)),
             }
         except Exception as exc:  # noqa: BLE001
-            logger.error("EGRUL parse failed for %s: %s", query, exc)
+            logger.error("EGRUL request failed for %s: %s", query, exc)
             return None
 
     def _search_list_org(self, query: str, is_person: bool = False) -> list[dict[str, str]]:
@@ -874,52 +897,46 @@ class CompanyWebApp:
             return []
         soup = BeautifulSoup(html, "lxml")
         hits: list[dict[str, str]] = []
-        for item in soup.select(".search-result__item"):
-            company_title = item.select_one(".search-result__title")
-            company_name = self._normalize_spaces(company_title.get_text(" ", strip=True) if isinstance(company_title, Tag) else "")
-            company_link = item.select_one("a.search-result__title-link")
-            company_url = ""
-            if isinstance(company_link, Tag):
-                href = str(company_link.get("href", ""))
-                company_url = "https://www.rusprofile.ru" + href if href.startswith("/") else href
-            inn_tag = item.select_one(".search-result__inn")
-            company_inn = self._normalize_spaces(inn_tag.get_text(" ", strip=True).replace("ИНН", "") if isinstance(inn_tag, Tag) else "")
+        for a_tag in soup.find_all("a", href=re.compile(r"^/person/")):
+            href = str(a_tag.get("href", ""))
+            name = self._normalize_spaces(a_tag.get_text(" ", strip=True))
+            if not name or not href:
+                continue
+            parent = a_tag.find_parent()
+            block_text = self._normalize_spaces(parent.get_text(" ", strip=True)) if isinstance(parent, Tag) else ""
+            inn_match = re.search(r"\b(\d{10})\b", block_text)
+            org_link = parent.find("a", href=re.compile(r"^/id/")) if isinstance(parent, Tag) else None
+            org_name = self._normalize_spaces(org_link.get_text(" ", strip=True)) if isinstance(org_link, Tag) else ""
+            hits.append({
+                "source": "rusprofile.ru",
+                "type": "person",
+                "name": name,
+                "org": org_name,
+                "inn": inn_match.group(1) if inn_match else "",
+                "url": "https://www.rusprofile.ru" + href,
+            })
+            if len(hits) >= 10:
+                break
 
-            leader_link = item.select_one("a[href^='/person/']")
-            if isinstance(leader_link, Tag):
-                leader_name = self._normalize_spaces(leader_link.get_text(" ", strip=True))
-                href = str(leader_link.get("href", ""))
-                leader_url = "https://www.rusprofile.ru" + href if href.startswith("/") else href
-                snippet = item.select_one(".search-result__snippet")
-                snippet_text = self._normalize_spaces(snippet.get_text(" ", strip=True) if isinstance(snippet, Tag) else "")
-                position = snippet_text.split(" с ", 1)[0] if snippet_text else ""
+        if not is_person:
+            for a_tag in soup.find_all("a", href=re.compile(r"^/id/")):
+                href = str(a_tag.get("href", ""))
+                name = self._normalize_spaces(a_tag.get_text(" ", strip=True))
+                if not name or not href:
+                    continue
+                parent = a_tag.find_parent()
+                block_text = self._normalize_spaces(parent.get_text(" ", strip=True)) if isinstance(parent, Tag) else ""
+                inn_match = re.search(r"\b(\d{10})\b", block_text)
                 hits.append({
                     "source": "rusprofile.ru",
-                    "type": "person" if is_person else "company",
-                    "name": leader_name,
-                    "org": company_name,
-                    "position": position,
-                    "inn": company_inn,
-                    "url": leader_url,
+                    "type": "company",
+                    "name": name,
+                    "org": name,
+                    "inn": inn_match.group(1) if inn_match else "",
+                    "url": "https://www.rusprofile.ru" + href,
                 })
-
-            if not isinstance(leader_link, Tag):
-                name_tag = item.select_one(".search-result__title")
-                name = self._normalize_spaces(name_tag.get_text(" ", strip=True) if isinstance(name_tag, Tag) else "")
-                url_tag = item.select_one("a.search-result__title-link")
-                url = ""
-                if isinstance(url_tag, Tag):
-                    href = str(url_tag.get("href", ""))
-                    url = "https://www.rusprofile.ru" + href if href.startswith("/") else href
-                inn = self._normalize_spaces(inn_tag.get_text(" ", strip=True).replace("ИНН", "") if isinstance(inn_tag, Tag) else "")
-                if name and "/person/" in url:
-                    hits.append({
-                        "source": "rusprofile.ru",
-                        "type": "person",
-                        "name": name,
-                        "inn": inn,
-                        "url": url,
-                    })
+                if len(hits) >= 10:
+                    break
 
         if is_person:
             hits = [h for h in hits if h.get("type") == "person"]
@@ -931,41 +948,44 @@ class CompanyWebApp:
         if not html:
             return {}
         soup = BeautifulSoup(html, "lxml")
-        profile: dict[str, Any] = {}
+        profile: dict[str, Any] = {"url": url, "source": "rusprofile.ru"}
+        page_text = soup.get_text(" ", strip=True)
         if "/person/" in url or "/ip/" in url:
-            full_name = self._normalize_spaces(soup.select_one("h1").get_text(" ", strip=True) if soup.select_one("h1") else "")
+            h1 = soup.find("h1")
+            full_name = self._normalize_spaces(h1.get_text(" ", strip=True)) if isinstance(h1, Tag) else ""
             parts = full_name.split()
             profile["surname_ru"] = parts[0] if parts else ""
             profile["name_ru"] = parts[1] if len(parts) > 1 else ""
             profile["middle_name_ru"] = parts[2] if len(parts) > 2 else ""
             patronymic = profile["middle_name_ru"]
             profile["gender"] = "М" if patronymic.lower().endswith(("вич", "ич")) else "Ж" if patronymic.lower().endswith("вна") else ""
-            inn_node = soup.select_one("[itemprop='inn']")
-            profile["inn"] = self._normalize_spaces(inn_node.get_text(" ", strip=True) if isinstance(inn_node, Tag) else "")
+            inn_match = re.search(r"ИНН[:\s]*(\d{10,12})", page_text)
+            profile["inn"] = inn_match.group(1) if inn_match else ""
 
-            orgs: list[str] = []
-            for company in soup.select(".company-item"):
-                name_tag = company.select_one(".company-name a")
-                pos_tag = company.select_one(".position")
-                org_name = self._normalize_spaces(name_tag.get_text(" ", strip=True) if isinstance(name_tag, Tag) else "")
-                position = self._normalize_spaces(pos_tag.get_text(" ", strip=True) if isinstance(pos_tag, Tag) else "")
-                if org_name or position:
-                    orgs.append(f"{org_name} - {position}")
+            org_match = re.search(r"\b(ПАО|АО|ООО|ОАО|ЗАО|ФГУП|ФГБУ|АНО|МУП|НКО|ИП)\s+[«\"]?([А-ЯЁа-яёA-Za-z0-9 \-]+?)[»\"]?\b", page_text)
+            profile["ru_org"] = self._clean_ru_org_name(f"{org_match.group(1)} {org_match.group(2).strip()}") if org_match else ""
 
-            profile["ru_org"] = orgs[0].split(" - ", 1)[0] if orgs else ""
-            profile["ru_position"] = orgs[0].split(" - ", 1)[1] if orgs and " - " in orgs[0] else ""
-            finance = soup.select_one(".company-finance__value")
-            revenue_mln = self._normalize_spaces(finance.get_text(" ", strip=True).replace(" млн руб.", "") if isinstance(finance, Tag) else "0")
-            profile["revenue_mln"] = revenue_mln
-            profile["revenue"] = str(int(float(revenue_mln.replace(",", "."))) * 1_000_000) if revenue_mln.replace(",", ".").replace(".", "", 1).isdigit() else "0"
+            pos_match = re.search(
+                r"(Генеральный директор|Президент|Председатель[^,\n]{0,60}|Директор|Руководитель)[^,\n]{0,80}",
+                page_text,
+                flags=re.IGNORECASE,
+            )
+            profile["ru_position"] = pos_match.group(0).strip() if pos_match else ""
+
+            rev_match = re.search(r"([\d\s]+(?:[.,]\d+)?)\s*млн\s*руб", page_text)
+            if rev_match:
+                try:
+                    profile["revenue"] = int(float(rev_match.group(1).replace(" ", "").replace(",", ".")) * 1_000_000)
+                except ValueError:
+                    profile["revenue"] = 0
+            else:
+                profile["revenue"] = self._extract_revenue_from_soup(soup)
         else:
             title = soup.find("h1")
             profile["ru_org"] = self._clean_ru_org_name(title.get_text(strip=True) if isinstance(title, Tag) else "")
-            profile["inn"] = self._extract_inn(soup.get_text(" ", strip=True))
+            inn_match = re.search(r"ИНН[:\s]*(\d{10})", page_text)
+            profile["inn"] = inn_match.group(1) if inn_match else ""
             profile["revenue"] = self._extract_revenue_from_soup(soup)
-            profile["revenue_mln"] = str((int(profile["revenue"]) / 1_000_000)) if int(profile.get("revenue", 0) or 0) else ""
-        profile["url"] = url
-        profile["source"] = "rusprofile.ru"
         return profile
 
     def _collect_rusprofile_profiles(self, query: str, input_type: str, is_person: bool = False) -> list[dict[str, Any]] | dict[str, Any] | None:
@@ -1102,45 +1122,16 @@ class CompanyWebApp:
         }
 
     def _fetch_from_egrul(self, inn: str) -> tuple[dict[str, Any] | None, str, str]:
+        # deprecated: kept for backward compatibility; use _parse_egrul in provider flow.
         if not re.fullmatch(r"\d{10,12}", inn):
             return None, "empty", "invalid inn"
-        url = f"https://egrul.itsoft.ru/{inn}.json"
-        if not self._throttle_acquire("egrul.itsoft.ru"):
-            return None, "rate_limited", "throttle"
-        try:
-            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode())
-            naim = data.get("СвНаимЮЛ", {})
-            sv = data.get("СвЮЛ", {})
-            dolzhn_list = data.get("СведДолжнФЛ", [])
-            dolzhn = dolzhn_list[0] if dolzhn_list else {}
-            fl = dolzhn.get("СвФЛ", {})
-            fio = [fl.get(k, "").strip().capitalize() for k in ["Фамилия", "Имя", "Отчество"]]
-            ru_org = naim.get("НаимЮЛПолн") or naim.get("НаимСокр", "")
-            return {
-                "source": "ФНС ЕГРЮЛ",
-                "url": url,
-                "data": {
-                    "ru_org": ru_org,
-                    "inn": inn,
-                    "ogrn": sv.get("ОГРН"),
-                    "surname_ru": fio[0],
-                    "name_ru": fio[1],
-                    "middle_name_ru": fio[2] if len(fio) > 2 else "",
-                    "ru_position": dolzhn.get("СвДолжн", {}).get("НаимДолжн", "Генеральный директор"),
-                    "gender": "М" if "ович" in " ".join(fio).lower() else "Ж",
-                }
-            }, "ok", ""
-        except Exception as exc:
-            reason = str(exc)
-            if "429" in reason:
-                self._save_rate_limited("ФНС ЕГРЮЛ", f"egrul:{inn}", 300)
-                return None, "rate_limited", "429"
-            fallback, state, fallback_reason = self._provider_fallback_from_catalog("ФНС ЕГРЮЛ", inn, inn)
+        data = self._parse_egrul(inn)
+        if not data:
+            fallback, state, reason = self._provider_fallback_from_catalog("ФНС ЕГРЮЛ", inn, inn)
             if fallback:
-                return fallback, state, fallback_reason
-            return None, "error", reason
+                return fallback, state, reason
+            return None, "empty", "not found"
+        return {"source": "ФНС ЕГРЮЛ", "url": data.get("url", ""), "data": data}, "ok", ""
 
     def _fetch_html_page(self, url: str) -> tuple[str | None, str, str]:
         self._domain_throttle(url)
@@ -1186,43 +1177,21 @@ class CompanyWebApp:
         return ""
 
     def _fetch_from_rusprofile(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
-        url = f"https://www.rusprofile.ru/search?query={inn}"
-        if not self._throttle_acquire("www.rusprofile.ru"):
-            return None, "rate_limited", "throttle"
-        try:
-            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urlopen(req, timeout=10) as response:
-                html = response.read().decode("utf-8", errors="ignore")
-            director_match = re.search(r"([А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+).*?(ПРЕЗИДЕНТ|ГЕНЕРАЛЬНЫЙ|ПРЕДСЕДАТЕЛЬ)", html, re.IGNORECASE | re.DOTALL)
-            if director_match:
-                fio_str = director_match.group(1).strip()
-                fio = fio_str.split()
-            else:
-                fio_match = re.search(r"([А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+)", html)
-                fio = fio_match.group(1).split() if fio_match else []
-            ru_org_match = re.search(r"<h1[^>]*>([^<]+)</h1>", html, re.IGNORECASE)
-            ru_org = ru_org_match.group(1).strip() if ru_org_match else ""
-            return {
-                "source": "rusprofile.ru",
-                "url": url,
-                "data": {
-                    "ru_org": ru_org,
-                    "inn": inn,
-                    "surname_ru": fio[0] if fio else "",
-                    "name_ru": fio[1] if len(fio) > 1 else "",
-                    "middle_name_ru": " ".join(fio[2:]) if len(fio) > 2 else "",
-                    "ru_position": "Президент, Председатель правления" if "ВТБ" in ru_org.upper() else "Генеральный директор",
-                    "gender": "М" if "ович" in " ".join(fio).lower() else "Ж",
-                }
-            }, "ok", ""
-        except Exception as exc:
-            if "429" in str(exc):
-                self._save_rate_limited("rusprofile.ru", f"rus:{inn}", 180)
-                return None, "rate_limited", "429"
-            fallback, state, reason = self._provider_fallback_from_catalog("rusprofile.ru", normalized, inn)
-            if fallback:
-                return fallback, state, reason
-            return None, "error", str(exc)
+        # deprecated: kept for backward compatibility; use _search_rusprofile + _parse_rusprofile.
+        hits = self._search_rusprofile(inn, is_person=False)
+        for hit in hits:
+            url = hit.get("url", "")
+            if not url:
+                continue
+            data = self._parse_rusprofile(url)
+            if data:
+                if hit.get("org") and not data.get("ru_org"):
+                    data["ru_org"] = hit.get("org", "")
+                return {"source": "rusprofile.ru", "url": url, "data": data}, "ok", ""
+        fallback, state, reason = self._provider_fallback_from_catalog("rusprofile.ru", normalized, inn)
+        if fallback:
+            return fallback, state, reason
+        return None, "empty", "not found"
 
     def _fetch_from_list_org(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
         if not inn:
