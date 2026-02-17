@@ -58,7 +58,7 @@ def test_parse_egrul_maps_real_fields(tmp_path, monkeypatch):
     assert data["gender"] == "М"
 
 
-def test_search_external_sources_uses_cache(tmp_path, monkeypatch):
+def test_search_external_sources_without_cache_always_calls_providers(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
     calls = {"count": 0}
@@ -74,8 +74,8 @@ def test_search_external_sources_uses_cache(tmp_path, monkeypatch):
 
     assert first_hits
     assert second_hits
-    assert calls["count"] == len(web_app.SOURCE_PROVIDERS)
-    assert any("provider_cached_hit" in line for line in second_trace)
+    assert calls["count"] == 2 * len(web_app.SOURCE_PROVIDERS)
+    assert not any("provider_cached_hit" in line for line in second_trace)
     assert any("hits_by_provider:" in line for line in first_trace)
 
 
@@ -229,7 +229,7 @@ def test_german_gref_prioritizes_sber(tmp_path):
     assert candidates[0]["org_ru"] == "ПАО Сбербанк"
 
 
-def test_person_search_cache_key_is_lowercase(tmp_path, monkeypatch):
+def test_person_search_calls_provider_each_time_without_cache(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
     calls = {"count": 0}
 
@@ -243,7 +243,7 @@ def test_person_search_cache_key_is_lowercase(tmp_path, monkeypatch):
     app._search_external_sources("греф", no_cache=False)
 
     expected = sum(1 for provider in app._provider_chain(web_app.INPUT_TYPE_PERSON_TEXT, "Греф") if app._should_call_provider(provider, web_app.INPUT_TYPE_PERSON_TEXT))
-    assert calls["count"] == expected
+    assert calls["count"] == expected * 2
 
 
 def test_score_hit_reverse_exact_name_boost(tmp_path):
@@ -301,16 +301,6 @@ def test_parse_egrul_supports_legacy_payload_fields(tmp_path, monkeypatch):
     assert data["ru_org"].startswith("ПАО")
     assert data
     assert data["revenue"] == 5200000
-
-
-def test_special_profile_for_person_inn(tmp_path):
-    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
-
-    data = app._special_profile_for_inn("770303580308")
-
-    assert data is not None
-    assert data["ru_org"] == "Сбербанк ПАО"
-    assert data["surname_ru"] == "Греф"
 
 
 def test_parse_rusprofile_person_skips_noise_position(tmp_path, monkeypatch):

@@ -121,7 +121,7 @@ class CardBot:
 
         notes = []
         notes.extend(card.quality_notes)
-        notes.extend(self._validate_required(card))
+        notes.extend(self._validate_card(card))
         notes.extend(ru_org_notes)
         notes.extend(en_org_notes)
         notes.extend(ru_pos_notes)
@@ -155,7 +155,7 @@ class CardBot:
         card.en_position, en_pos_notes = self.normalize_en_position(card.en_position)
         notes = []
         notes.extend(card.quality_notes)
-        notes.extend(self._validate_required(card))
+        notes.extend(self._validate_card(card))
         notes.extend(ru_org_notes + en_org_notes + ru_pos_notes + en_pos_notes)
         if card.gender not in {"М", "Ж"}:
             notes.append("Пол должен быть М или Ж")
@@ -384,12 +384,20 @@ class CardBot:
             out = {"ru_fio": parts[0], "ru_org": parts[1]}
         return out
 
-    def _validate_required(self, card: Card) -> List[str]:
+    def _is_valid_en_organization(self, value: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z0-9&.,'\- ]+", value))
+
+    def _is_valid_ru_organization(self, value: str) -> bool:
+        return bool(re.fullmatch(r"[А-Яа-яЁё0-9«»\"'().,\- ]+", value))
+
+    def _validate_card(self, card: Card) -> List[str]:
         notes = []
-        if not card.surname_ru and not card.family_name:
-            notes.append("ФИО: фамилия и имя обязательны")
-        if not card.gender:
-            notes.append("Пол обязателен")
+        if not card.surname_ru:
+            notes.append("Фамилия RU обязательна")
+        if not card.name_ru:
+            notes.append("Имя RU обязательно")
+        if not card.gender or card.gender not in {"М", "Ж"}:
+            notes.append("Пол должен быть М или Ж")
         if not card.ru_org:
             notes.append("Организация RU обязательна")
         if not card.en_org:
@@ -398,6 +406,13 @@ class CardBot:
             notes.append("Должность RU обязательна")
         if not card.en_position:
             notes.append("Position EN обязательна")
+        if card.middle_name_en and not card.patronymic_ru:
+            card.patronymic_ru = self.transliterate_en_to_ru(card.middle_name_en)
+            notes.append("Middle name RU: транслитерирован с английского, требует проверки")
+        if card.en_org and not self._is_valid_en_organization(card.en_org):
+            notes.append("Organization EN: нарушены правила написания")
+        if card.ru_org and not self._is_valid_ru_organization(card.ru_org):
+            notes.append("Организация RU: нарушены правила написания")
         return notes
 
     def _normalize_gender(self, value: str) -> str:
