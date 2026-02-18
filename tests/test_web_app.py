@@ -381,3 +381,60 @@ def test_handle_special_cases_always_includes_gref(tmp_path):
     enriched = app._handle_special_cases("Греф", [])
     assert enriched
     assert enriched[0]["data"]["appeal"] == "Г-н"
+
+
+def test_search_page_autodetects_person_mode_when_fio_present(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    captured = {}
+
+    def fake_search(params):
+        captured.update(params)
+        return [], [], []
+
+    monkeypatch.setattr(app, "_search_by_criteria", fake_search)
+
+    _body, status, _headers = app.search_page({"surname": ["Греф"], "search_type": [""]})
+
+    assert status == "200 OK"
+    assert captured["search_type"] == "person"
+
+
+def test_search_by_company_uses_normalized_name_first(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    provider = {"name": "rusprofile.ru", "kind": "rusprofile", "supports_name": True, "supports_inn": True}
+    queries = []
+
+    monkeypatch.setattr(app, "normalize_ru_org", lambda company: ("ПАО Сбербанк", ""))
+    monkeypatch.setattr(app, "_provider_chain", lambda *_args, **_kwargs: [provider])
+    monkeypatch.setattr(app, "_should_call_provider", lambda *_args, **_kwargs: True)
+
+    def fake_call(_provider, query, *_args, **_kwargs):
+        queries.append(query)
+        return [{"ru_org": "ПАО Сбербанк", "type": "company"}]
+
+    monkeypatch.setattr(app, "_call_provider_with_retry", fake_call)
+
+    hits, trace = app._search_by_company("Сбербанк")
+
+    assert hits
+    assert queries[0] == "ПАО Сбербанк"
+    assert any("Нормализовано: ПАО Сбербанк" in item for item in trace)
+
+
+def test_build_person_candidates_keeps_partial_matches(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    hits = [{
+        "source": "rusprofile.ru",
+        "data": {
+            "surname_ru": "Иванов",
+            "name_ru": "Петр",
+            "middle_name_ru": "Сергеевич",
+            "ru_org": "ООО Ромашка",
+        },
+    }]
+
+    candidates = app._build_person_candidates(hits, "Греф")
+
+    assert len(candidates) == 1
+    assert candidates[0]["fio_ru"] == "Иванов Петр Сергеевич"
