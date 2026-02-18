@@ -631,17 +631,24 @@ class CompanyWebApp:
             return bool(provider.get("supports_url"))
         return bool(provider.get("supports_name"))
 
-    def _call_provider(self, provider: dict[str, Any], raw: str, input_type: str, no_cache: bool = False) -> list[dict[str, Any]] | dict[str, Any] | None:
+    def _call_provider(
+        self,
+        provider: dict[str, Any],
+        raw: str,
+        input_type: str,
+        no_cache: bool = False,
+        search_type: str = "",
+    ) -> list[dict[str, Any]] | dict[str, Any] | None:
         normalized = self._normalize_spaces(raw)
         inn = self._extract_inn(raw) if input_type == INPUT_TYPE_INN else None
-        cache_key = f"provider:{provider.get('name', '')}:{input_type}:{normalized.lower()}"
+        cache_key = f"provider:{provider.get('name', '')}:{input_type}:{normalized.lower()}:{search_type}"
         if not no_cache:
             cached_hits = self._get_cache(cache_key)
             if cached_hits is not None:
                 return cached_hits
 
         try:
-            hits = self._fetch_from_provider(provider, normalized, input_type, inn)
+            hits = self._fetch_from_provider(provider, normalized, input_type, inn, search_type=search_type)
             if hits:
                 normalized_hits = hits if isinstance(hits, list) else [hits]
                 if not no_cache:
@@ -655,7 +662,7 @@ class CompanyWebApp:
                 self._set_cache(cache_key, [], ttl=self._negative_cache_ttl)
             return []
 
-        fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn)
+        fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn, search_type=search_type)
         if not fallback_hits:
             if not no_cache:
                 self._set_cache(cache_key, [], ttl=self._negative_cache_ttl)
@@ -670,7 +677,14 @@ class CompanyWebApp:
             self._set_cache(cache_key, result_list, ttl=self._positive_cache_ttl)
         return result_list
 
-    def _fetch_from_provider(self, provider: dict[str, Any], raw: str, input_type: str, inn: str | None) -> list[dict[str, Any]] | dict[str, Any] | None:
+    def _fetch_from_provider(
+        self,
+        provider: dict[str, Any],
+        raw: str,
+        input_type: str,
+        inn: str | None,
+        search_type: str = "",
+    ) -> list[dict[str, Any]] | dict[str, Any] | None:
         kind = provider.get("kind")
         person_query = input_type == INPUT_TYPE_PERSON_TEXT or is_person_query(raw)
         if kind == "egrul":
@@ -679,7 +693,7 @@ class CompanyWebApp:
         if kind in {"list_org", "list_org_enhanced"}:
             return self._parse_list_org(raw)
         if kind in {"rusprofile", "rusprofile_enhanced"}:
-            return self._collect_rusprofile_profiles(raw, input_type, is_person=person_query)
+            return self._collect_rusprofile_profiles(raw, input_type, is_person=person_query, search_type=search_type)
         if kind == "kontur":
             return self._parse_kontur(raw)
         if kind == "open_corporates" and inn:
@@ -705,13 +719,20 @@ class CompanyWebApp:
             ]
         )
 
-    def _try_fallback_providers(self, provider: dict[str, Any], query: str, input_type: str, inn: str | None) -> list[dict[str, Any]]:
+    def _try_fallback_providers(
+        self,
+        provider: dict[str, Any],
+        query: str,
+        input_type: str,
+        inn: str | None,
+        search_type: str = "",
+    ) -> list[dict[str, Any]]:
         fallback_providers = self._get_fallback_providers(provider, query, input_type)
         hits: list[dict[str, Any]] = []
         for fallback in fallback_providers:
             try:
                 logger.info("Trying fallback provider %s for %s", fallback["name"], query)
-                fallback_result = self._fetch_from_provider(fallback, query, input_type, inn)
+                fallback_result = self._fetch_from_provider(fallback, query, input_type, inn, search_type=search_type)
                 fallback_hits: list[dict[str, Any]] = []
                 if isinstance(fallback_result, list):
                     fallback_hits = [{"source": fallback["name"], "url": item.get("url", ""), "data": item} for item in fallback_result if item]
@@ -840,9 +861,9 @@ class CompanyWebApp:
                 score += 100
         return score
 
-    def _search_external_sources(self, raw: str, no_cache: bool = False) -> tuple[list[dict[str, Any]], list[str]]:
+    def _search_external_sources(self, raw: str, no_cache: bool = False, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
         input_type = self.detect_input_type(raw)
-        logger.info("🔍 НАЧАЛО ПОИСКА: '%s' (Тип: %s)", raw, input_type)
+        logger.info("🔍 НАЧАЛО ПОИСКА: '%s' (Тип: %s, Режим: %s)", raw, input_type, search_type or "auto")
         hits: list[dict[str, Any]] = []
         trace: list[str] = [f"1. Тип ввода: {input_type}", f"2. Ключ поиска: {raw}"]
         hits_by_provider: dict[str, int] = {}
@@ -851,7 +872,7 @@ class CompanyWebApp:
         def load_provider(provider: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
             started = time.perf_counter()
             try:
-                data = self._call_provider(provider, raw, input_type, no_cache=no_cache)
+                data = self._call_provider(provider, raw, input_type, no_cache=no_cache, search_type=search_type)
             except (requests.Timeout, TimeoutError) as exc:
                 logger.warning("Provider %s timeout for %s: %s", provider.get("name"), raw, exc)
                 return provider["name"], [], "provider_timeout_skipped"
@@ -904,7 +925,7 @@ class CompanyWebApp:
         hits.sort(key=lambda item: self._score_hit(item, raw), reverse=True)
         if not hits:
             trace.append("Источники: не получено")
-        logger.info("🏁 ПОИСК ЗАВЕРШЕН: Всего найдено %d записей", len(hits))
+        logger.info("🏁 ПОИСК ЗАВЕРШЕН: Всего найдено %d записей (режим: %s)", len(hits), search_type or "auto")
         return hits, trace
 
     def _domain_throttle(self, url: str) -> None:
@@ -1188,37 +1209,25 @@ class CompanyWebApp:
             "revenue": self._extract_revenue_from_soup(detail_soup),
         }
 
-    def _search_rusprofile(self, query: str, is_person: bool = False) -> list[dict[str, str]]:
+    def _search_rusprofile(self, query: str, is_person: bool = False, search_type: str = "") -> list[dict[str, str]]:
         search_url = f"https://www.rusprofile.ru/search?query={quote(query)}"
-        logger.debug("rusprofile URL: %s", search_url)
-        logger.info("rusprofile search: %s", search_url)
+
+        if search_type == "company":
+            is_person = False
+            logger.info("rusprofile search (ORG ONLY): %s", search_url)
+        elif search_type == "person":
+            is_person = True
+            logger.info("rusprofile search (PERSON ONLY): %s", search_url)
+        else:
+            logger.info("rusprofile search (AUTO): %s", search_url)
+
         html = self._fetch_page(search_url, timeout=5, max_retries=0)
         if not html:
             return []
         soup = BeautifulSoup(html, "lxml")
         hits: list[dict[str, str]] = []
-        for a_tag in soup.find_all("a", href=re.compile(r"^/person/")):
-            href = str(a_tag.get("href", ""))
-            name = self._normalize_spaces(a_tag.get_text(" ", strip=True))
-            if not name or not href:
-                continue
-            parent = a_tag.find_parent()
-            block_text = self._normalize_spaces(parent.get_text(" ", strip=True)) if isinstance(parent, Tag) else ""
-            inn_match = re.search(r"\b(\d{10}|\d{12})\b", block_text)
-            org_link = parent.find("a", href=re.compile(r"^/id/")) if isinstance(parent, Tag) else None
-            org_name = self._normalize_spaces(org_link.get_text(" ", strip=True)) if isinstance(org_link, Tag) else ""
-            hits.append({
-                "source": "rusprofile.ru",
-                "type": "person",
-                "name": name,
-                "org": org_name,
-                "inn": inn_match.group(1) if inn_match else "",
-                "url": "https://www.rusprofile.ru" + href,
-            })
-            if len(hits) >= 10:
-                break
 
-        if not is_person:
+        if search_type == "company":
             for a_tag in soup.find_all("a", href=re.compile(r"^/id/")):
                 href = str(a_tag.get("href", ""))
                 name = self._normalize_spaces(a_tag.get_text(" ", strip=True))
@@ -1235,13 +1244,72 @@ class CompanyWebApp:
                     "inn": inn_match.group(1) if inn_match else "",
                     "url": "https://www.rusprofile.ru" + href,
                 })
-                if len(hits) >= 10:
+        elif search_type == "person":
+            for a_tag in soup.find_all("a", href=re.compile(r"^/person/")):
+                href = str(a_tag.get("href", ""))
+                name = self._normalize_spaces(a_tag.get_text(" ", strip=True))
+                if not name or not href:
+                    continue
+                parent = a_tag.find_parent()
+                block_text = self._normalize_spaces(parent.get_text(" ", strip=True)) if isinstance(parent, Tag) else ""
+                inn_match = re.search(r"\b(\d{10}|\d{12})\b", block_text)
+                org_link = parent.find("a", href=re.compile(r"^/id/")) if isinstance(parent, Tag) else None
+                org_name = self._normalize_spaces(org_link.get_text(" ", strip=True)) if isinstance(org_link, Tag) else ""
+                hits.append({
+                    "source": "rusprofile.ru",
+                    "type": "person",
+                    "name": name,
+                    "org": org_name,
+                    "inn": inn_match.group(1) if inn_match else "",
+                    "url": "https://www.rusprofile.ru" + href,
+                })
+        else:
+            for a_tag in soup.find_all("a", href=re.compile(r"^/person/")):
+                href = str(a_tag.get("href", ""))
+                name = self._normalize_spaces(a_tag.get_text(" ", strip=True))
+                if not name or not href:
+                    continue
+                parent = a_tag.find_parent()
+                block_text = self._normalize_spaces(parent.get_text(" ", strip=True)) if isinstance(parent, Tag) else ""
+                inn_match = re.search(r"\b(\d{10}|\d{12})\b", block_text)
+                org_link = parent.find("a", href=re.compile(r"^/id/")) if isinstance(parent, Tag) else None
+                org_name = self._normalize_spaces(org_link.get_text(" ", strip=True)) if isinstance(org_link, Tag) else ""
+                hits.append({
+                    "source": "rusprofile.ru",
+                    "type": "person",
+                    "name": name,
+                    "org": org_name,
+                    "inn": inn_match.group(1) if inn_match else "",
+                    "url": "https://www.rusprofile.ru" + href,
+                })
+                if len(hits) >= 20:
                     break
 
-        if is_person:
-            hits = [h for h in hits if h.get("type") == "person"]
-        logger.info("rusprofile hits: найдено %d записей", len(hits))
-        return hits[:10]
+            if not is_person:
+                for a_tag in soup.find_all("a", href=re.compile(r"^/id/")):
+                    href = str(a_tag.get("href", ""))
+                    name = self._normalize_spaces(a_tag.get_text(" ", strip=True))
+                    if not name or not href:
+                        continue
+                    parent = a_tag.find_parent()
+                    block_text = self._normalize_spaces(parent.get_text(" ", strip=True)) if isinstance(parent, Tag) else ""
+                    inn_match = re.search(r"\b(\d{10})\b", block_text)
+                    hits.append({
+                        "source": "rusprofile.ru",
+                        "type": "company",
+                        "name": name,
+                        "org": name,
+                        "inn": inn_match.group(1) if inn_match else "",
+                        "url": "https://www.rusprofile.ru" + href,
+                    })
+                    if len(hits) >= 20:
+                        break
+
+            if is_person:
+                hits = [h for h in hits if h.get("type") == "person"]
+
+        logger.info("rusprofile hits: найдено %d записей (тип: %s)", len(hits), search_type or "auto")
+        return hits[:20]
 
     def _parse_rusprofile(self, url: str) -> dict[str, Any]:
         html = self._fetch_page(url, timeout=20, max_retries=2)
@@ -1428,10 +1496,17 @@ class CompanyWebApp:
                 return any(variant in normalized_org for variant in opf_variants)
         return False
 
-    def _call_provider_with_retry(self, provider: dict[str, Any], query: str, input_type: str, max_retries: int = 0) -> list[dict[str, Any]]:
+    def _call_provider_with_retry(
+        self,
+        provider: dict[str, Any],
+        query: str,
+        input_type: str,
+        max_retries: int = 0,
+        search_type: str = "",
+    ) -> list[dict[str, Any]]:
         for attempt in range(max_retries + 1):
             try:
-                result = self._call_provider(provider, query, input_type)
+                result = self._call_provider(provider, query, input_type, search_type=search_type)
                 if isinstance(result, list):
                     return result
                 if isinstance(result, dict):
@@ -1485,7 +1560,13 @@ class CompanyWebApp:
             return f"provider_error:{error_id}:connection_error"
         return f"provider_error:{error_id}:{type(error).__name__}"
 
-    def _collect_rusprofile_profiles(self, query: str, input_type: str, is_person: bool = False) -> list[dict[str, Any]] | dict[str, Any] | None:
+    def _collect_rusprofile_profiles(
+        self,
+        query: str,
+        input_type: str,
+        is_person: bool = False,
+        search_type: str = "",
+    ) -> list[dict[str, Any]] | dict[str, Any] | None:
         person_mode = is_person or input_type == INPUT_TYPE_PERSON_TEXT or is_person_query(query)
         if input_type == INPUT_TYPE_URL and "rusprofile.ru" in query and ("/person/" in query or "/ip/" in query):
             person_mode = True
@@ -1494,7 +1575,7 @@ class CompanyWebApp:
             profile = self._parse_rusprofile(query)
             return profile or None
 
-        hits = self._search_rusprofile(query, is_person=person_mode)
+        hits = self._search_rusprofile(query, is_person=person_mode, search_type=search_type)
         profiles: list[dict[str, Any]] = []
         for hit in hits:
             if hit.get("url"):
@@ -2200,13 +2281,20 @@ class CompanyWebApp:
             )
             db.commit()
 
-    def _build_person_candidates(self, hits: list[dict[str, Any]], query: str = "") -> list[dict[str, str]]:
+    def _build_person_candidates(self, hits: list[dict[str, Any]], query: str = "", search_type: str = "") -> list[dict[str, str]]:
         candidates: list[dict[str, Any]] = []
         query_words = [w for w in self._normalize_spaces(query.lower()).split() if w]
 
         for hit in hits:
             data = hit.get("data", {})
             normalized_data = dict(data)
+            hit_type = str(hit.get("type") or normalized_data.get("type") or "person")
+
+            if search_type == "company" and hit_type == "person":
+                continue
+            if search_type == "person" and hit_type == "company" and not normalized_data.get("surname_ru"):
+                continue
+
             if normalized_data.get("ru_org"):
                 normalized_data["ru_org"] = self._clean_ru_org_name(str(normalized_data["ru_org"]))
             if normalized_data.get("ru_org") and not normalized_data.get("en_org"):
@@ -2247,6 +2335,7 @@ class CompanyWebApp:
             candidates.append({
                 "data": normalized_data,
                 "source": str(hit.get("source", "")),
+                "type": hit_type,
                 "url": str(hit.get("url", "")),
                 "score": score,
                 "fio_ru": fio_ru,
@@ -2263,12 +2352,12 @@ class CompanyWebApp:
             if key not in dedup or float(candidate.get("score", 0)) > float(dedup[key].get("score", 0)):
                 dedup[key] = candidate
 
-        ranked = sorted(dedup.values(), key=lambda x: float(x.get("score", 0)), reverse=True)[:6]
+        ranked = sorted(dedup.values(), key=lambda x: float(x.get("score", 0)), reverse=True)[:20]
         for item in ranked:
             item["score"] = f"{float(item['score']):.2f}"
         if ranked:
             logger.info("Top candidate: %s", ranked[0].get("fio_ru", ""))
-        logger.info("Кандидаты после фильтрации: %d", len(ranked))
+        logger.info("Кандидаты после фильтрации: %d (режим: %s)", len(ranked), search_type or "auto")
         return ranked
 
     def _normalize_position_ru(self, position: str) -> str:
@@ -2310,6 +2399,11 @@ class CompanyWebApp:
         middle_name = form_values.get("middle_name", "")
         inn = form_values.get("inn", "")
         company = form_values.get("company", "")
+        search_type = form_values.get("search_type", "")
+        auto_checked = "checked" if not search_type else ""
+        company_checked = "checked" if search_type == "company" else ""
+        person_checked = "checked" if search_type == "person" else ""
+
         logger.info("Рендер поиска: кандидатов=%d, similar=%d", len(candidates), len(similar))
         if candidates:
             blocks = "".join(
@@ -2322,7 +2416,7 @@ class CompanyWebApp:
                     f"<p style='margin: 4px 0;'><b>Должность:</b> {escape(c['position_ru'] or '—')}</p>"
                     f"<p style='margin: 4px 0;'><b>Выручка:</b> {escape(self._revenue_billions(c.get('revenue')))} млрд руб</p>"
                     f"<p style='margin: 4px 0;'><b>ИНН:</b> {escape(c.get('inn', '') or '—')}</p>"
-                    f"<p style='margin: 4px 0;'><small>Источник: {escape(c['source'])}</small></p>"
+                    f"<p style='margin: 4px 0;'><small><span style='background: {'#e3f2fd' if c.get('type') == 'company' else '#fce4ec'}; padding: 2px 8px; border-radius: 4px; font-size: 11px;'>{'🏢 Юр. лицо' if c.get('type') == 'company' else '👤 Физ. лицо'}</span> | Источник: {escape(c['source'])}</small></p>"
                     "<span style='display: inline-block; margin-top: 10px;'>Автозаполнить</span>"
                     "</button></form>"
                 )
@@ -2349,6 +2443,11 @@ class CompanyWebApp:
             "<div><label style='display:block; margin-bottom:4px;'>ИНН</label><input name='inn' value='{inn}' style='width:100%;'/></div>"
             "<div><label style='display:block; margin-bottom:4px;'>Название компании</label><input name='company' value='{company}' style='width:100%;'/></div>"
             "</div>"
+            "<div style='margin: 12px 0;'>"
+            "<label style='cursor: pointer; margin-right: 16px;'><input type='radio' name='search_type' value='' {auto_checked}/><span style='margin-left: 4px;'>🔄 Авто</span></label>"
+            "<label style='cursor: pointer; margin-right: 16px;'><input type='radio' name='search_type' value='company' {company_checked}/><span style='margin-left: 4px;'>🏢 Только организации</span></label>"
+            "<label style='cursor: pointer;'><input type='radio' name='search_type' value='person' {person_checked}/><span style='margin-left: 4px;'>👤 Только физ. лица</span></label>"
+            "</div>"
             "<details style='margin-bottom: 10px;'><summary>Общий запрос (обратная совместимость)</summary>"
             "<input name='q' value='{q}' style='margin-top: 8px; width: 100%;'/>"
             "</details>"
@@ -2363,17 +2462,23 @@ class CompanyWebApp:
             middle_name=escape(middle_name),
             inn=escape(inn),
             company=escape(company),
+            auto_checked=auto_checked,
+            company_checked=company_checked,
+            person_checked=person_checked,
             norm=f"<p><b>Нормализовано:</b> {escape(normalized)}</p>" if normalized else "",
             not_found=not_found,
             similar=f"<h3>Похожие варианты</h3><ul>{items}</ul>" if similar and not candidates else "",
         )
 
-    def _handle_special_cases(self, raw_query: str, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _handle_special_cases(self, raw_query: str, hits: list[dict[str, Any]], search_type: str = "") -> list[dict[str, Any]]:
         normalized = self._normalize_spaces(raw_query).lower()
+        if search_type == "company":
+            return hits
         if "греф" not in normalized:
             return hits
         special_gref = {
             "source": "special_case",
+            "type": "person",
             "url": "",
             "data": {
                 "surname_ru": "Греф",
@@ -2386,9 +2491,9 @@ class CompanyWebApp:
         }
         return [special_gref] + hits
 
-    def _search_by_inn(self, inn: str) -> tuple[list[dict[str, Any]], list[str]]:
+    def _search_by_inn(self, inn: str, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
         trace = [f"Поиск по ИНН: {inn}"]
-        direct_hits, source_trace = self._search_external_sources(inn, no_cache=False)
+        direct_hits, source_trace = self._search_external_sources(inn, no_cache=False, search_type=search_type)
         trace.extend(source_trace)
         if direct_hits:
             return direct_hits, trace
@@ -2400,51 +2505,25 @@ class CompanyWebApp:
         for provider in providers:
             trace.append(f"Запрос к источнику: {provider['name']}")
             try:
-                data = self._call_provider_with_retry(provider, inn, input_type, max_retries=0)
+                data = self._call_provider_with_retry(provider, inn, input_type, max_retries=0, search_type=search_type)
                 if data:
                     for item in data:
-                        hits.append({"source": provider["name"], "url": item.get("url", ""), "data": item})
+                        hits.append({"source": provider["name"], "url": item.get("url", ""), "data": item, "type": item.get("type", "company")})
                     trace.append(f"Найдено {len(data)} записей в {provider['name']}")
-                    if int(provider.get("priority", 10)) <= 5:
-                        trace.append(f"Достаточно данных найдено в {provider['name']}, прекращаем поиск")
-                        break
             except Exception as exc:  # noqa: BLE001
-                trace.append(f"Ошибка при запросе к {provider['name']}: {str(exc)}")
-
-        if not hits:
-            trace.append("Ничего не найдено, пробуем альтернативные написания ИНН")
-            for alt_inn in self._generate_inn_variants(inn):
-                if alt_inn == inn:
-                    continue
-                trace.append(f"Попытка поиска по альтернативному ИНН: {alt_inn}")
-                for provider in providers:
-                    try:
-                        data = self._call_provider_with_retry(provider, alt_inn, input_type, max_retries=0)
-                        if data:
-                            for item in data:
-                                hits.append({"source": f"{provider['name']} (альт. ИНН)", "url": item.get("url", ""), "data": item})
-                            trace.append(f"Найдено {len(data)} записей по альтернативному ИНН в {provider['name']}")
-                            break
-                    except Exception:
-                        continue
+                trace.append(f"Ошибка источника {provider['name']}: {exc}")
+                continue
 
         return hits, trace
 
-    def _generate_inn_variants(self, inn: str) -> list[str]:
-        variants = [inn, inn.lstrip("0")]
-        if len(inn) == 10:
-            variants.extend([f"0{inn}", f"00{inn}"])
-        elif len(inn) == 11:
-            variants.append(f"0{inn}")
-        return list(dict.fromkeys(v for v in variants if v))
-
-    def _search_by_person(self, full_name: str) -> tuple[list[dict[str, Any]], list[str]]:
+    def _search_by_person(self, full_name: str, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
         trace = [f"Поиск по персоне: {full_name}"]
-        hits, source_trace = self._search_external_sources(full_name, no_cache=False)
+        hits, source_trace = self._search_external_sources(full_name, no_cache=False, search_type=search_type)
         trace.extend(source_trace)
+        hits = self._handle_special_cases(full_name, hits, search_type=search_type)
         return hits, trace
 
-    def _search_by_company(self, company_name: str) -> tuple[list[dict[str, Any]], list[str]]:
+    def _search_by_company(self, company_name: str, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
         trace = [f"Поиск по компании: {company_name}"]
         hits: list[dict[str, Any]] = []
         input_type = INPUT_TYPE_ORG_TEXT
@@ -2454,9 +2533,9 @@ class CompanyWebApp:
             if not self._should_call_provider(provider, input_type):
                 continue
             trace.append(f"Запрос к источнику: {provider['name']}")
-            data = self._call_provider_with_retry(provider, company_name, input_type, max_retries=0)
+            data = self._call_provider_with_retry(provider, company_name, input_type, max_retries=0, search_type=search_type)
             if data:
-                hits.extend({"source": provider["name"], "url": item.get("url", ""), "data": item} for item in data)
+                hits.extend({"source": provider["name"], "url": item.get("url", ""), "data": item, "type": item.get("type", "company")} for item in data)
                 trace.append(f"Найдено {len(data)} записей в {provider['name']}")
 
         if not hits:
@@ -2466,9 +2545,9 @@ class CompanyWebApp:
                 for provider in providers:
                     if not self._should_call_provider(provider, input_type):
                         continue
-                    data = self._call_provider_with_retry(provider, alt_name, input_type, max_retries=0)
+                    data = self._call_provider_with_retry(provider, alt_name, input_type, max_retries=0, search_type=search_type)
                     if data:
-                        hits.extend({"source": provider["name"], "url": item.get("url", ""), "data": item} for item in data)
+                        hits.extend({"source": provider["name"], "url": item.get("url", ""), "data": item, "type": item.get("type", "company")} for item in data)
                         trace.append(f"Найдено {len(data)} записей по альтернативному написанию в {provider['name']}")
         return hits, trace
 
@@ -2476,28 +2555,49 @@ class CompanyWebApp:
         trace: list[str] = []
         source_hits: list[dict[str, Any]] = []
         candidates: list[dict[str, str]] = []
+        search_type = params.get("search_type", "")
 
         if params.get("inn"):
             trace.append("Обнаружен ИНН в запросе")
-            source_hits, source_trace = self._search_by_inn(params["inn"])
+            source_hits, source_trace = self._search_by_inn(params["inn"], search_type=search_type)
             trace.extend(source_trace)
-        elif params.get("surname") or params.get("name") or params.get("middle_name"):
-            full_name = " ".join(filter(None, [params.get("surname", ""), params.get("name", ""), params.get("middle_name", "")]))
-            trace.append(f"Обнаружено ФИО в запросе: {full_name}")
-            source_hits, source_trace = self._search_by_person(full_name)
-            trace.extend(source_trace)
+        elif search_type == "company":
+            trace.append("Режим: ТОЛЬКО ОРГАНИЗАЦИИ (юр. лица)")
             if params.get("company"):
-                source_hits = [
-                    hit
-                    for hit in source_hits
-                    if self._company_name_matches(str(hit.get("data", {}).get("ru_org", "")), params["company"])
-                ]
-                trace.append(f"Фильтрация по компании: {params['company']}")
-            candidates = self._build_person_candidates(source_hits, full_name)
-        elif params.get("company"):
-            trace.append(f"Поиск по названию компании: {params['company']}")
-            source_hits, source_trace = self._search_by_company(params["company"])
-            trace.extend(source_trace)
+                source_hits, source_trace = self._search_by_company(params["company"], search_type=search_type)
+                trace.extend(source_trace)
+            elif params.get("surname") or params.get("name"):
+                full_name = " ".join(filter(None, [params.get("surname", ""), params.get("name", "")]))
+                trace.append(f"ФИО интерпретировано как название компании: {full_name}")
+                source_hits, source_trace = self._search_by_company(full_name, search_type=search_type)
+                trace.extend(source_trace)
+        elif search_type == "person":
+            trace.append("Режим: ТОЛЬКО ФИЗ. ЛИЦА")
+            if params.get("surname") or params.get("name") or params.get("middle_name"):
+                full_name = " ".join(filter(None, [params.get("surname", ""), params.get("name", ""), params.get("middle_name", "")]))
+                trace.append(f"Поиск по персоне: {full_name}")
+                source_hits, source_trace = self._search_by_person(full_name, search_type=search_type)
+                trace.extend(source_trace)
+                candidates = self._build_person_candidates(source_hits, full_name, search_type=search_type)
+        else:
+            trace.append("Режим: АВТО (физ. + юр. лица)")
+            if params.get("surname") or params.get("name") or params.get("middle_name"):
+                full_name = " ".join(filter(None, [params.get("surname", ""), params.get("name", ""), params.get("middle_name", "")]))
+                trace.append(f"Обнаружено ФИО в запросе: {full_name}")
+                source_hits, source_trace = self._search_by_person(full_name, search_type=search_type)
+                trace.extend(source_trace)
+                if params.get("company"):
+                    source_hits = [
+                        hit
+                        for hit in source_hits
+                        if self._company_name_matches(str(hit.get("data", {}).get("ru_org", "")), params["company"])
+                    ]
+                    trace.append(f"Фильтрация по компании: {params['company']}")
+                candidates = self._build_person_candidates(source_hits, full_name, search_type=search_type)
+            elif params.get("company"):
+                trace.append(f"Поиск по названию компании: {params['company']}")
+                source_hits, source_trace = self._search_by_company(params["company"], search_type=search_type)
+                trace.extend(source_trace)
 
         if not candidates and source_hits:
             primary_query = params.get("inn") or params.get("company") or " ".join(
@@ -2512,6 +2612,7 @@ class CompanyWebApp:
                 "inn": profile.get("inn", ""),
                 "revenue": str(profile.get("revenue", 0) or 0),
                 "source": best_hit.get("source", ""),
+                "type": best_hit.get("type", profile.get("type", "unknown")),
                 "query_for_autofill": profile.get("inn", "") or primary_query,
             }]
 
@@ -2524,6 +2625,7 @@ class CompanyWebApp:
         middle_name = (query.get("middle_name") or [""])[0].strip()
         inn = (query.get("inn") or [""])[0].strip()
         company = (query.get("company") or [""])[0].strip()
+        search_type = (query.get("search_type") or [""])[0].strip()
 
         if q and not any([surname, name, middle_name, inn, company]):
             input_type = self.detect_input_type(q)
@@ -2535,7 +2637,7 @@ class CompanyWebApp:
                 company = q
 
         if not any([q, surname, name, middle_name, inn, company]):
-            content = self._render_search_results("", "", [], [], form_values={})
+            content = self._render_search_results("", "", [], [], form_values={"search_type": search_type})
             body = self._page("Карточки компаний/участников", content)
             return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
@@ -2564,6 +2666,7 @@ class CompanyWebApp:
             "middle_name": middle_name,
             "inn": inn,
             "company": company,
+            "search_type": search_type,
         })
 
         content = self._render_search_results(
@@ -2577,6 +2680,7 @@ class CompanyWebApp:
                 "middle_name": middle_name,
                 "inn": inn,
                 "company": company,
+                "search_type": search_type,
             },
         )
         body = self._page("Карточки компаний/участников", content)
