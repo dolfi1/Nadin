@@ -485,3 +485,12 @@ def test_handle_special_cases_adds_sberbank_for_company_search(tmp_path):
     assert enriched[0]["type"] == "company"
     assert enriched[0]["data"]["ru_org"] == "ПАО Сбербанк"
     assert enriched[0]["data"]["inn"] == "7707083893"
+
+
+def test_is_person_query_recognizes_bank_as_company():
+    assert web_app.is_person_query("Сбербанк") is False
+
+
+def test_split_fio_handles_empty_value(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    assert app._split_fio_ru("") == ("", "", "")
