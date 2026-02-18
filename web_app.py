@@ -175,7 +175,7 @@ class CompanyWebApp:
         self._positive_cache_ttl = 30 * 24 * 60 * 60
         self._negative_cache_ttl = 4 * 60 * 60
         self._domain_last_call: dict[str, float] = {}
-        self._domain_throttle_seconds = 10
+        self._domain_throttle_seconds = 12
         self._active_searches: dict[str, float] = {}
         self._autofill_result_cache: dict[str, dict[str, Any]] = {}
         self._last_search_time: dict[str, float] = {}
@@ -988,25 +988,22 @@ class CompanyWebApp:
                 headers = self._get_random_headers(self._get_random_user_agent())
                 proxies = self._get_random_proxy() if attempt > 0 else None
                 response = requests.get(url, timeout=timeout, headers=headers, verify=True, allow_redirects=True, proxies=proxies)
-                try:
-                    response = requests.get(url, timeout=timeout, headers=headers, proxies=proxies, verify=True)
-                except requests.exceptions.SSLError as ssl_exc:
-                    logger.warning("SSL error for %s (attempt %d): %s", url, attempt + 1, ssl_exc)
-                    if attempt < attempts - 1:
-                        time.sleep((attempt + 1) * 2)
-                        continue
-                    return None
                 status_code = getattr(response, "status_code", 200 if getattr(response, "ok", False) else 500)
-                response_text_lower = response.text.lower()
+                response_text = response.text
+                response_text_lower = response_text.lower()
+                response_length = len(response_text)
+                logger.info("Fetched %s status=%d len=%d", url, status_code, response_length)
                 if (
                     "captcha" in response_text_lower
                     or "доступ ограничен" in response_text_lower
                     or "block" in response_text_lower
+                    or "проверка" in response_text_lower
+                    or response_length < 1000
                 ):
-                    logger.warning("%s returned captcha/block page", url)
+                    logger.warning("%s returned captcha/block page (content check, len=%d)", url, response_length)
                     return None
                 if status_code == 200:
-                    return response.text
+                    return response_text
                 if status_code == 429:
                     wait_time = (attempt + 1) * 5
                     logger.warning("Received 429 from %s, waiting %d seconds before retry", url, wait_time)
@@ -1296,7 +1293,7 @@ class CompanyWebApp:
         else:
             logger.info("rusprofile search (AUTO): %s", search_url)
 
-        html = self._fetch_page(search_url, timeout=5, max_retries=0)
+        html = self._fetch_page(search_url, timeout=15, max_retries=2)
         if not html:
             return []
         soup = BeautifulSoup(html, "lxml")
@@ -2602,6 +2599,20 @@ class CompanyWebApp:
 
     def _handle_special_cases(self, raw_query: str, hits: list[dict[str, Any]], search_type: str = "") -> list[dict[str, Any]]:
         normalized = self._normalize_spaces(raw_query).lower()
+
+        if search_type != "person" and ("сбербанк" in normalized or "сбер" in normalized):
+            sberbank_case = {
+                "source": "special_case",
+                "type": "company",
+                "url": "",
+                "data": {
+                    "ru_org": "ПАО Сбербанк",
+                    "inn": "7707083893",
+                    "ru_position": "",
+                },
+            }
+            hits = [sberbank_case] + hits
+
         if search_type == "company":
             return hits
         if "греф" not in normalized:
@@ -2687,6 +2698,7 @@ class CompanyWebApp:
                         break
                 if hits:
                     break
+        hits = self._handle_special_cases(company_name, hits, search_type=search_type)
         return hits, trace
 
     def _search_by_criteria(self, params: dict[str, str]) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[str]]:

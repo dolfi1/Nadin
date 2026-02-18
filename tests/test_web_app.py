@@ -93,8 +93,9 @@ def test_parse_rusprofile_person_text_extracts_fio(tmp_path, monkeypatch):
                 '<a class="search-result__title-link" href="/id/1027700132195">ПАО Сбербанк</a>'
                 '<a href="/person/gref-go-770303580308">Греф Герман Оскарович</a>'
                 '</div>'
+                + "x" * 1200
             )
-        return FakeResponse('<h1>Греф Герман Оскарович</h1><a href="/id/1027700132195">ПАО Сбербанк</a>')
+        return FakeResponse('<h1>Греф Герман Оскарович</h1><a href="/id/1027700132195">ПАО Сбербанк</a>' + "x" * 1200)
 
     monkeypatch.setattr(web_app.requests, "get", fake_get)
 
@@ -110,7 +111,7 @@ def test_parse_rusprofile_url_input_uses_detail_page_directly(tmp_path, monkeypa
 
     def fake_get(url, **_kwargs):
         called["urls"].append(url)
-        return FakeResponse("<h1>ПАО Сбербанк</h1>")
+        return FakeResponse("<h1>ПАО Сбербанк</h1>" + "x" * 1200)
 
     monkeypatch.setattr(web_app.requests, "get", fake_get)
     raw_url = "https://www.rusprofile.ru/id/1027700132195"
@@ -438,3 +439,49 @@ def test_build_person_candidates_keeps_partial_matches(tmp_path):
 
     assert len(candidates) == 1
     assert candidates[0]["fio_ru"] == "Иванов Петр Сергеевич"
+
+
+def test_search_rusprofile_uses_extended_timeout_and_retries(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    captured = {}
+
+    def fake_fetch(url, timeout=0, max_retries=0):
+        captured["url"] = url
+        captured["timeout"] = timeout
+        captured["max_retries"] = max_retries
+        return "<html></html>"
+
+    monkeypatch.setattr(app, "_fetch_page", fake_fetch)
+
+    app._search_rusprofile("Сбербанк", search_type="company")
+
+    assert "rusprofile.ru/search" in captured["url"]
+    assert captured["timeout"] == 15
+    assert captured["max_retries"] == 2
+
+
+def test_fetch_page_detects_captcha_by_short_content(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(app, "_domain_throttle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(app, "_is_localhost", lambda *_args, **_kwargs: True)
+
+    def fake_get(*_args, **_kwargs):
+        return FakeResponse(text="короткий ответ", ok=True)
+
+    monkeypatch.setattr(web_app.requests, "get", fake_get)
+
+    data = app._fetch_page("https://www.rusprofile.ru/search?query=test", timeout=1, max_retries=1)
+
+    assert data is None
+
+
+def test_handle_special_cases_adds_sberbank_for_company_search(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    enriched = app._handle_special_cases("Сбербанк", [], search_type="company")
+
+    assert enriched
+    assert enriched[0]["type"] == "company"
+    assert enriched[0]["data"]["ru_org"] == "ПАО Сбербанк"
+    assert enriched[0]["data"]["inn"] == "7707083893"
