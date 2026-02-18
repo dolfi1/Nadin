@@ -974,6 +974,10 @@ class CompanyWebApp:
             time.sleep(wait_for)
         self._domain_last_call[host] = time.time()
 
+    def _fetch_page(self, url: str, timeout: int = 10, max_retries: int = 3) -> str | None:
+        self._domain_throttle(url)
+        if not self._is_localhost(url):
+            time.sleep(random.uniform(1.0, 3.0))
     def _fetch_page(self, url: str, timeout: int = 5, max_retries: int = 3) -> str | None:
         self._domain_throttle(url)
         if not self._is_localhost(url):
@@ -981,9 +985,9 @@ class CompanyWebApp:
         attempts = max(1, max_retries)
         for attempt in range(attempts):
             try:
-                user_agent = self._get_random_user_agent()
-                headers = self._get_random_headers(user_agent)
+                headers = self._get_random_headers(self._get_random_user_agent())
                 proxies = self._get_random_proxy() if attempt > 0 else None
+                response = requests.get(url, timeout=timeout, headers=headers, verify=True, allow_redirects=True, proxies=proxies)
                 try:
                     response = requests.get(url, timeout=timeout, headers=headers, proxies=proxies, verify=True)
                 except requests.exceptions.SSLError as ssl_exc:
@@ -994,18 +998,33 @@ class CompanyWebApp:
                     return None
                 status_code = getattr(response, "status_code", 200 if getattr(response, "ok", False) else 500)
                 if status_code == 200:
+                    if "captcha" in response.text.lower() or "доступ ограничен" in response.text.lower():
+                        logger.warning("%s returned captcha/block page", url)
+                        return None
                     return response.text
                 if status_code == 429:
-                    wait_time = (attempt + 1) * 3
+                    wait_time = (attempt + 1) * 5
                     logger.warning("Received 429 from %s, waiting %d seconds before retry", url, wait_time)
                     time.sleep(wait_time)
                     continue
                 logger.error("Failed to fetch %s, status code: %d", url, status_code)
                 return None
+            except requests.exceptions.SSLError as exc:
+                logger.warning("SSL error for %s (attempt %d/%d): %s", url, attempt + 1, attempts, exc)
+                if attempt < attempts - 1:
+                    time.sleep((attempt + 1) * 2)
+                    continue
+            except requests.exceptions.ConnectionError as exc:
+                logger.warning("Connection error for %s (attempt %d/%d): %s", url, attempt + 1, attempts, exc)
+                if attempt < attempts - 1:
+                    time.sleep((attempt + 1) * 2)
+                    continue
             except Exception as exc:  # noqa: BLE001
                 logger.error("Fetch failed for %s (attempt %d/%d): %s", url, attempt + 1, attempts, exc)
                 if attempt < attempts - 1:
                     time.sleep((attempt + 1) * 2)
+                    continue
+
 
         logger.error("Failed to fetch %s after %d attempts", url, attempts)
         return None
@@ -1030,15 +1049,18 @@ class CompanyWebApp:
             "User-Agent": user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": random.choice(["ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7", "en-US,en;q=0.9,ru;q=0.8"]),
+            "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
             "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+            "DNT": "1",
         }
-        if random.random() > 0.5:
-            headers["Referer"] = random.choice(["https://www.google.com/", "https://yandex.ru/", "https://www.bing.com/"])
+        if random.random() > 0.3:
+            headers["Referer"] = random.choice(["https://www.google.com/", "https://yandex.ru/", "https://www.rusprofile.ru/"])
         return headers
 
     def _get_random_proxy(self) -> dict[str, str] | None:
@@ -1050,18 +1072,23 @@ class CompanyWebApp:
 
     def _request(self, url: str, timeout: int = 10) -> requests.Response:
         self._domain_throttle(url)
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36",
-        ]
-        headers = {
-            "User-Agent": random.choice(user_agents),
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Connection": "keep-alive",
-        }
-        return requests.get(url, timeout=timeout, headers=headers)
+        attempts = 3
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                headers = self._get_random_headers(self._get_random_user_agent())
+                return requests.get(url, timeout=timeout, headers=headers, verify=True, allow_redirects=True)
+            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as exc:
+                last_exc = exc
+                logger.warning("Request retry for %s (attempt %d/%d): %s", url, attempt + 1, attempts, exc)
+                if attempt < attempts - 1:
+                    time.sleep((attempt + 1) * 2)
+                    continue
+                raise
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"Failed request for {url}")
 
     def _parse_egrul(self, query: str) -> dict[str, Any] | None:
         if not re.fullmatch(r"\d{10,12}", query):
@@ -1620,20 +1647,39 @@ class CompanyWebApp:
 
         hits = self._search_rusprofile(query, is_person=person_mode, search_type=search_type)
         profiles: list[dict[str, Any]] = []
-        for hit in hits:
-            if hit.get("url"):
+
+        def parse_single_hit(hit: dict[str, Any]) -> dict[str, Any] | None:
+            if not hit.get("url"):
+                return None
+            try:
                 profile = self._parse_rusprofile(hit["url"])
-                if profile:
-                    if hit.get("org") and not profile.get("ru_org"):
-                        profile["ru_org"] = hit.get("org", "")
-                    if hit.get("position") and not profile.get("ru_position"):
-                        profile["ru_position"] = hit.get("position", "")
-                    if not profile.get("surname_ru") and hit.get("name"):
-                        sur, nam, patr = self._split_fio_ru(str(hit.get("name", "")))
-                        profile["surname_ru"] = sur
-                        profile["name_ru"] = nam
-                        profile["middle_name_ru"] = patr
-                    profiles.append(profile)
+                if not profile:
+                    return None
+                if hit.get("org") and not profile.get("ru_org"):
+                    profile["ru_org"] = hit.get("org", "")
+                if hit.get("position") and not profile.get("ru_position"):
+                    profile["ru_position"] = hit.get("position", "")
+                if not profile.get("surname_ru") and hit.get("name"):
+                    sur, nam, patr = self._split_fio_ru(str(hit.get("name", "")))
+                    profile["surname_ru"] = sur
+                    profile["name_ru"] = nam
+                    profile["middle_name_ru"] = patr
+                return profile
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to parse %s: %s", hit.get("url", ""), exc)
+                return None
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(parse_single_hit, hit): hit for hit in hits[:10]}
+            try:
+                for future in as_completed(futures, timeout=30):
+                    result = future.result()
+                    if result:
+                        profiles.append(result)
+            except FuturesTimeoutError:
+                logger.warning("RusProfile parse timeout for query: %s", query)
+
+        logger.info("RusProfile: найдено %d профилей из %d хитов", len(profiles), len(hits))
 
         if person_mode:
             return profiles
@@ -2364,14 +2410,13 @@ class CompanyWebApp:
     def _build_person_candidates(self, hits: list[dict[str, Any]], query: str = "", search_type: str = "") -> list[dict[str, str]]:
         candidates: list[dict[str, Any]] = []
         query_words = [w for w in self._normalize_spaces(query.lower()).split() if w]
+        logger.info("Построение кандидатов: %d хитов, query_words=%s, search_type=%s", len(hits), query_words, search_type)
 
-        for hit in hits:
+        for idx, hit in enumerate(hits):
             data = hit.get("data", {})
             normalized_data = dict(data)
-            hit_type = str(hit.get("type") or normalized_data.get("type") or "person")
+            hit_type = str(hit.get("type") or normalized_data.get("type") or "unknown")
 
-            if search_type == "company" and hit_type == "person":
-                continue
             if search_type == "person" and hit_type == "company" and not normalized_data.get("surname_ru"):
                 continue
 
@@ -2394,8 +2439,8 @@ class CompanyWebApp:
             if normalized_data.get("gender") and not normalized_data.get("appeal"):
                 normalized_data["appeal"] = "Г-н" if normalized_data["gender"] == "М" else "Г-жа"
 
-            if not normalized_data.get("surname_ru") and hit.get("data", {}).get("name"):
-                full_name = self._normalize_spaces(str(hit.get("data", {}).get("name", "")))
+            if not normalized_data.get("surname_ru") and hit.get("name"):
+                full_name = self._normalize_spaces(str(hit.get("name", "")))
                 parts = [part for part in full_name.split() if part]
                 if len(parts) >= 1:
                     normalized_data["surname_ru"] = parts[0]
@@ -2409,7 +2454,7 @@ class CompanyWebApp:
                 fio_lower = self._normalize_spaces(fio_ru.lower())
                 surname = self._normalize_spaces(str(normalized_data.get("surname_ru", "")).lower())
                 if not (any(word in surname for word in query_words) or all(word in fio_lower for word in query_words)):
-                    continue
+                    logger.debug("Кандидат %d: частичное совпадение ФИО", idx)
 
             score = self._score_hit({"source": hit.get("source", ""), "data": normalized_data}, query)
             candidates.append({
@@ -2437,7 +2482,7 @@ class CompanyWebApp:
             item["score"] = f"{float(item['score']):.2f}"
         if ranked:
             logger.info("Top candidate: %s", ranked[0].get("fio_ru", ""))
-        logger.info("Кандидаты после фильтрации: %d (режим: %s)", len(ranked), search_type or "auto")
+        logger.info("Кандидаты после фильтрации: %d из %d (режим: %s)", len(ranked), len(hits), search_type or "auto")
         return ranked
 
     def _normalize_position_ru(self, position: str) -> str:
@@ -2607,28 +2652,36 @@ class CompanyWebApp:
         trace = [f"Поиск по компании: {company_name}"]
         hits: list[dict[str, Any]] = []
         input_type = INPUT_TYPE_ORG_TEXT
-        providers = self._provider_chain(input_type, company_name)
+        normalized_name, _ = self.normalize_ru_org(company_name)
+        trace.append(f"Нормализовано: {normalized_name}")
+        providers = self._provider_chain(input_type, normalized_name)
 
         for provider in providers:
             if not self._should_call_provider(provider, input_type):
                 continue
             trace.append(f"Запрос к источнику: {provider['name']}")
-            data = self._call_provider_with_retry(provider, company_name, input_type, max_retries=0, search_type=search_type)
+            data = self._call_provider_with_retry(provider, normalized_name, input_type, max_retries=0, search_type=search_type)
             if data:
                 hits.extend({"source": provider["name"], "url": item.get("url", ""), "data": item, "type": item.get("type", "company")} for item in data)
                 trace.append(f"Найдено {len(data)} записей в {provider['name']}")
+                break
 
         if not hits:
             trace.append("Ничего не найдено, пробуем альтернативные написания")
             for alt_name in self._generate_company_name_variants(company_name):
-                trace.append(f"Попытка поиска по альтернативному написанию: {alt_name}")
+                if alt_name == company_name:
+                    continue
+                trace.append(f"Попытка: {alt_name}")
                 for provider in providers:
                     if not self._should_call_provider(provider, input_type):
                         continue
                     data = self._call_provider_with_retry(provider, alt_name, input_type, max_retries=0, search_type=search_type)
                     if data:
                         hits.extend({"source": provider["name"], "url": item.get("url", ""), "data": item, "type": item.get("type", "company")} for item in data)
-                        trace.append(f"Найдено {len(data)} записей по альтернативному написанию в {provider['name']}")
+                        trace.append(f"Найдено {len(data)} записей по '{alt_name}'")
+                        break
+                if hits:
+                    break
         return hits, trace
 
     def _search_by_criteria(self, params: dict[str, str]) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[str]]:
@@ -2727,6 +2780,14 @@ class CompanyWebApp:
         inn = (query.get("inn") or [""])[0].strip()
         company = (query.get("company") or [""])[0].strip()
         search_type = (query.get("search_type") or [""])[0].strip()
+
+        if not search_type:
+            if surname or name or middle_name:
+                search_type = "person"
+            elif company:
+                search_type = "company"
+            else:
+                search_type = ""
 
         if q and not any([surname, name, middle_name, inn, company]):
             input_type = self.detect_input_type(q)
