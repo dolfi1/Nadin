@@ -877,7 +877,7 @@ class CompanyWebApp:
             with ThreadPoolExecutor(max_workers=min(5, len(active_providers))) as executor:
                 futures = {executor.submit(load_provider, provider): provider for provider in active_providers}
                 try:
-                    for future in as_completed(futures, timeout=5):
+                    for future in as_completed(futures, timeout=60):
                         provider = futures[future]
                         try:
                             provider_name, provider_hits, state = future.result()
@@ -890,7 +890,7 @@ class CompanyWebApp:
                             trace.append(f"Источник: {provider['name']} — {reason}")
                             hits_by_provider[provider["name"]] = 0
                 except FuturesTimeoutError:
-                    trace.append("Источники: global_timeout (5s)")
+                    trace.append("Источники: global_timeout (60s)")
                     for future, provider in futures.items():
                         if not future.done():
                             trace.append(f"Источник: {provider['name']} — global_timeout")
@@ -1190,6 +1190,7 @@ class CompanyWebApp:
 
     def _search_rusprofile(self, query: str, is_person: bool = False) -> list[dict[str, str]]:
         search_url = f"https://www.rusprofile.ru/search?query={quote(query)}"
+        logger.debug("rusprofile URL: %s", search_url)
         logger.info("rusprofile search: %s", search_url)
         html = self._fetch_page(search_url, timeout=5, max_retries=0)
         if not html:
@@ -2224,6 +2225,16 @@ class CompanyWebApp:
                 normalized_data["middle_name_en"] = self._translit(str(normalized_data["middle_name_ru"]))
             if normalized_data.get("gender") and not normalized_data.get("appeal"):
                 normalized_data["appeal"] = "Г-н" if normalized_data["gender"] == "М" else "Г-жа"
+
+            if not normalized_data.get("surname_ru") and hit.get("data", {}).get("name"):
+                full_name = self._normalize_spaces(str(hit.get("data", {}).get("name", "")))
+                parts = [part for part in full_name.split() if part]
+                if len(parts) >= 1:
+                    normalized_data["surname_ru"] = parts[0]
+                if len(parts) >= 2:
+                    normalized_data["name_ru"] = parts[1]
+                if len(parts) >= 3:
+                    normalized_data["middle_name_ru"] = parts[2]
 
             fio_ru = " ".join(x for x in [normalized_data.get("surname_ru", ""), normalized_data.get("name_ru", ""), normalized_data.get("middle_name_ru", "")] if x).strip()
             if query_words and fio_ru:
