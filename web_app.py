@@ -1027,8 +1027,9 @@ class CompanyWebApp:
             "captcha" in response_text_lower
             or "доступ ограничен" in response_text_lower
             or "block" in response_text_lower
+            or "браузер не подходит" in response_text_lower
             or "проверка" in response_text_lower
-            or response_length < 1000
+            or response_length < 5000
         )
 
     def _fetch_page(self, url: str, timeout: int = 15, max_retries: int = 3) -> str | None:
@@ -1146,6 +1147,12 @@ class CompanyWebApp:
             if "json" not in content_type and "javascript" not in content_type:
                 return None
             data = resp.json()
+            logger.debug("ФНС ЕГРЮЛ сырые данные: %s", json.dumps(data, ensure_ascii=False)[:500])
+
+            if not data.get("СвЮЛ") and not data.get("company"):
+                logger.warning("ФНС ЕГРЮЛ вернул пустую структуру для INN=%s", query)
+                return None
+
             sv_yul = data.get("СвЮЛ") or {}
             company = data.get("company") or {}
             ru_org_raw = (
