@@ -175,7 +175,7 @@ class CompanyWebApp:
         self._positive_cache_ttl = 30 * 24 * 60 * 60
         self._negative_cache_ttl = 4 * 60 * 60
         self._domain_last_call: dict[str, float] = {}
-        self._domain_throttle_seconds = 3
+        self._domain_throttle_seconds = 10
         self._active_searches: dict[str, float] = {}
         self._autofill_result_cache: dict[str, dict[str, Any]] = {}
         self._last_search_time: dict[str, float] = {}
@@ -670,9 +670,7 @@ class CompanyWebApp:
             logger.warning("Provider %s failed for %s: %s", provider.get("name"), raw, str(exc))
 
         if provider.get("kind") in {"rusprofile", "rusprofile_enhanced"}:
-            if not no_cache:
-                self._set_cache(cache_key, [], ttl=self._negative_cache_ttl)
-                logger.info("Кэш сохранен для %s", cache_key)
+            logger.info("Не кэшируем пустой результат от %s (возможна капча)", provider.get("name"))
             return []
 
         fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn, search_type=search_type)
@@ -744,6 +742,12 @@ class CompanyWebApp:
         search_type: str = "",
     ) -> list[dict[str, Any]]:
         fallback_providers = self._get_fallback_providers(provider, query, input_type)
+        if provider.get("kind") in {"rusprofile", "rusprofile_enhanced"}:
+            fallback_providers = [
+                fallback
+                for fallback in fallback_providers
+                if fallback.get("kind") not in {"rusprofile", "rusprofile_enhanced"}
+            ]
         hits: list[dict[str, Any]] = []
         normalized_query = self._normalize_spaces(query).lower()
         for fallback in fallback_providers:
@@ -974,14 +978,10 @@ class CompanyWebApp:
             time.sleep(wait_for)
         self._domain_last_call[host] = time.time()
 
-    def _fetch_page(self, url: str, timeout: int = 10, max_retries: int = 3) -> str | None:
-        self._domain_throttle(url)
-        if not self._is_localhost(url):
-            time.sleep(random.uniform(1.0, 3.0))
     def _fetch_page(self, url: str, timeout: int = 5, max_retries: int = 3) -> str | None:
         self._domain_throttle(url)
         if not self._is_localhost(url):
-            time.sleep(random.uniform(0.5, 2.5))
+            time.sleep(random.uniform(3.0, 7.0))
         attempts = max(1, max_retries)
         for attempt in range(attempts):
             try:
@@ -997,10 +997,15 @@ class CompanyWebApp:
                         continue
                     return None
                 status_code = getattr(response, "status_code", 200 if getattr(response, "ok", False) else 500)
+                response_text_lower = response.text.lower()
+                if (
+                    "captcha" in response_text_lower
+                    or "доступ ограничен" in response_text_lower
+                    or "block" in response_text_lower
+                ):
+                    logger.warning("%s returned captcha/block page", url)
+                    return None
                 if status_code == 200:
-                    if "captcha" in response.text.lower() or "доступ ограничен" in response.text.lower():
-                        logger.warning("%s returned captcha/block page", url)
-                        return None
                     return response.text
                 if status_code == 429:
                     wait_time = (attempt + 1) * 5
@@ -2786,8 +2791,24 @@ class CompanyWebApp:
                 search_type = "person"
             elif company:
                 search_type = "company"
+            elif q:
+                input_type = self.detect_input_type(q)
+                if input_type == INPUT_TYPE_PERSON_TEXT:
+                    search_type = "person"
+                elif input_type == INPUT_TYPE_ORG_TEXT:
+                    search_type = "company"
+                else:
+                    search_type = ""
             else:
                 search_type = ""
+
+        logger.info(
+            "Поиск: surname=%s, name=%s, company=%s, search_type=%s",
+            surname,
+            name,
+            company,
+            search_type or "auto",
+        )
 
         if q and not any([surname, name, middle_name, inn, company]):
             input_type = self.detect_input_type(q)
