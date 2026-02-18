@@ -10,6 +10,7 @@ import sqlite3
 import time
 import unicodedata
 import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from concurrent.futures import as_completed
@@ -110,6 +111,9 @@ def is_person_query(raw: str) -> bool:
     company_markers = {
         "ооо", "пао", "ао", "оао", "зао", "ип", "фгбу", "фгуп", "муп", "ltd", "llc", "inc", "corp", "company",
     }
+    company_keywords = ("банк", "холдинг", "group")
+    if any(keyword in value for keyword in company_keywords):
+        return False
     if any(re.search(rf"\b{marker}\b", value) for marker in company_markers):
         return False
     if re.fullmatch(r"\d{12}", value):
@@ -174,11 +178,13 @@ class CompanyWebApp:
         self._source_cache: dict[str, dict[str, Any]] = {}
         self._positive_cache_ttl = 30 * 24 * 60 * 60
         self._negative_cache_ttl = 4 * 60 * 60
+        self._negative_cache_ttl = 30 * 60
         self._domain_last_call: dict[str, float] = {}
         self._domain_throttle_seconds = 12
         self._active_searches: dict[str, float] = {}
         self._autofill_result_cache: dict[str, dict[str, Any]] = {}
         self._last_search_time: dict[str, float] = {}
+        self._endpoint_rate_limit: dict[str, list[float]] = defaultdict(list)
         self._add_enhanced_providers()
         self._add_osint_providers()
         self._init_db()
@@ -215,6 +221,8 @@ class CompanyWebApp:
                   payload_json TEXT NOT NULL,
                   expires_at REAL NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_cards_ru_org ON cards(ru_org);
+                CREATE INDEX IF NOT EXISTS idx_cards_inn ON cards(json_extract(data_json, '$.profile.inn'));
                 """
             )
             db.commit()
@@ -229,7 +237,10 @@ class CompanyWebApp:
             if path == "/" and method == "GET":
                 body, status, headers = self.search_page(query)
             elif path == "/autofill/review" and method == "POST":
-                body, status, headers = self.autofill_review(form)
+                if self._rate_limited(environ, "autofill_review"):
+                    body, status, headers = "Rate limit exceeded", "429 Too Many Requests", [("Content-Type", "text/plain; charset=utf-8")]
+                else:
+                    body, status, headers = self.autofill_review(form)
             elif path == "/autofill/confirm" and method == "POST":
                 body, status, headers = self.autofill_confirm(form)
             elif path == "/create/manual" and method == "GET":
@@ -340,6 +351,8 @@ class CompanyWebApp:
         return match.group(1) if match else ""
 
     def _split_fio_ru(self, fio: str) -> tuple[str, str, str]:
+        if not fio or not fio.strip():
+            return "", "", ""
         parts = self._normalize_spaces(fio).split()
         if len(parts) >= 3:
             return parts[0].capitalize(), parts[1].capitalize(), parts[2].capitalize()
@@ -535,9 +548,7 @@ class CompanyWebApp:
     def _provider_chain(self, input_type: str, raw: str) -> list[dict[str, Any]]:
         if input_type == INPUT_TYPE_PERSON_TEXT:
             names = ["rusprofile.ru", "ФНС ЕГРЮЛ", "list-org.com"]
-            provider_map = {provider["name"]: provider for provider in self.SOURCE_PROVIDERS}
-            return [provider_map[name] for name in names if name in provider_map]
-        if self._is_foreign_query(raw):
+        elif self._is_foreign_query(raw):
             names = [
                 "OpenCorporates",
                 "OffshoreLeaks",
@@ -579,7 +590,21 @@ class CompanyWebApp:
                 "Банк России",
             ]
         provider_map = {provider["name"]: provider for provider in self.SOURCE_PROVIDERS}
-        return [provider_map[name] for name in names if name in provider_map]
+        selected = [provider_map[name] for name in names if name in provider_map]
+        random.shuffle(selected)
+        return selected
+
+    def _rate_limited(self, environ: dict[str, Any], endpoint: str, limit: int = 8, window_seconds: int = 60) -> bool:
+        client = environ.get("REMOTE_ADDR", "unknown")
+        key = f"{endpoint}:{client}"
+        now = time.time()
+        samples = [stamp for stamp in self._endpoint_rate_limit[key] if now - stamp < window_seconds]
+        if len(samples) >= limit:
+            self._endpoint_rate_limit[key] = samples
+            return True
+        samples.append(now)
+        self._endpoint_rate_limit[key] = samples
+        return False
 
     def _get_cache(self, cache_key: str) -> list[dict[str, Any]] | None:
         cached = self._source_cache.get(cache_key)
@@ -710,6 +735,9 @@ class CompanyWebApp:
             return self._collect_rusprofile_profiles(raw, input_type, is_person=person_query, search_type=search_type)
         if kind == "kontur":
             return self._parse_kontur(raw)
+        if kind in {"yandex_people", "offshoreleaks", "checko", "zachestnyibiznes", "sherlock", "maigret", "holehe", "theharvester"}:
+            url = provider.get("url_template", "").format(inn=inn or "", query=quote(raw))
+            return self._parse_generic_osint(url, provider.get("name", kind))
         if kind == "open_corporates" and inn:
             url = provider.get("url_template", "").format(inn=inn)
             return self._parse_open_corporates(url)
@@ -749,8 +777,13 @@ class CompanyWebApp:
                 if fallback.get("kind") not in {"rusprofile", "rusprofile_enhanced"}
             ]
         hits: list[dict[str, Any]] = []
+        seen_fallbacks: set[str] = set()
         normalized_query = self._normalize_spaces(query).lower()
         for fallback in fallback_providers:
+            fallback_id = f"{fallback.get('name', '')}:{fallback.get('kind', '')}"
+            if fallback_id in seen_fallbacks:
+                continue
+            seen_fallbacks.add(fallback_id)
             fallback_cache_key = f"provider:{fallback.get('name', '')}:{input_type}:{normalized_query}:{search_type}"
             try:
                 cached_hits = self._get_cache(fallback_cache_key)
@@ -831,11 +864,20 @@ class CompanyWebApp:
 
     def _add_osint_providers(self) -> None:
         osint_providers = [
-            {"name": "open-corporates", "kind": "open_corporates", "url_template": "https://opencorporates.com/companies/ru_{inn}", "supports_inn": True, "supports_name": True, "priority": 5},
-            {"name": "sparks", "kind": "sparks", "url_template": "https://sparks.ru/company/{inn}", "supports_inn": True, "supports_name": True, "priority": 6},
-            {"name": "sbis", "kind": "sbis", "url_template": "https://sbis.ru/contragents/{inn}", "supports_inn": True, "supports_name": True, "priority": 7},
-            {"name": "kontur_focus", "kind": "kontur_focus", "url_template": "https://focus.kontur.ru/entity/{inn}", "supports_inn": True, "supports_name": True, "priority": 8},
-            {"name": "banki_ru", "kind": "banki_ru", "url_template": "https://www.banki.ru/company/{inn}/", "supports_inn": True, "supports_name": False, "priority": 9},
+            {"name": "open-corporates", "kind": "open_corporates", "url_template": "https://opencorporates.com/companies/ru_{inn}", "supports_inn": True, "supports_name": True, "priority": 50},
+            {"name": "sparks", "kind": "sparks", "url_template": "https://sparks.ru/company/{inn}", "supports_inn": True, "supports_name": True, "priority": 50},
+            {"name": "sbis", "kind": "sbis", "url_template": "https://sbis.ru/contragents/{inn}", "supports_inn": True, "supports_name": True, "priority": 50},
+            {"name": "kontur_focus", "kind": "kontur_focus", "url_template": "https://focus.kontur.ru/entity/{inn}", "supports_inn": True, "supports_name": True, "priority": 50},
+            {"name": "banki_ru", "kind": "banki_ru", "url_template": "https://www.banki.ru/company/{inn}/", "supports_inn": True, "supports_name": False, "priority": 50},
+            {"name": "Yandex People", "kind": "yandex_people", "url_template": "https://yandex.ru/search/?text={query}%20site%3Arupep.org", "supports_inn": False, "supports_name": True, "priority": 50},
+            {"name": "OffshoreLeaks", "kind": "offshoreleaks", "url_template": "https://offshoreleaks.icij.org/search?q={query}", "supports_inn": True, "supports_name": True, "priority": 50},
+            {"name": "checko.ru", "kind": "checko", "url_template": "https://checko.ru/search/quick?query={query}", "supports_inn": True, "supports_name": True, "priority": 50},
+            {"name": "zachestnyibiznes.ru", "kind": "zachestnyibiznes", "url_template": "https://zachestnyibiznes.ru/search?query={query}", "supports_inn": True, "supports_name": True, "priority": 50},
+            {"name": "list-org.com", "kind": "list_org_enhanced", "supports_inn": True, "supports_name": True, "priority": 50},
+            {"name": "sherlock", "kind": "sherlock", "url_template": "https://github.com/sherlock-project/sherlock/search?q={query}", "supports_inn": False, "supports_name": True, "priority": 50},
+            {"name": "maigret", "kind": "maigret", "url_template": "https://github.com/soxoj/maigret/search?q={query}", "supports_inn": False, "supports_name": True, "priority": 50},
+            {"name": "holehe", "kind": "holehe", "url_template": "https://github.com/megadose/holehe/search?q={query}", "supports_inn": False, "supports_name": True, "priority": 50},
+            {"name": "theHarvester", "kind": "theharvester", "url_template": "https://github.com/laramies/theHarvester/search?q={query}", "supports_inn": False, "supports_name": True, "priority": 50},
         ]
         for provider in osint_providers:
             provider.setdefault("supports_url", False)
@@ -978,7 +1020,18 @@ class CompanyWebApp:
             time.sleep(wait_for)
         self._domain_last_call[host] = time.time()
 
-    def _fetch_page(self, url: str, timeout: int = 5, max_retries: int = 3) -> str | None:
+    def _is_captcha_or_block(self, response_text: str) -> bool:
+        response_text_lower = response_text.lower()
+        response_length = len(response_text)
+        return (
+            "captcha" in response_text_lower
+            or "доступ ограничен" in response_text_lower
+            or "block" in response_text_lower
+            or "проверка" in response_text_lower
+            or response_length < 1000
+        )
+
+    def _fetch_page(self, url: str, timeout: int = 15, max_retries: int = 3) -> str | None:
         self._domain_throttle(url)
         if not self._is_localhost(url):
             time.sleep(random.uniform(3.0, 7.0))
@@ -993,13 +1046,7 @@ class CompanyWebApp:
                 response_text_lower = response_text.lower()
                 response_length = len(response_text)
                 logger.info("Fetched %s status=%d len=%d", url, status_code, response_length)
-                if (
-                    "captcha" in response_text_lower
-                    or "доступ ограничен" in response_text_lower
-                    or "block" in response_text_lower
-                    or "проверка" in response_text_lower
-                    or response_length < 1000
-                ):
+                if self._is_captcha_or_block(response_text):
                     logger.warning("%s returned captcha/block page (content check, len=%d)", url, response_length)
                     return None
                 if status_code == 200:
@@ -1011,20 +1058,15 @@ class CompanyWebApp:
                     continue
                 logger.error("Failed to fetch %s, status code: %d", url, status_code)
                 return None
-            except requests.exceptions.SSLError as exc:
+            except requests.exceptions.RequestException as exc:
                 logger.warning("SSL error for %s (attempt %d/%d): %s", url, attempt + 1, attempts, exc)
                 if attempt < attempts - 1:
-                    time.sleep((attempt + 1) * 2)
-                    continue
-            except requests.exceptions.ConnectionError as exc:
-                logger.warning("Connection error for %s (attempt %d/%d): %s", url, attempt + 1, attempts, exc)
-                if attempt < attempts - 1:
-                    time.sleep((attempt + 1) * 2)
+                    time.sleep(2 ** (attempt + 1))
                     continue
             except Exception as exc:  # noqa: BLE001
                 logger.error("Fetch failed for %s (attempt %d/%d): %s", url, attempt + 1, attempts, exc)
                 if attempt < attempts - 1:
-                    time.sleep((attempt + 1) * 2)
+                    time.sleep(2 ** (attempt + 1))
                     continue
 
 
