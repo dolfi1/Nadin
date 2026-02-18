@@ -176,6 +176,9 @@ class CompanyWebApp:
         self._negative_cache_ttl = 4 * 60 * 60
         self._domain_last_call: dict[str, float] = {}
         self._domain_throttle_seconds = 3
+        self._active_searches: dict[str, float] = {}
+        self._autofill_result_cache: dict[str, dict[str, Any]] = {}
+        self._last_search_time: dict[str, float] = {}
         self._add_enhanced_providers()
         self._add_osint_providers()
         self._init_db()
@@ -387,16 +390,23 @@ class CompanyWebApp:
         rows = ""
         for field, label in CARD_FIELDS:
             value = profile.get(field, "")
-            source = field_sources.get(field, "—") if value else "Нужно заполнить"
-            status = "Заполнено" if value else "Нужно заполнить"
+            normalized_value = self._normalize_spaces(str(value))
+            if normalized_value:
+                source = field_sources.get(field, "—")
+                status = "Заполнено"
+            else:
+                source = "—"
+                status = "Нужно заполнить"
             if field == "revenue_mln":
                 source = field_sources.get("revenue_mln", field_sources.get("revenue", "Источник"))
                 status = "Справочно"
-            if field == "gender" and value:
+            if field == "gender" and normalized_value:
                 source = field_sources.get(field, "Автоопределение")
-            if field == "en_org" and value:
+            if field == "en_org" and normalized_value:
                 source = field_sources.get(field, "Транслитерация из RU")
-            rows += f"<tr><td>{label}</td><td>{escape(value)}</td><td>{source}</td><td>{status}</td></tr>"
+            if not normalized_value and field in {"surname_ru", "name_ru", "ru_org"}:
+                logger.warning("Поле %s пустое в профиле", field)
+            rows += f"<tr><td>{label}</td><td>{escape(str(value))}</td><td>{source}</td><td>{status}</td></tr>"
         return f"<table border='1' cellpadding='6' cellspacing='0'><tr><th>Поле</th><th>Значение</th><th>Источник</th><th>Статус</th></tr>{rows}</table>"
 
     def normalize_ru_org(self, raw: str) -> tuple[str, list[str]]:
@@ -645,6 +655,7 @@ class CompanyWebApp:
         if not no_cache:
             cached_hits = self._get_cache(cache_key)
             if cached_hits is not None:
+                logger.info("Кэш найден для %s", cache_key)
                 return cached_hits
 
         try:
@@ -653,6 +664,7 @@ class CompanyWebApp:
                 normalized_hits = hits if isinstance(hits, list) else [hits]
                 if not no_cache:
                     self._set_cache(cache_key, normalized_hits, ttl=self._positive_cache_ttl)
+                    logger.info("Кэш сохранен для %s", cache_key)
                 return hits
         except Exception as exc:  # noqa: BLE001
             logger.warning("Provider %s failed for %s: %s", provider.get("name"), raw, str(exc))
@@ -660,21 +672,25 @@ class CompanyWebApp:
         if provider.get("kind") in {"rusprofile", "rusprofile_enhanced"}:
             if not no_cache:
                 self._set_cache(cache_key, [], ttl=self._negative_cache_ttl)
+                logger.info("Кэш сохранен для %s", cache_key)
             return []
 
         fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn, search_type=search_type)
         if not fallback_hits:
             if not no_cache:
                 self._set_cache(cache_key, [], ttl=self._negative_cache_ttl)
+                logger.info("Кэш сохранен для %s", cache_key)
             return []
         if provider.get("kind") == "egrul":
             result = fallback_hits[0].get("data", {})
             if not no_cache:
                 self._set_cache(cache_key, [result], ttl=self._positive_cache_ttl)
+                logger.info("Кэш сохранен для %s", cache_key)
             return result
         result_list = [hit.get("data", {}) for hit in fallback_hits]
         if not no_cache:
             self._set_cache(cache_key, result_list, ttl=self._positive_cache_ttl)
+            logger.info("Кэш сохранен для %s", cache_key)
         return result_list
 
     def _fetch_from_provider(
@@ -729,8 +745,19 @@ class CompanyWebApp:
     ) -> list[dict[str, Any]]:
         fallback_providers = self._get_fallback_providers(provider, query, input_type)
         hits: list[dict[str, Any]] = []
+        normalized_query = self._normalize_spaces(query).lower()
         for fallback in fallback_providers:
+            fallback_cache_key = f"provider:{fallback.get('name', '')}:{input_type}:{normalized_query}:{search_type}"
             try:
+                cached_hits = self._get_cache(fallback_cache_key)
+                if cached_hits is not None:
+                    logger.info("Кэш найден для fallback %s", fallback_cache_key)
+                    fallback_hits = [{"source": fallback["name"], "url": item.get("url", ""), "data": item} for item in cached_hits if item]
+                    if fallback_hits:
+                        hits.extend(fallback_hits)
+                        break
+                    continue
+
                 logger.info("Trying fallback provider %s for %s", fallback["name"], query)
                 fallback_result = self._fetch_from_provider(fallback, query, input_type, inn, search_type=search_type)
                 fallback_hits: list[dict[str, Any]] = []
@@ -739,9 +766,11 @@ class CompanyWebApp:
                 elif isinstance(fallback_result, dict) and fallback_result:
                     fallback_hits = [{"source": fallback["name"], "url": fallback_result.get("url", ""), "data": fallback_result}]
                 if fallback_hits:
+                    self._set_cache(fallback_cache_key, [hit.get("data", {}) for hit in fallback_hits], ttl=self._positive_cache_ttl)
                     hits.extend(fallback_hits)
                     logger.info("Successfully retrieved %d results from %s", len(fallback_hits), fallback["name"])
                     break
+                self._set_cache(fallback_cache_key, [], ttl=self._negative_cache_ttl)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Fallback provider %s failed: %s", fallback["name"], str(exc))
         return hits
@@ -863,6 +892,13 @@ class CompanyWebApp:
 
     def _search_external_sources(self, raw: str, no_cache: bool = False, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
         input_type = self.detect_input_type(raw)
+        request_key = f"{input_type}:{raw.lower()}"
+        last_started = self._last_search_time.get(request_key)
+        if last_started is not None:
+            time_diff = time.time() - last_started
+            if time_diff < 10:
+                logger.warning("Дубликат запроса %s через %.1f сек", request_key, time_diff)
+        self._last_search_time[request_key] = time.time()
         logger.info("🔍 НАЧАЛО ПОИСКА: '%s' (Тип: %s, Режим: %s)", raw, input_type, search_type or "auto")
         hits: list[dict[str, Any]] = []
         trace: list[str] = [f"1. Тип ввода: {input_type}", f"2. Ключ поиска: {raw}"]
@@ -942,12 +978,24 @@ class CompanyWebApp:
         self._domain_throttle(url)
         if not self._is_localhost(url):
             time.sleep(random.uniform(1.0, 3.0))
+    def _fetch_page(self, url: str, timeout: int = 5, max_retries: int = 3) -> str | None:
+        self._domain_throttle(url)
+        if not self._is_localhost(url):
+            time.sleep(random.uniform(0.5, 2.5))
         attempts = max(1, max_retries)
         for attempt in range(attempts):
             try:
                 headers = self._get_random_headers(self._get_random_user_agent())
                 proxies = self._get_random_proxy() if attempt > 0 else None
                 response = requests.get(url, timeout=timeout, headers=headers, verify=True, allow_redirects=True, proxies=proxies)
+                try:
+                    response = requests.get(url, timeout=timeout, headers=headers, proxies=proxies, verify=True)
+                except requests.exceptions.SSLError as ssl_exc:
+                    logger.warning("SSL error for %s (attempt %d): %s", url, attempt + 1, ssl_exc)
+                    if attempt < attempts - 1:
+                        time.sleep((attempt + 1) * 2)
+                        continue
+                    return None
                 status_code = getattr(response, "status_code", 200 if getattr(response, "ok", False) else 500)
                 if status_code == 200:
                     if "captcha" in response.text.lower() or "доступ ограничен" in response.text.lower():
@@ -2221,6 +2269,14 @@ class CompanyWebApp:
         profile = {field: "" for field, _ in CARD_FIELDS}
         field_sources: dict[str, str] = {}
 
+        for hit in source_hits:
+            data = hit.get("data", {})
+            source_name = hit.get("source", "unknown")
+            for field in ["surname_ru", "name_ru", "middle_name_ru", "gender"]:
+                if data.get(field) and not profile.get(field):
+                    profile[field] = str(data[field])
+                    field_sources[field] = source_name
+
         for field, _ in CARD_FIELDS:
             skip_person_noise = field in {"surname_ru", "name_ru", "middle_name_ru", "gender", "ru_position", "position"}
             value, source_name = self._pick_field_by_priority(field, source_hits, skip_person_noise=skip_person_noise)
@@ -2274,7 +2330,13 @@ class CompanyWebApp:
         if profile.get("surname_ru") or profile.get("name_ru"):
             profile["family_name"] = profile.get("family_name") or self._translit(profile.get("surname_ru", ""))
             profile["first_name"] = profile.get("first_name") or self._translit(profile.get("name_ru", ""))
-            profile["middle_name"] = profile.get("middle_name") or self._translit(profile.get("middle_name_ru", ""))
+            profile["middle_name_en"] = profile.get("middle_name_en") or self._translit(profile.get("middle_name_ru", ""))
+            if profile.get("family_name"):
+                field_sources.setdefault("family_name", "Транслитерация из Фамилия")
+            if profile.get("first_name"):
+                field_sources.setdefault("first_name", "Транслитерация из Имя")
+            if profile.get("middle_name_en"):
+                field_sources.setdefault("middle_name_en", "Транслитерация из Отчество")
 
         if input_type == INPUT_TYPE_PERSON_TEXT and not profile.get("surname_ru") and not profile.get("name_ru"):
             sur, nam, patr = self._split_fio_ru(raw_name)
@@ -2311,6 +2373,29 @@ class CompanyWebApp:
         profile["salutation"] = profile.get("appeal", "")
         profile["en_position"] = profile.get("position", "")
         profile = self._normalize_card_data(profile, field_sources)
+
+        for field, _ in CARD_FIELDS:
+            if profile.get(field):
+                continue
+            value, source_name = self._pick_field_by_priority(field, source_hits)
+            if value:
+                profile[field] = value
+                field_sources[field] = source_name
+
+        if not profile.get("appeal") and profile.get("gender"):
+            profile["appeal"] = self._derive_salutation(profile["gender"])
+            if profile["appeal"]:
+                field_sources.setdefault("appeal", "Автоопределение")
+
+        if not profile.get("family_name") and profile.get("surname_ru"):
+            profile["family_name"] = self._translit(profile["surname_ru"])
+            field_sources.setdefault("family_name", "Транслитерация из Фамилия")
+        if not profile.get("first_name") and profile.get("name_ru"):
+            profile["first_name"] = self._translit(profile["name_ru"])
+            field_sources.setdefault("first_name", "Транслитерация из Имя")
+        if not profile.get("middle_name_en") and profile.get("middle_name_ru"):
+            profile["middle_name_en"] = self._translit(profile["middle_name_ru"])
+            field_sources.setdefault("middle_name_en", "Транслитерация из Отчество")
 
         return profile, field_sources
 
@@ -2604,21 +2689,25 @@ class CompanyWebApp:
         source_hits: list[dict[str, Any]] = []
         candidates: list[dict[str, str]] = []
         search_type = params.get("search_type", "")
+        queried_providers: set[str] = set()
 
         if params.get("inn"):
             trace.append("Обнаружен ИНН в запросе")
             source_hits, source_trace = self._search_by_inn(params["inn"], search_type=search_type)
             trace.extend(source_trace)
+            queried_providers.update(hit.get("source", "") for hit in source_hits)
         elif search_type == "company":
             trace.append("Режим: ТОЛЬКО ОРГАНИЗАЦИИ (юр. лица)")
             if params.get("company"):
                 source_hits, source_trace = self._search_by_company(params["company"], search_type=search_type)
                 trace.extend(source_trace)
+                queried_providers.update(hit.get("source", "") for hit in source_hits)
             elif params.get("surname") or params.get("name"):
                 full_name = " ".join(filter(None, [params.get("surname", ""), params.get("name", "")]))
                 trace.append(f"ФИО интерпретировано как название компании: {full_name}")
                 source_hits, source_trace = self._search_by_company(full_name, search_type=search_type)
                 trace.extend(source_trace)
+                queried_providers.update(hit.get("source", "") for hit in source_hits)
         elif search_type == "person":
             trace.append("Режим: ТОЛЬКО ФИЗ. ЛИЦА")
             if params.get("surname") or params.get("name") or params.get("middle_name"):
@@ -2626,6 +2715,7 @@ class CompanyWebApp:
                 trace.append(f"Поиск по персоне: {full_name}")
                 source_hits, source_trace = self._search_by_person(full_name, search_type=search_type)
                 trace.extend(source_trace)
+                queried_providers.update(hit.get("source", "") for hit in source_hits)
                 candidates = self._build_person_candidates(source_hits, full_name, search_type=search_type)
         else:
             trace.append("Режим: АВТО (физ. + юр. лица)")
@@ -2634,6 +2724,7 @@ class CompanyWebApp:
                 trace.append(f"Обнаружено ФИО в запросе: {full_name}")
                 source_hits, source_trace = self._search_by_person(full_name, search_type=search_type)
                 trace.extend(source_trace)
+                queried_providers.update(hit.get("source", "") for hit in source_hits)
                 if params.get("company"):
                     source_hits = [
                         hit
@@ -2646,6 +2737,21 @@ class CompanyWebApp:
                 trace.append(f"Поиск по названию компании: {params['company']}")
                 source_hits, source_trace = self._search_by_company(params["company"], search_type=search_type)
                 trace.extend(source_trace)
+                queried_providers.update(hit.get("source", "") for hit in source_hits)
+
+        dedup_hits: list[dict[str, Any]] = []
+        seen_hits: set[tuple[str, str]] = set()
+        for hit in source_hits:
+            source_name = str(hit.get("source", ""))
+            hit_key = (source_name, str(hit.get("url", "")) or json.dumps(hit.get("data", {}), ensure_ascii=False, sort_keys=True))
+            if hit_key in seen_hits:
+                logger.debug("Провайдер %s уже запрошен, пропускаем дубликат", source_name)
+                continue
+            seen_hits.add(hit_key)
+            dedup_hits.append(hit)
+        source_hits = dedup_hits
+        if queried_providers:
+            trace.append("Провайдеры в поиске: " + ", ".join(sorted(p for p in queried_providers if p)))
 
         if not candidates and source_hits:
             primary_query = params.get("inn") or params.get("company") or " ".join(
@@ -2746,80 +2852,99 @@ class CompanyWebApp:
         raw = self._get_one(form, "company_name")
         no_cache = self._get_one(form, "no_cache") == "1"
         input_type = self.detect_input_type(raw)
-        if self._get_one(form, "reset_inn_cache") == "1" and input_type == INPUT_TYPE_INN:
-            dropped = self._clear_cache_for_inn(self._extract_inn(raw))
-            reset_note = [f"Кэш по ИНН очищен: {dropped}"]
-        elif self._get_one(form, "reset_inn_cache") == "1" and input_type == INPUT_TYPE_PERSON_TEXT:
-            dropped = self._clear_cache_for_person(raw)
-            reset_note = [f"Кэш по персоне очищен: {dropped}"]
-        else:
-            reset_note = []
-        source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache)
-        search_trace = reset_note + search_trace
-        profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type)
+        normalized_raw = self._normalize_spaces(raw).lower()
+        cache_key = f"search:{input_type}:{normalized_raw}"
 
-        ru_org, ru_notes = self.normalize_ru_org(profile["ru_org"])
-        en_org, en_notes = self.normalize_en_org(profile["en_org"], ru_org, is_media=profile.get("is_media") in {True, "1", "true"}, is_ru_registered=profile.get("is_ru_registered") in {True, "1", "true"})
-        ru_pos, ru_pos_notes = self._normalize_positions_ru(profile.get("ru_position", ""))
-        en_pos, en_pos_notes = self._normalize_positions_en(profile.get("position", profile.get("en_position", "")))
-        profile["ru_org"] = ru_org
-        profile["en_org"] = en_org
-        profile["ru_position"] = ru_pos
-        profile["position"] = en_pos
-        profile["appeal"] = self._derive_salutation(profile.get("gender", ""))
-        notes = ru_notes + en_notes + ru_pos_notes + en_pos_notes
-        if source_hits:
-            notes.append(f"Источники: найдено {len(source_hits)}")
-        else:
-            notes.append("Источники: не получено (в источниках нет данных по запросу)")
+        cached_result = self._autofill_result_cache.get(cache_key)
+        if cached_result and time.time() < float(cached_result.get("expires_at", 0)):
+            logger.info("Используем кэш результата autofill для %s", raw)
+            return cached_result["response"]
 
-        field_statuses = self._field_statuses(profile, notes)
+        if cache_key in self._active_searches:
+            logger.info("Поиск уже выполняется для %s, используем последний кэш", raw)
+            if cached_result:
+                return cached_result["response"]
 
-        source_hidden = "".join(f"<input type='hidden' name='source_name' value='{escape(item['source'])}'/>" for item in source_hits)
-        trace_hidden = "".join(f"<input type='hidden' name='search_trace' value='{escape(step)}'/>" for step in search_trace)
-        field_source_hidden = "".join(
-            f"<input type='hidden' name='field_source_{escape(field)}' value='{escape(source)}'/>"
-            for field, source in field_sources.items()
-        )
-        profile_hidden = "".join(
-            f"<input type='hidden' name='profile_{escape(field)}' value='{escape(value)}'/>"
-            for field, value in profile.items()
-        )
-        hidden = "".join(f"<input type='hidden' name='notes' value='{escape(n)}'/>" for n in notes)
-        source_list = (
-            "<h3>Найдено в доступных источниках</h3><ul>"
-            + "".join(
-                f"<li>{escape(item['source'])}: {escape(item['data'].get('ru_org', '') or '/')} / </li>" for item in source_hits
+        self._active_searches[cache_key] = time.time()
+        try:
+            if self._get_one(form, "reset_inn_cache") == "1" and input_type == INPUT_TYPE_INN:
+                dropped = self._clear_cache_for_inn(self._extract_inn(raw))
+                reset_note = [f"Кэш по ИНН очищен: {dropped}"]
+            elif self._get_one(form, "reset_inn_cache") == "1" and input_type == INPUT_TYPE_PERSON_TEXT:
+                dropped = self._clear_cache_for_person(raw)
+                reset_note = [f"Кэш по персоне очищен: {dropped}"]
+            else:
+                reset_note = []
+            source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache)
+            search_trace = reset_note + search_trace
+            profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type)
+
+            ru_org, ru_notes = self.normalize_ru_org(profile["ru_org"])
+            en_org, en_notes = self.normalize_en_org(profile["en_org"], ru_org, is_media=profile.get("is_media") in {True, "1", "true"}, is_ru_registered=profile.get("is_ru_registered") in {True, "1", "true"})
+            ru_pos, ru_pos_notes = self._normalize_positions_ru(profile.get("ru_position", ""))
+            en_pos, en_pos_notes = self._normalize_positions_en(profile.get("position", profile.get("en_position", "")))
+            profile["ru_org"] = ru_org
+            profile["en_org"] = en_org
+            profile["ru_position"] = ru_pos
+            profile["position"] = en_pos
+            profile["appeal"] = self._derive_salutation(profile.get("gender", ""))
+            notes = ru_notes + en_notes + ru_pos_notes + en_pos_notes
+            if source_hits:
+                notes.append(f"Источники: найдено {len(source_hits)}")
+            else:
+                notes.append("Источники: не получено (в источниках нет данных по запросу)")
+
+            field_statuses = self._field_statuses(profile, notes)
+
+            source_hidden = "".join(f"<input type='hidden' name='source_name' value='{escape(item['source'])}'/>" for item in source_hits)
+            trace_hidden = "".join(f"<input type='hidden' name='search_trace' value='{escape(step)}'/>" for step in search_trace)
+            field_source_hidden = "".join(
+                f"<input type='hidden' name='field_source_{escape(field)}' value='{escape(source)}'/>"
+                for field, source in field_sources.items()
             )
-            + "</ul>"
-        ) if source_hits else "<p>В доступных источниках совпадений не найдено.</p>"
-        source_table_rows = self._render_profile(profile, field_sources, notes)
-        if any("автотранслит" in n.lower() for n in notes):
-            source_table_rows = "<div style='background:#fff7cc;padding:8px;border:1px solid #e0c95b'>⚠ Требуется ручная проверка перевода организации EN (автотранслит)</div>" + source_table_rows
-        search_trace_list = "<h3>Как происходил поиск</h3><ol>" + "".join(f"<li>{escape(step)}</li>" for step in search_trace) + "</ol>"
-        content = (
-            "<h2>Автосбор: черновик</h2>"
-            f"{source_list}"
-            f"{search_trace_list}"
-            "<h3>Карточка и источники по полям</h3>"
-            f"{source_table_rows}"
-            "<form method='post' action='/autofill/confirm'>"
-            f"<p>RU: <input name='ru_org' value='{escape(ru_org)}'/></p>"
-            f"<p>EN: <input name='en_org' value='{escape(en_org)}'/></p>"
-            f"<input type='hidden' name='input_value' value='{escape(raw)}'/>"
-            f"{hidden}{source_hidden}{trace_hidden}{field_source_hidden}{profile_hidden}"
-            "<button name='action' value='create'>✅ Создать карту</button>"
-            "<button name='action' value='edit'>✏️ Отредактировать</button>"
-            "<button name='action' value='cancel'>❌ Отмена</button></form>"
-            f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(raw)}'/><input type='hidden' name='no_cache' value='1'/><button>Повторить без кэша</button></form>"
-            + (
-                f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(raw)}'/><input type='hidden' name='reset_inn_cache' value='1'/><button>Сбросить кэш по ИНН</button></form>"
-                if input_type == INPUT_TYPE_INN
-                else ""
+            profile_hidden = "".join(
+                f"<input type='hidden' name='profile_{escape(field)}' value='{escape(value)}'/>"
+                for field, value in profile.items()
             )
-        )
-        body = self._page("Автосбор: черновик", content, back_href="/")
-        return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
+            hidden = "".join(f"<input type='hidden' name='notes' value='{escape(n)}'/>" for n in notes)
+            source_list = (
+                "<h3>Найдено в доступных источниках</h3><ul>"
+                + "".join(
+                    f"<li>{escape(item['source'])}: {escape(item['data'].get('ru_org', '') or '/')} / </li>" for item in source_hits
+                )
+                + "</ul>"
+            ) if source_hits else "<p>В доступных источниках совпадений не найдено.</p>"
+            source_table_rows = self._render_profile(profile, field_sources, notes)
+            if any("автотранслит" in n.lower() for n in notes):
+                source_table_rows = "<div style='background:#fff7cc;padding:8px;border:1px solid #e0c95b'>⚠ Требуется ручная проверка перевода организации EN (автотранслит)</div>" + source_table_rows
+            search_trace_list = "<h3>Как происходил поиск</h3><ol>" + "".join(f"<li>{escape(step)}</li>" for step in search_trace) + "</ol>"
+            content = (
+                "<h2>Автосбор: черновик</h2>"
+                f"{source_list}"
+                f"{search_trace_list}"
+                "<h3>Карточка и источники по полям</h3>"
+                f"{source_table_rows}"
+                "<form method='post' action='/autofill/confirm'>"
+                f"<p>RU: <input name='ru_org' value='{escape(ru_org)}'/></p>"
+                f"<p>EN: <input name='en_org' value='{escape(en_org)}'/></p>"
+                f"<input type='hidden' name='input_value' value='{escape(raw)}'/>"
+                f"{hidden}{source_hidden}{trace_hidden}{field_source_hidden}{profile_hidden}"
+                "<button name='action' value='create'>✅ Создать карту</button>"
+                "<button name='action' value='edit'>✏️ Отредактировать</button>"
+                "<button name='action' value='cancel'>❌ Отмена</button></form>"
+                f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(raw)}'/><input type='hidden' name='no_cache' value='1'/><button>Повторить без кэша</button></form>"
+                + (
+                    f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(raw)}'/><input type='hidden' name='reset_inn_cache' value='1'/><button>Сбросить кэш по ИНН</button></form>"
+                    if input_type == INPUT_TYPE_INN
+                    else ""
+                )
+            )
+            body = self._page("Автосбор: черновик", content, back_href="/")
+            response = (body, "200 OK", [("Content-Type", "text/html; charset=utf-8")])
+            self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+            return response
+        finally:
+            self._active_searches.pop(cache_key, None)
 
     def autofill_confirm(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         action = self._get_one(form, "action") or "create"
