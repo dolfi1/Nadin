@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import logging
 import io
 import json
@@ -8,6 +9,7 @@ import random
 import re
 import sqlite3
 import time
+import threading
 import unicodedata
 import uuid
 from collections import defaultdict
@@ -194,6 +196,7 @@ class CompanyWebApp:
         self._autofill_result_cache: dict[str, dict[str, Any]] = {}
         self._last_search_time: dict[str, float] = {}
         self._endpoint_rate_limit: dict[str, list[float]] = defaultdict(list)
+        self._thread_state = threading.local()
         self._add_enhanced_providers()
         self._add_osint_providers()
         self._init_db()
@@ -253,7 +256,7 @@ class CompanyWebApp:
             if path == "/" and method == "GET":
                 body, status, headers = self.search_page(query)
             elif path == "/autofill/review" and method == "POST":
-                if self._rate_limited(environ, "autofill_review"):
+                if self._rate_limited(environ, "autofill_review", limit=1, window_seconds=10):
                     body, status, headers = "Rate limit exceeded", "429 Too Many Requests", [("Content-Type", "text/plain; charset=utf-8")]
                 else:
                     body, status, headers = self.autofill_review(form)
@@ -724,6 +727,7 @@ class CompanyWebApp:
         no_cache: bool = False,
         search_type: str = "",
     ) -> list[dict[str, Any]] | dict[str, Any] | None:
+        self._thread_state.blocked_fetch = False
         normalized = self._normalize_spaces(raw)
         inn = self._extract_inn(raw) if input_type == INPUT_TYPE_INN else None
         cache_key = f"provider:{provider.get('name', '')}:{input_type}:{normalized.lower()}:{search_type}"
@@ -749,6 +753,9 @@ class CompanyWebApp:
 
         fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn, search_type=search_type)
         if not fallback_hits:
+            if getattr(self._thread_state, "blocked_fetch", False):
+                logger.warning("Provider %s returned captcha/block for '%s'; skip negative cache", provider.get("name", "unknown"), raw)
+                return None
             if not no_cache:
                 negative_ttl = self._negative_ttl_for_provider(provider)
                 if negative_ttl > 0:
@@ -994,6 +1001,12 @@ class CompanyWebApp:
 
     def _search_external_sources(self, raw: str, no_cache: bool = False, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
         input_type = self.detect_input_type(raw)
+        request_fingerprint = hashlib.sha1(f"{input_type}|{self._normalize_spaces(raw).lower()}|{search_type}|{int(no_cache)}".encode("utf-8")).hexdigest()
+        active_key = f"external:{request_fingerprint}"
+        if active_key in self._active_searches:
+            logger.warning("Пропущен дублирующийся активный запрос external:%s", request_fingerprint[:8])
+            return [], ["Источник: дублирующийся активный запрос пропущен"]
+        self._active_searches[active_key] = time.time()
         request_key = f"{input_type}:{raw.lower()}"
         last_started = self._last_search_time.get(request_key)
         if last_started is not None:
@@ -1031,41 +1044,44 @@ class CompanyWebApp:
                 return provider["name"], provider_hits, "provider_called_ok"
             return provider["name"], [], "provider_called_empty"
 
-        active_providers = [provider for provider in providers if self._should_call_provider(provider, input_type)]
-        if active_providers:
-            with ThreadPoolExecutor(max_workers=min(5, len(active_providers))) as executor:
-                futures = {executor.submit(load_provider, provider): provider for provider in active_providers}
-                try:
-                    for future in as_completed(futures, timeout=60):
-                        provider = futures[future]
-                        try:
-                            provider_name, provider_hits, state = future.result()
-                            if provider_hits:
-                                hits.extend(provider_hits)
-                            hits_by_provider[provider_name] = len(provider_hits)
-                            icon = "✅" if provider_hits else "❌"
-                            trace.append(f"{icon} Источник: {provider_name} — {state}")
-                        except Exception as exc:  # noqa: BLE001
-                            reason = self._handle_provider_error(provider.get("name", "unknown"), exc)
-                            trace.append(f"⚠️ Источник: {provider['name']} — {reason}")
-                            hits_by_provider[provider["name"]] = 0
-                except FuturesTimeoutError:
-                    trace.append("Источники: global_timeout (60s)")
-                    for future, provider in futures.items():
-                        if not future.done():
-                            trace.append(f"⚠️ Источник: {provider['name']} — global_timeout")
-                            hits_by_provider[provider["name"]] = 0
-        for provider in providers:
-            if not self._should_call_provider(provider, input_type):
-                continue
-            hits_by_provider.setdefault(provider["name"], 0)
+        try:
+            active_providers = [provider for provider in providers if self._should_call_provider(provider, input_type)]
+            if active_providers:
+                with ThreadPoolExecutor(max_workers=min(5, len(active_providers))) as executor:
+                    futures = {executor.submit(load_provider, provider): provider for provider in active_providers}
+                    try:
+                        for future in as_completed(futures, timeout=60):
+                            provider = futures[future]
+                            try:
+                                provider_name, provider_hits, state = future.result()
+                                if provider_hits:
+                                    hits.extend(provider_hits)
+                                hits_by_provider[provider_name] = len(provider_hits)
+                                icon = "✅" if provider_hits else "❌"
+                                trace.append(f"{icon} Источник: {provider_name} — {state}")
+                            except Exception as exc:  # noqa: BLE001
+                                reason = self._handle_provider_error(provider.get("name", "unknown"), exc)
+                                trace.append(f"⚠️ Источник: {provider['name']} — {reason}")
+                                hits_by_provider[provider["name"]] = 0
+                    except FuturesTimeoutError:
+                        trace.append("Источники: global_timeout (60s)")
+                        for future, provider in futures.items():
+                            if not future.done():
+                                trace.append(f"⚠️ Источник: {provider['name']} — global_timeout")
+                                hits_by_provider[provider["name"]] = 0
+            for provider in providers:
+                if not self._should_call_provider(provider, input_type):
+                    continue
+                hits_by_provider.setdefault(provider["name"], 0)
 
-        trace.append("hits_by_provider: " + ", ".join(f"{k}={v}" for k, v in hits_by_provider.items()))
-        hits.sort(key=lambda item: self._score_hit(item, raw), reverse=True)
-        if not hits:
-            trace.append("Источники: не получено")
-        logger.info("🏁 ПОИСК ЗАВЕРШЕН: Всего найдено %d записей (режим: %s)", len(hits), search_type or "auto")
-        return hits, trace
+            trace.append("hits_by_provider: " + ", ".join(f"{k}={v}" for k, v in hits_by_provider.items()))
+            hits.sort(key=lambda item: self._score_hit(item, raw), reverse=True)
+            if not hits:
+                trace.append("Источники: не получено")
+            logger.info("🏁 ПОИСК ЗАВЕРШЕН: Всего найдено %d записей (режим: %s)", len(hits), search_type or "auto")
+            return hits, trace
+        finally:
+            self._active_searches.pop(active_key, None)
 
     def _domain_throttle(self, url: str) -> None:
         host = urlparse(url).netloc.lower()
@@ -1080,17 +1096,23 @@ class CompanyWebApp:
     def _is_captcha_or_block(self, response_text: str) -> bool:
         response_text_lower = response_text.lower()
         response_length = len(response_text)
-        return (
-            "captcha" in response_text_lower
-            or "доступ ограничен" in response_text_lower
-            or "block" in response_text_lower
-            or "браузер не подходит" in response_text_lower
-            or "проверка" in response_text_lower
-            or response_length < 800
+        block_keywords = (
+            "captcha",
+            "доступ ограничен",
+            "block",
+            "браузер не подходит",
+            "проверка",
         )
+        if any(keyword in response_text_lower for keyword in block_keywords):
+            return True
+        if response_length < 5000:
+            meaningful_markers = ("<h1", "search-result", "/person/", "/id/", "инн")
+            return not any(marker in response_text_lower for marker in meaningful_markers)
+        return False
 
-    def _fetch_page(self, url: str, timeout: int = 20, max_retries: int = 5) -> str | None:
+    def _fetch_page(self, url: str, timeout: int = 15, max_retries: int = 5) -> str | None:
         self._domain_throttle(url)
+        timeout = max(15, timeout)
         if not self._is_localhost(url):
             time.sleep(random.uniform(3.0, 7.0))
         attempts = max(1, max_retries)
@@ -1109,6 +1131,7 @@ class CompanyWebApp:
                 response_length = len(response_text)
                 logger.info("Fetched %s status=%d len=%d", url, status_code, response_length)
                 if self._is_captcha_or_block(response_text):
+                    self._thread_state.blocked_fetch = True
                     logger.warning("%s returned captcha/block page (content check, len=%d)", url, response_length)
                     return None
                 if status_code == 200:
@@ -1298,7 +1321,7 @@ class CompanyWebApp:
     def _search_list_org(self, query: str, is_person: bool = False) -> list[dict[str, str]]:
         type_param = "fio" if is_person else "all"
         url = f"https://www.list-org.com/search?type={type_param}&name={quote(query)}"
-        logger.info("list-org search: %s", url)
+        logger.debug("list-org search: %s", url)
         html = self._fetch_page(url, timeout=5)
         if not html:
             return []
@@ -1398,12 +1421,12 @@ class CompanyWebApp:
 
         if search_type == "company":
             is_person = False
-            logger.info("rusprofile search (ORG ONLY): %s", search_url)
+            logger.debug("rusprofile search (ORG ONLY): %s", search_url)
         elif search_type == "person":
             is_person = True
-            logger.info("rusprofile search (PERSON ONLY): %s", search_url)
+            logger.debug("rusprofile search (PERSON ONLY): %s", search_url)
         else:
-            logger.info("rusprofile search (AUTO): %s", search_url)
+            logger.debug("rusprofile search (AUTO): %s", search_url)
 
         html = self._fetch_page(search_url, timeout=15, max_retries=2)
         if not html:
@@ -1800,7 +1823,7 @@ class CompanyWebApp:
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(parse_single_hit, hit): hit for hit in hits[:10]}
             try:
-                for future in as_completed(futures, timeout=30):
+                for future in as_completed(futures, timeout=60):
                     result = future.result()
                     if result:
                         profiles.append(result)
@@ -2538,14 +2561,23 @@ class CompanyWebApp:
     def _build_person_candidates(self, hits: list[dict[str, Any]], query: str = "", search_type: str = "") -> list[dict[str, str]]:
         candidates: list[dict[str, Any]] = []
         query_words = [w for w in self._normalize_spaces(query.lower()).split() if w]
-        logger.info("Построение кандидатов: %d хитов, query_words=%s, search_type=%s", len(hits), query_words, search_type)
+        logger.debug("Построение кандидатов: %d хитов, search_type=%s", len(hits), search_type)
 
         for idx, hit in enumerate(hits):
             data = hit.get("data", {})
             normalized_data = dict(data)
             hit_type = str(hit.get("type") or normalized_data.get("type") or "unknown")
 
-            if search_type == "person" and hit_type == "company" and not normalized_data.get("surname_ru"):
+            source_is_person = bool(
+                hit.get("person_source")
+                or normalized_data.get("person_source")
+                or hit_type == "person"
+            )
+            source_is_company = hit_type == "company"
+
+            if search_type == "person" and source_is_company:
+                continue
+            if search_type == "company" and source_is_person:
                 continue
 
             if normalized_data.get("ru_org"):
