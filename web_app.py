@@ -1043,12 +1043,31 @@ class CompanyWebApp:
             provider_hits: list[dict[str, Any]] = []
             if isinstance(data, list):
                 provider_hits = [
-                    {"source": provider["name"], "url": item.get("url", ""), "data": item}
+                    {
+                        "source": provider["name"],
+                        "url": item.get("url", ""),
+                        "data": item,
+                        "type": item.get("type", "company"),
+                    }
                     for item in data
                     if item
                 ]
             elif data:
-                provider_hits = [{"source": provider["name"], "url": data.get("url", ""), "data": data}]
+                provider_hits = [{
+                    "source": provider["name"],
+                    "url": data.get("url", ""),
+                    "data": data,
+                    "type": data.get("type", "company"),
+                }]
+
+            for hit in provider_hits:
+                hit_data = hit.get("data", {})
+                logger.debug(
+                    "Хит от %s: data keys=%s, ru_org=%s",
+                    provider["name"],
+                    list(hit_data.keys()) if isinstance(hit_data, dict) else "N/A",
+                    hit_data.get("ru_org") if isinstance(hit_data, dict) else "N/A",
+                )
 
             elapsed = time.perf_counter() - started
             logger.info("✅ %s нашел %d записей (%.2f сек)", provider["name"], len(provider_hits), elapsed)
@@ -1252,7 +1271,8 @@ class CompanyWebApp:
             if "json" not in content_type and "javascript" not in content_type:
                 return None
             data = resp.json()
-            logger.debug("ФНС ЕГРЮЛ сырые данные: %s", json.dumps(data, ensure_ascii=False)[:500])
+            logger.debug("ФНС ЕГРЮЛ сырые данные keys: %s", list(data.keys()))
+            logger.debug("ФНС ЕГРЮЛ ru_org_raw: %s", data.get("НаимСокр") or data.get("name"))
 
             if not any([data.get("СвЮЛ"), data.get("company"), data.get("name"), data.get("НаимСокр")]):
                 logger.warning("ФНС ЕГРЮЛ вернул пустую структуру для INN=%s", query)
@@ -2300,14 +2320,26 @@ class CompanyWebApp:
     ) -> tuple[dict[str, str], dict[str, str]]:
         profile = {field: "" for field, _ in CARD_FIELDS}
         field_sources: dict[str, str] = {}
+        logger.info("Построение профиля из %d хитов", len(source_hits))
 
-        for hit in source_hits:
+        for hit_idx, hit in enumerate(source_hits):
             data = hit.get("data", {})
             source_name = hit.get("source", "unknown")
-            for field in ["surname_ru", "name_ru", "middle_name_ru", "gender"]:
+            logger.debug(
+                "Хит %d от %s: data keys=%s, ru_org=%s, surname=%s",
+                hit_idx,
+                source_name,
+                list(data.keys()) if isinstance(data, dict) else "N/A",
+                data.get("ru_org", "") if isinstance(data, dict) else "N/A",
+                data.get("surname_ru", "") if isinstance(data, dict) else "N/A",
+            )
+            if not isinstance(data, dict):
+                continue
+            for field in ["surname_ru", "name_ru", "middle_name_ru", "gender", "ru_org", "inn", "ru_position"]:
                 if data.get(field) and not profile.get(field):
                     profile[field] = str(data[field])
                     field_sources[field] = source_name
+                    logger.info("Поле %s заполнено из %s", field, source_name)
 
         for field, _ in CARD_FIELDS:
             skip_person_noise = field in {"surname_ru", "name_ru", "middle_name_ru", "gender", "ru_position", "position"}
@@ -2651,6 +2683,7 @@ class CompanyWebApp:
                 },
             }
             hits = [sberbank_case] + hits
+            logger.info("Добавлен special case для Сбербанка")
 
         if search_type == "company":
             return hits
@@ -2674,6 +2707,14 @@ class CompanyWebApp:
     def _search_by_inn(self, inn: str, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
         trace = [f"Поиск по ИНН: {inn}"]
         hits, source_trace = self._search_external_sources(inn, no_cache=False, search_type=search_type)
+        for hit in hits:
+            data = hit.get("data", {})
+            logger.debug(
+                "Хит от %s: data keys=%s, ru_org=%s",
+                hit.get("source", "unknown"),
+                list(data.keys()) if isinstance(data, dict) else "N/A",
+                data.get("ru_org") if isinstance(data, dict) else "N/A",
+            )
         trace.extend(source_trace)
         return hits, trace
 
@@ -2698,7 +2739,20 @@ class CompanyWebApp:
             trace.append(f"Запрос к источнику: {provider['name']}")
             data = self._call_provider_with_retry(provider, normalized_name, input_type, max_retries=0, search_type=search_type)
             if data:
-                hits.extend({"source": provider["name"], "url": item.get("url", ""), "data": item, "type": item.get("type", "company")} for item in data)
+                for item in data:
+                    hit = {
+                        "source": provider["name"],
+                        "url": item.get("url", ""),
+                        "data": item,
+                        "type": item.get("type", "company"),
+                    }
+                    logger.debug(
+                        "Хит от %s: data keys=%s, ru_org=%s",
+                        provider["name"],
+                        list(item.keys()) if isinstance(item, dict) else "N/A",
+                        item.get("ru_org") if isinstance(item, dict) else "N/A",
+                    )
+                    hits.append(hit)
                 trace.append(f"Найдено {len(data)} записей в {provider['name']}")
                 break
 
@@ -2713,7 +2767,20 @@ class CompanyWebApp:
                         continue
                     data = self._call_provider_with_retry(provider, alt_name, input_type, max_retries=0, search_type=search_type)
                     if data:
-                        hits.extend({"source": provider["name"], "url": item.get("url", ""), "data": item, "type": item.get("type", "company")} for item in data)
+                        for item in data:
+                            hit = {
+                                "source": provider["name"],
+                                "url": item.get("url", ""),
+                                "data": item,
+                                "type": item.get("type", "company"),
+                            }
+                            logger.debug(
+                                "Хит от %s: data keys=%s, ru_org=%s",
+                                provider["name"],
+                                list(item.keys()) if isinstance(item, dict) else "N/A",
+                                item.get("ru_org") if isinstance(item, dict) else "N/A",
+                            )
+                            hits.append(hit)
                         trace.append(f"Найдено {len(data)} записей по '{alt_name}'")
                         break
                 if hits:
@@ -2931,6 +2998,10 @@ class CompanyWebApp:
             source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache)
             search_trace = reset_note + search_trace
             profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type)
+            if not profile.get("ru_org") and not profile.get("surname_ru") and not profile.get("name_ru"):
+                logger.error("Профиль пустой после построения из %d хитов!", len(source_hits))
+            filled_fields = [k for k, v in profile.items() if v and k not in {"title", "appeal"}]
+            logger.info("Заполненные поля профиля: %s", filled_fields)
 
             ru_org, ru_notes = self.normalize_ru_org(profile["ru_org"])
             en_org, en_notes = self.normalize_en_org(profile["en_org"], ru_org)
