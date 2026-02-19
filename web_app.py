@@ -60,6 +60,7 @@ RU_TO_EN_OPF = {
     "ЧУ": "PI",
 }
 EN_TO_RU_OPF = {v: k for k, v in RU_TO_EN_OPF.items()}
+SPECIAL_EN_ORG_NAMES = {"сбербанк": "Sberbank PJSC", "газпром": "Gazprom PJSC", "лукойл": "Lukoil PJSC"}
 FULL_RU_OPF = {
     "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ": "ООО",
     "ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО": "ПАО",
@@ -77,8 +78,6 @@ SOURCE_DOMAINS = {
     "egrul.nalog.ru": "ЕГРЮЛ",
     "www.rusprofile.ru": "rusprofile.ru",
     "rusprofile.ru": "rusprofile.ru",
-    "www.list-org.com": "list-org.com",
-    "list-org.com": "list-org.com",
     "zachestnyibiznes.ru": "zachestnyibiznes.ru",
     "focus.kontur.ru": "focus.kontur.ru",
     "checko.ru": "checko.ru",
@@ -100,7 +99,6 @@ SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "Банк России", "kind": "bank_russia", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": False, "priority": 3, "url_template": "https://cbr.ru/eng/banking_sector/credit/coinfo/?id={inn}"},
     {"name": "РБК Компании", "kind": "rbc", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": False, "priority": 4, "url_template": "https://companies.rbc.ru/search/?query={query}"},
     {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True, "priority": 5},
-    {"name": "list-org.com", "kind": "list_org", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": True, "priority": 6},
     {"name": "focus.kontur.ru", "kind": "kontur", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 8},
 ]
 
@@ -159,23 +157,20 @@ CARD_FIELDS: list[tuple[str, str]] = [
     ("en_org", "Organization"),
     ("ru_position", "Должность"),
     ("position", "Position"),
-    ("revenue_mln", "Выручка (млн руб)"),
-    ("is_media", "СМИ"),
-    ("is_ru_registered", "Зарегистрировано в РФ"),
 ]
 
 REQUIRED_FIELDS = ["surname_ru", "name_ru", "gender", "ru_org", "en_org", "ru_position", "en_position"]
-PROBLEMATIC_PROVIDERS = {"rusprofile", "rusprofile_enhanced", "list_org", "zachestnyibiznes"}
-NO_NEGATIVE_CACHE_KINDS = {"rusprofile", "rusprofile_enhanced", "list_org", "zachestnyibiznes"}
+PROBLEMATIC_PROVIDERS = {"rusprofile", "rusprofile_enhanced", "zachestnyibiznes"}
+NO_NEGATIVE_CACHE_KINDS = {"rusprofile", "rusprofile_enhanced", "zachestnyibiznes"}
 
 FIELD_PRIORITIES: dict[str, list[str]] = {
-    "surname_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "list-org.com", "focus.kontur.ru"],
-    "name_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "list-org.com", "focus.kontur.ru"],
-    "middle_name_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "list-org.com", "focus.kontur.ru"],
-    "gender": ["ФНС ЕГРЮЛ", "rusprofile.ru", "list-org.com"],
-    "ru_position": ["ФНС ЕГРЮЛ", "rusprofile.ru", "list-org.com", "focus.kontur.ru"],
+    "surname_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
+    "name_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
+    "middle_name_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
+    "gender": ["ФНС ЕГРЮЛ", "rusprofile.ru"],
+    "ru_position": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
     "position": ["ФНС ЕГРЮЛ"],
-    "ru_org": ["ФНС ЕГРЮЛ", "rusprofile.ru", "list-org.com", "focus.kontur.ru"],
+    "ru_org": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
     "en_org": ["ФНС ЕГРЮЛ"],
 }
 
@@ -187,11 +182,12 @@ class CompanyWebApp:
         self._source_cache: dict[str, dict[str, Any]] = {}
         self._positive_cache_ttl = 30 * 24 * 60 * 60
         self._negative_cache_ttl_reliable = 4 * 60 * 60
-        self._negative_cache_ttl_problematic = 5 * 60
+        self._negative_cache_ttl_problematic = 30 * 60
         self._provider_error_streak: dict[str, int] = defaultdict(int)
         self._provider_disabled_until: dict[str, float] = {}
         self._domain_last_call: dict[str, float] = {}
         self._domain_throttle_seconds = 12
+        self._rusprofile_throttle_range = (30, 60)
         self._active_searches: dict[str, float] = {}
         self._autofill_result_cache: dict[str, dict[str, Any]] = {}
         self._last_search_time: dict[str, float] = {}
@@ -200,6 +196,16 @@ class CompanyWebApp:
         self._add_enhanced_providers()
         self._add_osint_providers()
         self._init_db()
+        self._clear_provider_cache_pattern("list-org.com")
+        self._clear_provider_cache_pattern("list_org")
+
+    def _clear_provider_cache_pattern(self, pattern: str) -> None:
+        dropped = [k for k in self._source_cache if pattern.lower() in k.lower()]
+        for key in dropped:
+            self._source_cache.pop(key, None)
+        with self._connect() as db:
+            db.execute("DELETE FROM source_cache WHERE lower(cache_key) LIKE ?", (f"%{pattern.lower()}%",))
+            db.commit()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -530,12 +536,18 @@ class CompanyWebApp:
         if not cleaned:
             return "", notes
 
+        fallback_key = self._normalize_spaces(fallback_ru.lower())
+        for key, value in SPECIAL_EN_ORG_NAMES.items():
+            if key in fallback_key:
+                return value, notes
+
         cleaned = unicodedata.normalize("NFKD", cleaned)
         cleaned = "".join(ch for ch in cleaned if ord(ch) < 128)
         parts = cleaned.split()
         opf = ""
         if parts and parts[0].upper() in EN_TO_RU_OPF:
             opf, parts = parts[0].upper(), parts[1:]
+            notes.append("Organization EN: OPF moved to suffix")
         elif parts and parts[-1].upper() in EN_TO_RU_OPF:
             opf, parts = parts[-1].upper(), parts[:-1]
         else:
@@ -566,7 +578,7 @@ class CompanyWebApp:
 
     def _provider_chain(self, input_type: str, raw: str) -> list[dict[str, Any]]:
         if input_type == INPUT_TYPE_PERSON_TEXT:
-            names = ["rusprofile.ru", "ФНС ЕГРЮЛ", "list-org.com"]
+            names = ["rusprofile.ru", "ФНС ЕГРЮЛ", "Google Search", "Yandex Search", "LinkedIn", "Facebook"]
         elif input_type == INPUT_TYPE_INN:
             names = [
                 "ФНС ЕГРЮЛ",
@@ -574,7 +586,8 @@ class CompanyWebApp:
                 "Банк России",
                 "РБК Компании",
                 "rusprofile.ru",
-                "list-org.com",
+                "Google Search",
+                "Yandex Search",
                 "focus.kontur.ru",
                 "checko.ru",
                 "zachestnyibiznes.ru",
@@ -591,7 +604,6 @@ class CompanyWebApp:
         elif input_type == INPUT_TYPE_URL:
             names = [
                 "ФНС ЕГРЮЛ",
-                "list-org.com",
                 "OpenCorporates",
                 "OffshoreLeaks",
                 "rusprofile.ru",
@@ -602,7 +614,8 @@ class CompanyWebApp:
         else:
             names = [
                 "ФНС ЕГРЮЛ",
-                "list-org.com",
+                "Google Search",
+                "Yandex Search",
                 "OpenCorporates",
                 "OffshoreLeaks",
                 "rusprofile.ru",
@@ -787,8 +800,6 @@ class CompanyWebApp:
         if kind == "egrul":
             parsed = self._parse_egrul(inn or raw)
             return parsed
-        if kind in {"list_org", "list_org_enhanced"}:
-            return self._parse_list_org(raw)
         if kind in {"rusprofile", "rusprofile_enhanced"}:
             return self._collect_rusprofile_profiles(raw, input_type, is_person=person_query, search_type=search_type)
         if kind == "kontur":
@@ -796,7 +807,7 @@ class CompanyWebApp:
         if kind in {"bank_russia", "rbc"}:
             url = provider.get("url_template", "").format(inn=inn or "", query=quote(raw))
             return self._parse_generic_osint(url, provider.get("name", kind))
-        if kind in {"yandex_people", "offshoreleaks", "checko", "zachestnyibiznes", "sherlock", "maigret", "holehe", "theharvester"}:
+        if kind in {"google_search", "yandex_search", "linkedin_search", "facebook_search", "offshoreleaks", "checko", "zachestnyibiznes", "sherlock", "maigret", "holehe", "theharvester"}:
             url = provider.get("url_template", "").format(inn=inn or "", query=quote(raw))
             return self._parse_generic_osint(url, provider.get("name", kind))
         if kind == "open_corporates" and inn:
@@ -932,12 +943,14 @@ class CompanyWebApp:
             {"name": "sbis", "kind": "sbis", "url_template": "https://sbis.ru/contragents/{inn}", "supports_inn": True, "supports_name": True, "priority": 50},
             {"name": "kontur_focus", "kind": "kontur_focus", "url_template": "https://focus.kontur.ru/entity/{inn}", "supports_inn": True, "supports_name": True, "priority": 50},
             {"name": "banki_ru", "kind": "banki_ru", "url_template": "https://www.banki.ru/company/{inn}/", "supports_inn": True, "supports_name": False, "priority": 50},
-            {"name": "Yandex People", "kind": "yandex_people", "url_template": "https://yandex.ru/search/?text={query}%20site%3Arupep.org", "supports_inn": False, "supports_name": True, "priority": 50},
+            {"name": "Google Search", "kind": "google_search", "url_template": "https://www.google.com/search?q={query}", "supports_inn": True, "supports_name": True, "priority": 7},
+            {"name": "Yandex Search", "kind": "yandex_search", "url_template": "https://yandex.ru/search/?text={query}", "supports_inn": True, "supports_name": True, "priority": 7},
+            {"name": "LinkedIn", "kind": "linkedin_search", "url_template": "https://www.google.com/search?q=site%3Alinkedin.com%2Fin+{query}", "supports_inn": False, "supports_name": True, "priority": 9},
+            {"name": "Facebook", "kind": "facebook_search", "url_template": "https://www.google.com/search?q=site%3Afacebook.com+{query}", "supports_inn": False, "supports_name": True, "priority": 9},
             {"name": "OffshoreLeaks", "kind": "offshoreleaks", "url_template": "https://offshoreleaks.icij.org/search?q={query}", "supports_inn": True, "supports_name": True, "priority": 50},
             {"name": "checko.ru", "kind": "checko", "url_template": "https://checko.ru/search/quick?query={query}", "supports_inn": True, "supports_name": True, "priority": 50},
             {"name": "zachestnyibiznes.ru", "kind": "zachestnyibiznes", "url_template": "https://zachestnyibiznes.ru/search?query={query}", "supports_inn": True, "supports_name": True, "priority": 50},
-            {"name": "list-org.com", "kind": "list_org_enhanced", "supports_inn": True, "supports_name": True, "priority": 50},
-            {"name": "sherlock", "kind": "sherlock", "url_template": "https://github.com/sherlock-project/sherlock/search?q={query}", "supports_inn": False, "supports_name": True, "priority": 50},
+                        {"name": "sherlock", "kind": "sherlock", "url_template": "https://github.com/sherlock-project/sherlock/search?q={query}", "supports_inn": False, "supports_name": True, "priority": 50},
             {"name": "maigret", "kind": "maigret", "url_template": "https://github.com/soxoj/maigret/search?q={query}", "supports_inn": False, "supports_name": True, "priority": 50},
             {"name": "holehe", "kind": "holehe", "url_template": "https://github.com/megadose/holehe/search?q={query}", "supports_inn": False, "supports_name": True, "priority": 50},
             {"name": "theHarvester", "kind": "theharvester", "url_template": "https://github.com/laramies/theHarvester/search?q={query}", "supports_inn": False, "supports_name": True, "priority": 50},
@@ -1087,9 +1100,13 @@ class CompanyWebApp:
         host = urlparse(url).netloc.lower()
         if not host:
             return
+        throttle_seconds = self._domain_throttle_seconds
+        if host in {"rusprofile.ru", "www.rusprofile.ru"}:
+            throttle_seconds = random.randint(*self._rusprofile_throttle_range)
         last_call = self._domain_last_call.get(host, 0)
-        wait_for = self._domain_throttle_seconds - (time.time() - last_call)
+        wait_for = throttle_seconds - (time.time() - last_call)
         if wait_for > 0:
+            logger.info("Throttle for %s: %.1f sec", host, wait_for)
             time.sleep(wait_for)
         self._domain_last_call[host] = time.time()
 
@@ -1114,9 +1131,9 @@ class CompanyWebApp:
         self._domain_throttle(url)
         timeout = max(15, timeout)
         if not self._is_localhost(url):
-            time.sleep(random.uniform(3.0, 7.0))
+            time.sleep(random.uniform(5.0, 15.0))
         attempts = max(1, max_retries)
-        blocked_domains = {"rusprofile.ru", "www.rusprofile.ru", "list-org.com", "www.list-org.com"}
+        blocked_domains = {"rusprofile.ru", "www.rusprofile.ru"}
         host = urlparse(url).netloc.lower()
         for attempt in range(attempts):
             try:
@@ -1204,6 +1221,8 @@ class CompanyWebApp:
     def _request(self, url: str, timeout: int = 20) -> requests.Response:
         self._domain_throttle(url)
         attempts = 3
+        if not self._is_localhost(url):
+            time.sleep(random.uniform(5.0, 15.0))
         last_exc: Exception | None = None
         for attempt in range(attempts):
             try:
@@ -1317,104 +1336,6 @@ class CompanyWebApp:
         except Exception as exc:  # noqa: BLE001
             logger.error("EGRUL request failed for %s: %s", query, exc)
             return None
-
-    def _search_list_org(self, query: str, is_person: bool = False) -> list[dict[str, str]]:
-        type_param = "fio" if is_person else "all"
-        url = f"https://www.list-org.com/search?type={type_param}&name={quote(query)}"
-        logger.debug("list-org search: %s", url)
-        html = self._fetch_page(url, timeout=5)
-        if not html:
-            return []
-        soup = BeautifulSoup(html, "lxml")
-        hits: list[dict[str, str]] = []
-        for p_tag in soup.select("p"):
-            a_tag = p_tag.select_one("a")
-            if isinstance(a_tag, Tag) and "boss" in str(a_tag.get("href", "")):
-                name = self._normalize_spaces(a_tag.get_text(" ", strip=True))
-                p_text = self._normalize_spaces(p_tag.get_text(" ", strip=True))
-                org = p_text.split(" - ", 1)[1] if " - " in p_text else ""
-                href = str(a_tag.get("href", ""))
-                hits.append({
-                    "source": "list-org.com",
-                    "name": name,
-                    "org": org,
-                    "url": "https://www.list-org.com" + href if href.startswith("/") else href,
-                })
-        logger.info("list-org hits: найдено %d записей", len(hits))
-        return hits[:10]
-
-    def _parse_list_org(self, query: str) -> list[dict[str, Any]] | dict[str, Any] | None:
-        input_type = self.detect_input_type(query)
-        if input_type == INPUT_TYPE_PERSON_TEXT:
-            hits: list[dict[str, Any]] = []
-            for item in self._search_list_org(query, is_person=True):
-                person_url = item.get("url", "")
-                if not person_url:
-                    continue
-                detail_html = self._fetch_page(person_url, timeout=5)
-                if not detail_html:
-                    continue
-                detail_soup = BeautifulSoup(detail_html, "lxml")
-                content = detail_soup.select_one("main") or detail_soup.select_one("#main") or detail_soup.select_one(".content") or detail_soup
-                for node in content.select("script, style, noscript, .adv, .banner, .advert, .ads, [class*='adv'], [id*='adv']"):
-                    node.decompose()
-                text = content.get_text(" ", strip=True)
-                if not text or any(marker in text.lower() for marker in ("реклама", "cookie", "политика конфиденциальности")):
-                    continue
-                fio = item.get("name", "")
-                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio)
-                org_match = re.search(r'(ПАО|АО|ООО|ИП|КХ|СПК|ЗАО)\s*[«"]?[^,.]+', text)
-                position_match = re.search(r"(Президент|Генеральный директор|Директор|Председатель)[^,.]*", text, flags=re.IGNORECASE)
-                hits.append({
-                    "url": person_url,
-                    "ru_org": self._clean_ru_org_name(item.get("org") or (org_match.group(0) if org_match else "")),
-                    "surname_ru": surname_ru,
-                    "name_ru": name_ru,
-                    "middle_name_ru": middle_name_ru,
-                    "gender": normalize_gender(middle_name_ru),
-                    "ru_position": position_match.group(0).strip() if position_match else "",
-                    "inn": self._extract_inn(text),
-                    "revenue": self._extract_revenue_from_soup(detail_soup),
-                })
-                if len(hits) >= 5:
-                    break
-            logger.info("list-org: найдено %d записей", len(hits))
-            return hits
-
-        search_url = f"https://www.list-org.com/search?val={quote(query)}"
-        search_html = self._fetch_page(search_url, timeout=5)
-        if not search_html:
-            return None
-        soup = BeautifulSoup(search_html, "lxml")
-        company_link = soup.find("a", href=re.compile(r"/company/\d+"))
-        if not isinstance(company_link, Tag):
-            return None
-        company_url = "https://www.list-org.com" + str(company_link.get("href", ""))
-        detail_html = self._fetch_page(company_url, timeout=5)
-        if not detail_html:
-            return None
-        detail_soup = BeautifulSoup(detail_html, "lxml")
-        h1 = detail_soup.find("h1")
-        ru_org = self._clean_ru_org_name(h1.get_text(strip=True) if isinstance(h1, Tag) else "")
-        content = detail_soup.select_one("main") or detail_soup.select_one("#main") or detail_soup.select_one(".content") or detail_soup
-        for node in content.select("script, style, noscript, .adv, .banner, .advert, .ads, [class*='adv'], [id*='adv']"):
-            node.decompose()
-        text = content.get_text(" ", strip=True)
-        fio_match = re.search(r"Руководитель[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", text)
-        position_match = re.search(r"Руководитель[^А-ЯЁ]{0,40}[А-ЯЁа-яё\s]+\(([^)]+)\)", text)
-        surname_ru = name_ru = middle_name_ru = ""
-        if fio_match:
-            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
-        return {
-            "url": company_url,
-            "ru_org": ru_org,
-            "surname_ru": surname_ru,
-            "name_ru": name_ru,
-            "middle_name_ru": middle_name_ru,
-            "ru_position": position_match.group(1).strip() if position_match else "",
-            "inn": self._extract_inn(text),
-            "revenue": self._extract_revenue_from_soup(detail_soup),
-        }
 
     def _search_rusprofile(self, query: str, is_person: bool = False, search_type: str = "") -> list[dict[str, str]]:
         search_url = f"https://www.rusprofile.ru/search?query={quote(query)}"
@@ -2068,44 +1989,6 @@ class CompanyWebApp:
             return fallback, state, reason
         return None, "empty", "not found"
 
-    def _fetch_from_list_org(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
-        if not inn:
-            return self._provider_fallback_from_catalog("list-org.com", normalized, inn)
-        url = f"https://www.list-org.com/search?type=inn&val={inn}"
-        if not self._throttle_acquire("www.list-org.com"):
-            return None, "rate_limited", "throttle"
-        try:
-            req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urlopen(req, timeout=10) as response:
-                html = response.read().decode("utf-8", errors="ignore")
-            surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(html)
-            org_name = self._extract_org_from_html(html)
-            if not org_name and not surname_ru:
-                fallback, state, reason = self._provider_fallback_from_catalog("list-org.com", normalized, inn)
-                if fallback:
-                    return fallback, state, reason
-                return None, "empty", "not found"
-            return {
-                "source": "list-org.com",
-                "url": url,
-                "data": {
-                    "inn": inn,
-                    "ru_org": org_name,
-                    "surname_ru": surname_ru,
-                    "name_ru": name_ru,
-                    "middle_name_ru": middle_name_ru,
-                    "ru_position": "Генеральный директор" if surname_ru else "",
-                },
-            }, "ok", ""
-        except Exception as exc:
-            if "429" in str(exc):
-                self._save_rate_limited("list-org.com", f"list:{inn}", 180)
-                return None, "rate_limited", "429"
-            fallback, state, reason = self._provider_fallback_from_catalog("list-org.com", normalized, inn)
-            if fallback:
-                return fallback, state, reason
-            return None, "error", str(exc)
-
     def _fetch_from_open_corporates(self, inn: str, normalized: str) -> tuple[dict[str, Any] | None, str, str]:
         hit, state, reason = self._fetch_inn_fixture("OpenCorporates", inn, normalized)
         return self._enrich_provider_payload(hit), state, reason
@@ -2152,7 +2035,7 @@ class CompanyWebApp:
                 if title_match:
                     org_name = re.sub(r"\s+", " ", title_match.group(1)).strip().split("—", 1)[0]
             if not org_name and not surname_ru:
-                fallback, state, reason = self._provider_fallback_from_catalog("list-org.com", normalized, inn)
+                fallback, state, reason = self._provider_fallback_from_catalog("rusprofile.ru", normalized, inn)
                 if fallback:
                     return fallback, state, reason
                 return None, "empty", "not found"
@@ -2201,7 +2084,7 @@ class CompanyWebApp:
             if not surname_ru:
                 surname_ru, name_ru, middle_name_ru = self._extract_director_from_html(body)
             if not org_name and not surname_ru:
-                fallback, state, reason = self._provider_fallback_from_catalog("list-org.com", normalized, inn)
+                fallback, state, reason = self._provider_fallback_from_catalog("rusprofile.ru", normalized, inn)
                 if fallback:
                     return fallback, state, reason
                 return None, "empty", "not found"
@@ -2377,8 +2260,6 @@ class CompanyWebApp:
             "ФНС ЕГРЮЛ": 100,
             "enhanced_rusprofile": 95,
             "rusprofile.ru": 90,
-            "enhanced_list_org": 85,
-            "list-org.com": 80,
             "bank_of_russia": 75,
             "zachestnyibiznes.ru": 70,
             "focus.kontur.ru": 65,
@@ -3052,7 +2933,7 @@ class CompanyWebApp:
             profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type)
 
             ru_org, ru_notes = self.normalize_ru_org(profile["ru_org"])
-            en_org, en_notes = self.normalize_en_org(profile["en_org"], ru_org, is_media=profile.get("is_media") in {True, "1", "true"}, is_ru_registered=profile.get("is_ru_registered") in {True, "1", "true"})
+            en_org, en_notes = self.normalize_en_org(profile["en_org"], ru_org)
             ru_pos, ru_pos_notes = self._normalize_positions_ru(profile.get("ru_position", ""))
             en_pos, en_pos_notes = self._normalize_positions_en(profile.get("position", profile.get("en_position", "")))
             profile["ru_org"] = ru_org
@@ -3109,7 +2990,6 @@ class CompanyWebApp:
                 f"{editable_fields}"
                 f"<input type='hidden' name='input_value' value='{escape(raw)}'/>"
                 f"{hidden}{source_hidden}{trace_hidden}"
-                "<button name='action' value='create'>✅ Создать карту</button>"
                 "<button name='action' value='edit'>✏️ Отредактировать</button>"
                 "<button name='action' value='cancel'>❌ Отмена</button></form>"
                 f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(raw)}'/><input type='hidden' name='no_cache' value='1'/><button>Повторить без кэша</button></form>"
@@ -3125,7 +3005,7 @@ class CompanyWebApp:
             self._active_searches.pop(cache_key, None)
 
     def autofill_confirm(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
-        action = self._get_one(form, "action") or "create"
+        action = self._get_one(form, "action") or "edit"
         if action == "cancel":
             return "", "302 Found", [("Location", "/")]
         ru_org = self._get_one(form, "ru_org")
@@ -3243,8 +3123,6 @@ class CompanyWebApp:
             f"<p>Пол <select name='gender'><option value=''>--</option><option{male_selected}>М</option><option{female_selected}>Ж</option></select></p>"
             f"<p>Должность RU <input name='ru_position' value='{escape(ru_position)}'></p>"
             f"<p>Position EN <input name='en_position' value='{escape(en_position)}'></p>"
-            "<p><label><input type='checkbox' name='is_media' value='1'> СМИ (разрешить The)</label></p>"
-            "<p><label><input type='checkbox' name='is_ru_registered' value='1'> Зарегистрировано в РФ</label></p>"
             "<button>Сохранить</button></form>"
         )
         body = self._page("Ручное создание", content, back_href="/")
@@ -3252,7 +3130,7 @@ class CompanyWebApp:
 
     def manual_post(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         ru_org, ru_notes = self.normalize_ru_org(self._get_one(form, "ru_org"))
-        en_org, en_notes = self.normalize_en_org(self._get_one(form, "en_org"), ru_org, is_media=self._get_one(form, "is_media") == "1", is_ru_registered=self._get_one(form, "is_ru_registered") == "1")
+        en_org, en_notes = self.normalize_en_org(self._get_one(form, "en_org"), ru_org)
         person_ru = self._get_one(form, "person_ru")
         gender = self._get_one(form, "gender")
         errors: list[str] = []
@@ -3292,9 +3170,7 @@ class CompanyWebApp:
             "gender": gender,
             "ru_position": self._get_one(form, "ru_position"),
             "en_position": self._get_one(form, "en_position"),
-            "is_media": self._get_one(form, "is_media") == "1",
-            "is_ru_registered": self._get_one(form, "is_ru_registered") == "1",
-        }
+                    }
         with self._connect() as db:
             cur = db.execute(
                 "INSERT INTO cards(ru_org,en_org,status,source,created_at,updated_at,data_json) VALUES(?,?,?,?,?,?,?)",
@@ -3356,7 +3232,7 @@ class CompanyWebApp:
 
     def card_edit_post(self, card_id: int, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         ru_org, ru_notes = self.normalize_ru_org(self._get_one(form, "ru_org"))
-        en_org, en_notes = self.normalize_en_org(self._get_one(form, "en_org"), ru_org, is_media=self._get_one(form, "is_media") == "1", is_ru_registered=self._get_one(form, "is_ru_registered") == "1")
+        en_org, en_notes = self.normalize_en_org(self._get_one(form, "en_org"), ru_org)
         notes = ru_notes + en_notes
         status = self._status(notes, bool(ru_org and en_org))
 
