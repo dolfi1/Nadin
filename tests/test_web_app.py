@@ -494,3 +494,69 @@ def test_is_person_query_recognizes_bank_as_company():
 def test_split_fio_handles_empty_value(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
     assert app._split_fio_ru("") == ("", "", "")
+
+
+def test_collect_rusprofile_profiles_falls_back_to_direct_inn_urls(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(app, "_search_rusprofile", lambda *_args, **_kwargs: [])
+
+    def fake_parse(url):
+        return {"url": url, "ru_org": "ПАО Сбербанк"} if "/id/" in url else None
+
+    monkeypatch.setattr(app, "_parse_rusprofile", fake_parse)
+
+    result = app._collect_rusprofile_profiles("7707083893", web_app.INPUT_TYPE_INN)
+
+    assert result is not None
+    assert result["url"].endswith("/id/7707083893")
+
+
+def test_autofill_confirm_redirects_to_manual_when_required_missing(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    body, status, headers = app.autofill_confirm(
+        {
+            "action": ["create"],
+            "ru_org": ["ПАО Сбербанк"],
+            "en_org": ["Sberbank PJSC"],
+            "input_value": ["7707083893"],
+            "profile_surname_ru": [""],
+            "profile_name_ru": [""],
+            "profile_gender": [""],
+            "profile_ru_position": [""],
+            "profile_en_position": [""],
+        }
+    )
+
+    assert body == ""
+    assert status == "302 Found"
+    location = dict(headers)["Location"]
+    assert location.startswith("/create/manual?")
+    assert "error=" in location
+
+
+def test_manual_post_validates_required_fields_and_redirects_back(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    body, status, headers = app.manual_post(
+        {
+            "ru_org": ["ПАО Сбербанк"],
+            "en_org": ["Sberbank PJSC"],
+            "person_ru": ["Греф Герман"],
+            "gender": [""],
+            "ru_position": [""],
+            "en_position": [""],
+        }
+    )
+
+    assert body == ""
+    assert status == "302 Found"
+    assert dict(headers)["Location"].startswith("/create/manual?")
+
+
+def test_provider_chain_for_inn_prioritizes_reliable_sources(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    providers = app._provider_chain(web_app.INPUT_TYPE_INN, "7707083893")
+    names = [p["name"] for p in providers[:4]]
+    assert names == ["ФНС ЕГРЮЛ", "ФНС Интеграция ЕГРЮЛ/ЕГРИП", "Банк России", "РБК Компании"]
