@@ -93,10 +93,13 @@ SOURCE_DOMAINS = {
 }
 
 SOURCE_PROVIDERS: list[dict[str, Any]] = [
-    {"name": "ФНС ЕГРЮЛ", "kind": "egrul", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": True},
-    {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True},
-    # {"name": "list-org.com", "kind": "list_org", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": True},
-    {"name": "focus.kontur.ru", "kind": "kontur", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False},
+    {"name": "ФНС ЕГРЮЛ", "kind": "egrul", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": True, "priority": 1},
+    {"name": "ФНС Интеграция ЕГРЮЛ/ЕГРИП", "kind": "egrul", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": True, "priority": 2},
+    {"name": "Банк России", "kind": "bank_russia", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": False, "priority": 3, "url_template": "https://cbr.ru/eng/banking_sector/credit/coinfo/?id={inn}"},
+    {"name": "РБК Компании", "kind": "rbc", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": False, "priority": 4, "url_template": "https://companies.rbc.ru/search/?query={query}"},
+    {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True, "priority": 5},
+    {"name": "list-org.com", "kind": "list_org", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": True, "priority": 6},
+    {"name": "focus.kontur.ru", "kind": "kontur", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 8},
 ]
 
 RUSPROFILE_NOISE_RE = re.compile(
@@ -159,6 +162,10 @@ CARD_FIELDS: list[tuple[str, str]] = [
     ("is_ru_registered", "Зарегистрировано в РФ"),
 ]
 
+REQUIRED_FIELDS = ["surname_ru", "name_ru", "gender", "ru_org", "en_org", "ru_position", "en_position"]
+PROBLEMATIC_PROVIDERS = {"rusprofile", "rusprofile_enhanced", "list_org", "zachestnyibiznes"}
+NO_NEGATIVE_CACHE_KINDS = {"rusprofile", "rusprofile_enhanced", "list_org", "zachestnyibiznes"}
+
 FIELD_PRIORITIES: dict[str, list[str]] = {
     "surname_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "list-org.com", "focus.kontur.ru"],
     "name_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "list-org.com", "focus.kontur.ru"],
@@ -177,8 +184,10 @@ class CompanyWebApp:
         self.SOURCE_PROVIDERS = [dict(provider) for provider in SOURCE_PROVIDERS]
         self._source_cache: dict[str, dict[str, Any]] = {}
         self._positive_cache_ttl = 30 * 24 * 60 * 60
-        self._negative_cache_ttl = 4 * 60 * 60
-        self._negative_cache_ttl = 30 * 60
+        self._negative_cache_ttl_reliable = 4 * 60 * 60
+        self._negative_cache_ttl_problematic = 5 * 60
+        self._provider_error_streak: dict[str, int] = defaultdict(int)
+        self._provider_disabled_until: dict[str, float] = {}
         self._domain_last_call: dict[str, float] = {}
         self._domain_throttle_seconds = 12
         self._active_searches: dict[str, float] = {}
@@ -220,6 +229,13 @@ class CompanyWebApp:
                   cache_key TEXT PRIMARY KEY,
                   payload_json TEXT NOT NULL,
                   expires_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS provider_errors (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  provider_name TEXT NOT NULL,
+                  error_type TEXT NOT NULL,
+                  error_details TEXT NOT NULL,
+                  created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_cards_ru_org ON cards(ru_org);
                 CREATE INDEX IF NOT EXISTS idx_cards_inn ON cards(json_extract(data_json, '$.profile.inn'));
@@ -548,6 +564,18 @@ class CompanyWebApp:
     def _provider_chain(self, input_type: str, raw: str) -> list[dict[str, Any]]:
         if input_type == INPUT_TYPE_PERSON_TEXT:
             names = ["rusprofile.ru", "ФНС ЕГРЮЛ", "list-org.com"]
+        elif input_type == INPUT_TYPE_INN:
+            names = [
+                "ФНС ЕГРЮЛ",
+                "ФНС Интеграция ЕГРЮЛ/ЕГРИП",
+                "Банк России",
+                "РБК Компании",
+                "rusprofile.ru",
+                "list-org.com",
+                "focus.kontur.ru",
+                "checko.ru",
+                "zachestnyibiznes.ru",
+            ]
         elif self._is_foreign_query(raw):
             names = [
                 "OpenCorporates",
@@ -591,7 +619,6 @@ class CompanyWebApp:
             ]
         provider_map = {provider["name"]: provider for provider in self.SOURCE_PROVIDERS}
         selected = [provider_map[name] for name in names if name in provider_map]
-        random.shuffle(selected)
         return selected
 
     def _rate_limited(self, environ: dict[str, Any], endpoint: str, limit: int = 8, window_seconds: int = 60) -> bool:
@@ -660,11 +687,34 @@ class CompanyWebApp:
             return len(dropped) + int(cur.rowcount)
 
     def _should_call_provider(self, provider: dict[str, Any], input_type: str) -> bool:
+        if self._is_provider_temporarily_disabled(provider):
+            return False
         if input_type == INPUT_TYPE_INN:
             return bool(provider.get("supports_inn"))
         if input_type == INPUT_TYPE_URL:
             return bool(provider.get("supports_url"))
         return bool(provider.get("supports_name"))
+
+    def _is_provider_temporarily_disabled(self, provider: dict[str, Any]) -> bool:
+        disabled_until = self._provider_disabled_until.get(provider.get("name", ""), 0)
+        return time.time() < disabled_until
+
+    def _mark_provider_success(self, provider_name: str) -> None:
+        self._provider_error_streak[provider_name] = 0
+        self._provider_disabled_until.pop(provider_name, None)
+
+    def _mark_provider_failure(self, provider_name: str) -> None:
+        streak = self._provider_error_streak.get(provider_name, 0) + 1
+        self._provider_error_streak[provider_name] = streak
+        if streak > 3:
+            self._provider_disabled_until[provider_name] = time.time() + random.randint(10 * 60, 15 * 60)
+
+    def _negative_ttl_for_provider(self, provider: dict[str, Any]) -> int:
+        if provider.get("kind") in NO_NEGATIVE_CACHE_KINDS:
+            return self._negative_cache_ttl_problematic
+        if provider.get("kind") == "egrul":
+            return self._negative_cache_ttl_reliable
+        return 10 * 60
 
     def _call_provider(
         self,
@@ -686,6 +736,7 @@ class CompanyWebApp:
         try:
             hits = self._fetch_from_provider(provider, normalized, input_type, inn, search_type=search_type)
             if hits:
+                self._mark_provider_success(provider.get("name", ""))
                 normalized_hits = hits if isinstance(hits, list) else [hits]
                 if not no_cache:
                     self._set_cache(cache_key, normalized_hits, ttl=self._positive_cache_ttl)
@@ -693,15 +744,15 @@ class CompanyWebApp:
                 return hits
         except Exception as exc:  # noqa: BLE001
             logger.warning("Provider %s failed for %s: %s", provider.get("name"), raw, str(exc))
-
-        if provider.get("kind") in {"rusprofile", "rusprofile_enhanced"}:
-            logger.info("Не кэшируем пустой результат от %s (возможна капча)", provider.get("name"))
-            return []
+            self._mark_provider_failure(provider.get("name", ""))
+            self._handle_provider_error(provider.get("name", "unknown"), exc)
 
         fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn, search_type=search_type)
         if not fallback_hits:
             if not no_cache:
-                self._set_cache(cache_key, [], ttl=self._negative_cache_ttl)
+                negative_ttl = self._negative_ttl_for_provider(provider)
+                if negative_ttl > 0:
+                    self._set_cache(cache_key, [], ttl=negative_ttl)
                 logger.info("Кэш сохранен для %s", cache_key)
             return []
         if provider.get("kind") == "egrul":
@@ -735,6 +786,9 @@ class CompanyWebApp:
             return self._collect_rusprofile_profiles(raw, input_type, is_person=person_query, search_type=search_type)
         if kind == "kontur":
             return self._parse_kontur(raw)
+        if kind in {"bank_russia", "rbc"}:
+            url = provider.get("url_template", "").format(inn=inn or "", query=quote(raw))
+            return self._parse_generic_osint(url, provider.get("name", kind))
         if kind in {"yandex_people", "offshoreleaks", "checko", "zachestnyibiznes", "sherlock", "maigret", "holehe", "theharvester"}:
             url = provider.get("url_template", "").format(inn=inn or "", query=quote(raw))
             return self._parse_generic_osint(url, provider.get("name", kind))
@@ -807,7 +861,9 @@ class CompanyWebApp:
                     hits.extend(fallback_hits)
                     logger.info("Successfully retrieved %d results from %s", len(fallback_hits), fallback["name"])
                     break
-                self._set_cache(fallback_cache_key, [], ttl=self._negative_cache_ttl)
+                negative_ttl = self._negative_ttl_for_provider(fallback)
+                if negative_ttl > 0:
+                    self._set_cache(fallback_cache_key, [], ttl=negative_ttl)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Fallback provider %s failed: %s", fallback["name"], str(exc))
         return hits
@@ -987,16 +1043,17 @@ class CompanyWebApp:
                             if provider_hits:
                                 hits.extend(provider_hits)
                             hits_by_provider[provider_name] = len(provider_hits)
-                            trace.append(f"Источник: {provider_name} — {state}")
+                            icon = "✅" if provider_hits else "❌"
+                            trace.append(f"{icon} Источник: {provider_name} — {state}")
                         except Exception as exc:  # noqa: BLE001
                             reason = self._handle_provider_error(provider.get("name", "unknown"), exc)
-                            trace.append(f"Источник: {provider['name']} — {reason}")
+                            trace.append(f"⚠️ Источник: {provider['name']} — {reason}")
                             hits_by_provider[provider["name"]] = 0
                 except FuturesTimeoutError:
                     trace.append("Источники: global_timeout (60s)")
                     for future, provider in futures.items():
                         if not future.done():
-                            trace.append(f"Источник: {provider['name']} — global_timeout")
+                            trace.append(f"⚠️ Источник: {provider['name']} — global_timeout")
                             hits_by_provider[provider["name"]] = 0
         for provider in providers:
             if not self._should_call_provider(provider, input_type):
@@ -1029,16 +1086,20 @@ class CompanyWebApp:
             or "block" in response_text_lower
             or "браузер не подходит" in response_text_lower
             or "проверка" in response_text_lower
-            or response_length < 5000
+            or response_length < 800
         )
 
-    def _fetch_page(self, url: str, timeout: int = 15, max_retries: int = 3) -> str | None:
+    def _fetch_page(self, url: str, timeout: int = 20, max_retries: int = 5) -> str | None:
         self._domain_throttle(url)
         if not self._is_localhost(url):
             time.sleep(random.uniform(3.0, 7.0))
         attempts = max(1, max_retries)
+        blocked_domains = {"rusprofile.ru", "www.rusprofile.ru", "list-org.com", "www.list-org.com"}
+        host = urlparse(url).netloc.lower()
         for attempt in range(attempts):
             try:
+                if host in blocked_domains and attempt > 0:
+                    time.sleep(random.uniform(2.0, 5.0))
                 headers = self._get_random_headers(self._get_random_user_agent())
                 proxies = self._get_random_proxy() if attempt > 0 else None
                 response = requests.get(url, timeout=timeout, headers=headers, verify=True, allow_redirects=True, proxies=proxies)
@@ -1052,11 +1113,13 @@ class CompanyWebApp:
                     return None
                 if status_code == 200:
                     return response_text
-                if status_code == 429:
-                    wait_time = (attempt + 1) * 5
-                    logger.warning("Received 429 from %s, waiting %d seconds before retry", url, wait_time)
+                if status_code in {403, 429, 503} and attempt < attempts - 1:
+                    wait_time = (2 ** (attempt + 1)) + random.uniform(0.2, 1.5)
+                    logger.warning("Received %d from %s, waiting %.1f seconds before retry", status_code, url, wait_time)
                     time.sleep(wait_time)
                     continue
+                if status_code >= 400:
+                    return None
                 logger.error("Failed to fetch %s, status code: %d", url, status_code)
                 return None
             except requests.exceptions.RequestException as exc:
@@ -1115,7 +1178,7 @@ class CompanyWebApp:
             return {"http": proxy, "https": proxy}
         return None
 
-    def _request(self, url: str, timeout: int = 10) -> requests.Response:
+    def _request(self, url: str, timeout: int = 20) -> requests.Response:
         self._domain_throttle(url)
         attempts = 3
         last_exc: Exception | None = None
@@ -1140,7 +1203,7 @@ class CompanyWebApp:
             return None
         url = f"https://egrul.itsoft.ru/{query}.json"
         try:
-            resp = self._request(url, timeout=10)
+            resp = self._request(url, timeout=20)
             if not resp.ok:
                 return None
             content_type = resp.headers.get("content-type", "")
@@ -1149,7 +1212,7 @@ class CompanyWebApp:
             data = resp.json()
             logger.debug("ФНС ЕГРЮЛ сырые данные: %s", json.dumps(data, ensure_ascii=False)[:500])
 
-            if not data.get("СвЮЛ") and not data.get("company"):
+            if not any([data.get("СвЮЛ"), data.get("company"), data.get("name"), data.get("НаимСокр")]):
                 logger.warning("ФНС ЕГРЮЛ вернул пустую структуру для INN=%s", query)
                 return None
 
@@ -1433,6 +1496,10 @@ class CompanyWebApp:
         return hits[:20]
 
     def _parse_rusprofile(self, url: str) -> dict[str, Any]:
+        if not re.match(r"https?://", url, flags=re.IGNORECASE):
+            search_hits = self._search_rusprofile(url, is_person=is_person_query(url), search_type="")
+            if search_hits and search_hits[0].get("url"):
+                url = search_hits[0]["url"]
         html = self._fetch_page(url, timeout=20, max_retries=2)
         if not html:
             return {}
@@ -1675,6 +1742,12 @@ class CompanyWebApp:
     def _handle_provider_error(self, provider_name: str, error: Exception) -> str:
         error_id = str(uuid.uuid4())
         logger.error("Provider %s failed (%s): %s", provider_name, error_id, error, exc_info=True)
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO provider_errors(provider_name,error_type,error_details,created_at) VALUES(?,?,?,?)",
+                (provider_name, type(error).__name__, str(error), self._now()),
+            )
+            db.commit()
         if isinstance(error, requests.HTTPError) and getattr(error.response, "status_code", None) == 429:
             return f"provider_error:{error_id}:rate_limited"
         if isinstance(error, requests.ConnectionError):
@@ -1698,6 +1771,10 @@ class CompanyWebApp:
 
         hits = self._search_rusprofile(query, is_person=person_mode, search_type=search_type)
         profiles: list[dict[str, Any]] = []
+        if not hits and input_type == INPUT_TYPE_INN:
+            inn = self._extract_inn(query)
+            direct_urls = [f"https://www.rusprofile.ru/id/{inn}", f"https://www.rusprofile.ru/ip/{inn}"] if inn else []
+            hits = [{"url": url} for url in direct_urls]
 
         def parse_single_hit(hit: dict[str, Any]) -> dict[str, Any] | None:
             if not hit.get("url"):
@@ -2683,27 +2760,8 @@ class CompanyWebApp:
 
     def _search_by_inn(self, inn: str, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
         trace = [f"Поиск по ИНН: {inn}"]
-        direct_hits, source_trace = self._search_external_sources(inn, no_cache=False, search_type=search_type)
+        hits, source_trace = self._search_external_sources(inn, no_cache=False, search_type=search_type)
         trace.extend(source_trace)
-        if direct_hits:
-            return direct_hits, trace
-
-        hits: list[dict[str, Any]] = []
-        input_type = INPUT_TYPE_INN
-        providers = sorted([p for p in self.SOURCE_PROVIDERS if p.get("supports_inn", False)], key=lambda p: int(p.get("priority", 10)))
-
-        for provider in providers:
-            trace.append(f"Запрос к источнику: {provider['name']}")
-            try:
-                data = self._call_provider_with_retry(provider, inn, input_type, max_retries=0, search_type=search_type)
-                if data:
-                    for item in data:
-                        hits.append({"source": provider["name"], "url": item.get("url", ""), "data": item, "type": item.get("type", "company")})
-                    trace.append(f"Найдено {len(data)} записей в {provider['name']}")
-            except Exception as exc:  # noqa: BLE001
-                trace.append(f"Ошибка источника {provider['name']}: {exc}")
-                continue
-
         return hits, trace
 
     def _search_by_person(self, full_name: str, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
@@ -2949,10 +3007,10 @@ class CompanyWebApp:
 
         self._active_searches[cache_key] = time.time()
         try:
-            if self._get_one(form, "reset_inn_cache") == "1" and input_type == INPUT_TYPE_INN:
+            if self._get_one(form, "reset_cache") == "1" and input_type == INPUT_TYPE_INN:
                 dropped = self._clear_cache_for_inn(self._extract_inn(raw))
                 reset_note = [f"Кэш по ИНН очищен: {dropped}"]
-            elif self._get_one(form, "reset_inn_cache") == "1" and input_type == INPUT_TYPE_PERSON_TEXT:
+            elif self._get_one(form, "reset_cache") == "1" and input_type == INPUT_TYPE_PERSON_TEXT:
                 dropped = self._clear_cache_for_person(raw)
                 reset_note = [f"Кэш по персоне очищен: {dropped}"]
             else:
@@ -2980,14 +3038,20 @@ class CompanyWebApp:
 
             source_hidden = "".join(f"<input type='hidden' name='source_name' value='{escape(item['source'])}'/>" for item in source_hits)
             trace_hidden = "".join(f"<input type='hidden' name='search_trace' value='{escape(step)}'/>" for step in search_trace)
-            field_source_hidden = "".join(
-                f"<input type='hidden' name='field_source_{escape(field)}' value='{escape(source)}'/>"
-                for field, source in field_sources.items()
-            )
-            profile_hidden = "".join(
-                f"<input type='hidden' name='profile_{escape(field)}' value='{escape(value)}'/>"
-                for field, value in profile.items()
-            )
+            editable_fields = ""
+            for field, label in CARD_FIELDS:
+                value = str(profile.get(field, ""))
+                mark = " *" if field in REQUIRED_FIELDS else ""
+                if field == "gender":
+                    editable_fields += (
+                        f"<p><b>{escape(label)}{mark}</b>: <select name='profile_{escape(field)}'>"
+                        f"<option value=''>--</option>"
+                        f"<option value='М'{' selected' if value == 'М' else ''}>М</option>"
+                        f"<option value='Ж'{' selected' if value == 'Ж' else ''}>Ж</option>"
+                        "</select></p>"
+                    )
+                else:
+                    editable_fields += f"<p><b>{escape(label)}{mark}</b>: <input name='profile_{escape(field)}' value='{escape(value)}' style='width:100%'></p>"
             hidden = "".join(f"<input type='hidden' name='notes' value='{escape(n)}'/>" for n in notes)
             source_list = (
                 "<h3>Найдено в доступных источниках</h3><ul>"
@@ -3009,16 +3073,16 @@ class CompanyWebApp:
                 "<form method='post' action='/autofill/confirm'>"
                 f"<p>RU: <input name='ru_org' value='{escape(ru_org)}'/></p>"
                 f"<p>EN: <input name='en_org' value='{escape(en_org)}'/></p>"
+                "<p style='color:#b22'>* Обязательные поля</p>"
+                f"{editable_fields}"
                 f"<input type='hidden' name='input_value' value='{escape(raw)}'/>"
-                f"{hidden}{source_hidden}{trace_hidden}{field_source_hidden}{profile_hidden}"
+                f"{hidden}{source_hidden}{trace_hidden}"
                 "<button name='action' value='create'>✅ Создать карту</button>"
                 "<button name='action' value='edit'>✏️ Отредактировать</button>"
                 "<button name='action' value='cancel'>❌ Отмена</button></form>"
                 f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(raw)}'/><input type='hidden' name='no_cache' value='1'/><button>Повторить без кэша</button></form>"
                 + (
-                    f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(raw)}'/><input type='hidden' name='reset_inn_cache' value='1'/><button>Сбросить кэш по ИНН</button></form>"
-                    if input_type == INPUT_TYPE_INN
-                    else ""
+                    f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(raw)}'/><input type='hidden' name='reset_cache' value='1'/><button>Сбросить кэш по этому запросу</button></form>"
                 )
             )
             body = self._page("Автосбор: черновик", content, back_href="/")
@@ -3074,6 +3138,14 @@ class CompanyWebApp:
                 manual_payload[f"profile_{key}"] = value
             return "", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")]
 
+        missing_fields = [field for field in REQUIRED_FIELDS if not self._normalize_spaces(str(profile_data.get(field, "")))]
+        if missing_fields:
+            params = {f"profile_{key}": value for key, value in profile_data.items()}
+            params["q"] = ru_org or input_value
+            params["en_org"] = en_org
+            params["error"] = f"Заполните обязательные поля: {', '.join(missing_fields)}"
+            return "", "302 Found", [("Location", f"/create/manual?{urlencode(params)}")]
+
         card_obj = Card.from_profile(profile_data)
         profile_data["family_name"] = card_obj.family_name or profile_data.get("family_name", "")
         profile_data["first_name"] = card_obj.first_name or profile_data.get("first_name", "")
@@ -3114,11 +3186,23 @@ class CompanyWebApp:
         gender = (query.get("gender") or [""])[0]
         ru_position = (query.get("ru_position") or [""])[0]
         en_position = (query.get("en_position") or [""])[0]
+        error = (query.get("error") or [""])[0]
+        profile_prefill = {key.removeprefix("profile_"): (values[0] if values else "") for key, values in query.items() if key.startswith("profile_")}
         ru_org, _ = self.normalize_ru_org(q) if q else ("", [])
+        ru_org = profile_prefill.get("ru_org", ru_org)
+        en_org = profile_prefill.get("en_org", en_org)
+        if profile_prefill:
+            person_ru = " ".join(filter(None, [profile_prefill.get("surname_ru", ""), profile_prefill.get("name_ru", ""), profile_prefill.get("middle_name_ru", "")]))
+            person_en = " ".join(filter(None, [profile_prefill.get("family_name", ""), profile_prefill.get("first_name", ""), profile_prefill.get("middle_name_en", "")]))
+            ru_position = profile_prefill.get("ru_position", ru_position)
+            en_position = profile_prefill.get("en_position", profile_prefill.get("position", en_position))
+            gender = profile_prefill.get("gender", gender)
         male_selected = " selected" if gender == "М" else ""
         female_selected = " selected" if gender == "Ж" else ""
+        error_html = f"<p style='color:#b22'>{escape(error)}</p>" if error else ""
         content = (
             "<h2>Ручное создание</h2>"
+            f"{error_html}"
             "<form method='post' action='/create/manual'>"
             f"<p>Организация RU <input name='ru_org' value='{escape(ru_org)}'></p>"
             f"<p>Organization EN <input name='en_org' value='{escape(en_org)}'></p>"
@@ -3142,10 +3226,32 @@ class CompanyWebApp:
         errors: list[str] = []
         if person_ru and gender not in {"М", "Ж"}:
             errors.append("Пол обязателен: М/Ж")
+        profile = {
+            "surname_ru": self._get_one(form, "surname_ru") or (person_ru.split()[0] if person_ru else ""),
+            "name_ru": self._get_one(form, "name_ru") or (person_ru.split()[1] if len(person_ru.split()) > 1 else ""),
+            "gender": gender,
+            "ru_org": ru_org,
+            "en_org": en_org,
+            "ru_position": self._get_one(form, "ru_position"),
+            "en_position": self._get_one(form, "en_position"),
+        }
+        missing_required = [field for field in REQUIRED_FIELDS if not self._normalize_spaces(str(profile.get(field, "")))]
+        if missing_required:
+            errors.append(f"Заполните обязательные поля: {', '.join(missing_required)}")
         notes = ru_notes + en_notes + errors
         status = self._status(notes, bool(ru_org and en_org))
         if errors:
-            return "<p>Пол обязателен: М/Ж</p>", "400 Bad Request", [("Content-Type", "text/html; charset=utf-8")]
+            params = {
+                "q": ru_org,
+                "en_org": en_org,
+                "person_ru": person_ru,
+                "person_en": self._get_one(form, "person_en"),
+                "gender": gender,
+                "ru_position": self._get_one(form, "ru_position"),
+                "en_position": self._get_one(form, "en_position"),
+                "error": "; ".join(errors),
+            }
+            return "", "302 Found", [("Location", f"/create/manual?{urlencode(params)}")]
 
         data = {
             "notes": notes,
