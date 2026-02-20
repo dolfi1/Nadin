@@ -83,10 +83,18 @@ class Card:
     @classmethod
     def from_profile(cls, profile: dict) -> "Card":
         payload = {field: profile.get(field, "") for field in cls.__dataclass_fields__}
-        payload["middle_name_en"] = profile.get("middle_name_en") or profile.get("middle_name", "")
+        payload["surname_ru"] = profile.get("surname_ru") or profile.get("family_name", "")
+        payload["name_ru"] = profile.get("name_ru") or profile.get("first_name", "")
         payload["patronymic_ru"] = profile.get("patronymic_ru") or profile.get("middle_name_ru", "")
         payload["surname_en"] = profile.get("surname_en") or profile.get("family_name", "")
         payload["name_en"] = profile.get("name_en") or profile.get("first_name", "")
+        payload["middle_name_en"] = profile.get("middle_name_en") or profile.get("middle_name", "")
+        payload["family_name"] = profile.get("family_name") or profile.get("surname_en", "")
+        payload["first_name"] = profile.get("first_name") or profile.get("name_en", "")
+        payload["ru_org"] = profile.get("ru_org", "")
+        payload["en_org"] = profile.get("en_org", "")
+        payload["ru_position"] = profile.get("ru_position", "")
+        payload["en_position"] = profile.get("en_position") or profile.get("position", "")
         return cls(**payload)
 
 
@@ -430,9 +438,9 @@ class CardBot:
 
     def _validate_card(self, card: Card) -> List[str]:
         notes = []
-        if not card.surname_ru:
+        if not card.surname_ru and not card.family_name:
             notes.append("Фамилия RU обязательна")
-        if not card.name_ru:
+        if not card.name_ru and not card.first_name:
             notes.append("Имя RU обязательно")
         if not card.gender or card.gender not in {"М", "Ж"}:
             notes.append("Пол должен быть М или Ж")

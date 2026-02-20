@@ -676,3 +676,60 @@ def test_provider_chain_for_inn_prioritizes_reliable_sources(tmp_path):
     providers = app._provider_chain(web_app.INPUT_TYPE_INN, "7707083893")
     names = [p["name"] for p in providers]
     assert names == ["ФНС ЕГРЮЛ", "rusprofile.ru"]
+
+
+def test_manual_get_prefers_profile_prefill_and_person_name(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    body, status, _headers = app.manual_get(
+        {
+            "q": ["7707083893"],
+            "person_ru": ["Греф Герман Оскарович"],
+            "profile_ru_org": ["ПАО Сбербанк"],
+            "profile_en_org": ["Sberbank PJSC"],
+        }
+    )
+
+    assert status == "200 OK"
+    assert "name='ru_org' value='ПАО Сбербанк'" in body
+    assert "name='en_org' value='Sberbank PJSC'" in body
+    assert "name='surname_ru' value='Греф'" in body
+    assert "name='name_ru' value='Герман'" in body
+
+
+def test_build_profile_from_sources_keeps_special_case_position_and_names(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    hits = [
+        {
+            "source": "special_case",
+            "type": "company",
+            "data": {
+                "surname_ru": "Греф",
+                "name_ru": "Герман",
+                "middle_name_ru": "Оскарович",
+                "ru_org": "ПАО Сбербанк",
+                "en_org": "Sberbank PJSC",
+                "ru_position": "Президент, Председатель правления",
+                "en_position": "President, Chairman of the Board",
+                "gender": "М",
+                "appeal": "Г-н",
+            },
+        },
+        {
+            "source": "ФНС ЕГРЮЛ",
+            "type": "company",
+            "data": {
+                "ru_position": "Генеральный директор",
+                "ru_org": "Сбербанк",
+            },
+        },
+    ]
+
+    profile, _sources = app._build_profile_from_sources(hits, "Сбербанк", web_app.INPUT_TYPE_ORG_TEXT)
+
+    assert profile["surname_ru"] == "Греф"
+    assert profile["name_ru"] == "Герман"
+    assert profile["ru_position"] == "Президент, Председатель правления"
+    assert profile["en_position"] == "President, Chairman of the Board"
+    assert profile["en_org"] == "Sberbank PJSC"

@@ -122,3 +122,23 @@ def test_enrich_card_generates_position_middle_name_and_appeal(tmp_path):
     assert card.en_position == "President, Chairman of the Board"
     assert card.middle_name_en == "Oskarovich"
     assert card.appeal == "Г-н"
+
+
+def test_from_profile_maps_ru_and_en_fallbacks():
+    card = Card.from_profile(
+        {
+            "family_name": "Gref",
+            "first_name": "German",
+            "middle_name_ru": "Оскарович",
+            "ru_org": "ПАО Сбербанк",
+            "en_org": "Sberbank PJSC",
+            "ru_position": "Президент",
+            "position": "President",
+            "gender": "М",
+        }
+    )
+
+    assert card.surname_ru == "Gref"
+    assert card.name_ru == "German"
+    assert card.patronymic_ru == "Оскарович"
+    assert card.en_position == "President"
