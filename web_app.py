@@ -20,7 +20,7 @@ from difflib import SequenceMatcher
 from urllib.request import Request
 from urllib.request import urlopen
 from datetime import datetime, timezone
-from html import escape
+from html import escape, unescape
 from pathlib import Path
 from typing import Any, Callable
 import requests
@@ -380,6 +380,34 @@ class CompanyWebApp:
         if len(parts) == 1:
             return parts[0].capitalize(), "", ""
         return "", "", ""
+
+    def _extract_ru_org_from_keywords(self, keywords_text: str) -> str:
+        text = self._normalize_spaces(unescape(keywords_text))
+        if not text:
+            return ""
+
+        short_match = re.search(
+            r"\b(ПАО|АО|ООО|ОАО|ЗАО|ФГУП|ФГБУ|АНО|МУП|НКО|ИП)\s+[«\"]?([А-ЯЁа-яёA-Za-z0-9\-]+(?:\s+[А-ЯЁа-яёA-Za-z0-9\-]+){0,7})[»\"]?",
+            text,
+        )
+        if short_match:
+            return self._clean_ru_org_name(f"{short_match.group(1)} {short_match.group(2)}")
+
+        full_match = re.search(
+            r"(ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО|АКЦИОНЕРНОЕ ОБЩЕСТВО|ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ)\s+[\"«]([^\"»]+)[\"»]",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if full_match:
+            full_opf = full_match.group(1).upper()
+            short_opf = FULL_RU_OPF.get(full_opf, "")
+            if short_opf:
+                return self._clean_ru_org_name(f"{short_opf} {full_match.group(2)}")
+        return ""
+
+    def _extract_fio_from_text(self, text: str) -> tuple[str, str, str]:
+        fio_match = re.search(r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", text)
+        return self._split_fio_ru(fio_match.group(1)) if fio_match else ("", "", "")
 
     def _normalize_positions_ru(self, raw: str) -> tuple[str, list[str]]:
         notes: list[str] = []
@@ -1420,6 +1448,9 @@ class CompanyWebApp:
         soup = BeautifulSoup(html, "lxml")
         profile: dict[str, Any] = {"url": url, "source": "rusprofile.ru"}
         page_text = soup.get_text(" ", strip=True)
+        keywords_node = soup.find("meta", attrs={"name": re.compile(r"^keywords$", re.IGNORECASE)})
+        keywords_raw = str(keywords_node.get("content", "")) if isinstance(keywords_node, Tag) else ""
+        keywords_text = self._normalize_spaces(unescape(keywords_raw))
         is_person = "/person/" in url or "/ip/" in url
 
         if is_person:
@@ -1503,15 +1534,19 @@ class CompanyWebApp:
             else:
                 profile["revenue"] = self._extract_revenue_from_soup(soup)
         else:
-            title = soup.find("h1", class_=re.compile(r"(company|org)", re.IGNORECASE))
-            if not title:
-                title = soup.find("div", class_=re.compile(r"(company|org)", re.IGNORECASE))
-            if not title:
-                title = soup.find("h1")
-            profile["ru_org"] = self._clean_ru_org_name(title.get_text(strip=True) if isinstance(title, Tag) else "")
+            profile["ru_org"] = self._extract_ru_org_from_keywords(keywords_text)
+            if not profile.get("ru_org"):
+                title = soup.find("h1", class_=re.compile(r"(company|org)", re.IGNORECASE))
+                if not title:
+                    title = soup.find("div", class_=re.compile(r"(company|org)", re.IGNORECASE))
+                if not title:
+                    title = soup.find("h1")
+                profile["ru_org"] = self._clean_ru_org_name(title.get_text(strip=True) if isinstance(title, Tag) else "")
             inn_match = re.search(r"ИНН[:\s]*(\d{10,12})", page_text)
             if not inn_match:
                 inn_match = re.search(r"Идентификационный номер налогоплательщика[:\s]*(\d{10,12})", page_text)
+            if not inn_match and keywords_text:
+                inn_match = re.search(r"\bИНН\s*(\d{10,12})\b", keywords_text, flags=re.IGNORECASE)
             profile["inn"] = inn_match.group(1) if inn_match else ""
             profile["revenue"] = self._extract_revenue_from_soup(soup)
             head_block = re.search(
@@ -1534,6 +1569,14 @@ class CompanyWebApp:
                     if not profile.get("ru_position"):
                         before_fio = director_text.split(fio_match.group(1))[0] if fio_match else ""
                         profile["ru_position"] = self._normalize_position_ru(before_fio)
+            if not fio_match and keywords_text:
+                surname_ru, name_ru, middle_name_ru = self._extract_fio_from_text(keywords_text)
+                if surname_ru and name_ru:
+                    profile.update({"surname_ru": surname_ru, "name_ru": name_ru, "middle_name_ru": middle_name_ru})
+
+            chief_title = self._select_first_text(soup, [".chief-title", ".company-info__item .chief-title"])
+            if chief_title:
+                profile["ru_position"] = self._normalize_position_ru(chief_title)
             if fio_match:
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
                 profile.update({"surname_ru": surname_ru, "name_ru": name_ru, "middle_name_ru": middle_name_ru})
