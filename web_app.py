@@ -1514,12 +1514,26 @@ class CompanyWebApp:
                 inn_match = re.search(r"Идентификационный номер налогоплательщика[:\s]*(\d{10,12})", page_text)
             profile["inn"] = inn_match.group(1) if inn_match else ""
             profile["revenue"] = self._extract_revenue_from_soup(soup)
-            fio_match = re.search(r"Руководитель[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", page_text)
+            head_block = re.search(
+                r"Руководитель\s+([А-ЯЁа-яё\-,\s]{3,120}?)\s+([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
+                page_text,
+            )
+            fio_match = None
+            if head_block:
+                ru_position = self._normalize_position_ru(head_block.group(1))
+                if ru_position:
+                    profile["ru_position"] = ru_position
+                fio_match = re.search(r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", head_block.group(2))
+            if not fio_match:
+                fio_match = re.search(r"Руководитель[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", page_text)
             if not fio_match:
                 director_element = soup.find("div", class_=re.compile(r"(director|rukovoditel)", re.IGNORECASE))
                 if director_element:
                     director_text = self._normalize_spaces(director_element.get_text(" ", strip=True))
                     fio_match = re.search(r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", director_text)
+                    if not profile.get("ru_position"):
+                        before_fio = director_text.split(fio_match.group(1))[0] if fio_match else ""
+                        profile["ru_position"] = self._normalize_position_ru(before_fio)
             if fio_match:
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
                 profile.update({"surname_ru": surname_ru, "name_ru": name_ru, "middle_name_ru": middle_name_ru})
@@ -2415,6 +2429,44 @@ class CompanyWebApp:
 
         return profile, field_sources
 
+    def _create_autofill_card(
+        self,
+        profile_data: dict[str, Any],
+        notes: list[str],
+        source_hits: list[dict[str, Any]],
+        search_trace: list[str],
+        field_provenance: dict[str, str],
+    ) -> int:
+        ru_org = str(profile_data.get("ru_org", ""))
+        en_org = str(profile_data.get("en_org", ""))
+        status = self._status(notes, bool(ru_org and en_org))
+        with self._connect() as db:
+            cur = db.execute(
+                "INSERT INTO cards(ru_org,en_org,status,source,created_at,updated_at,data_json) VALUES(?,?,?,?,?,?,?)",
+                (
+                    ru_org,
+                    en_org,
+                    status,
+                    "autofill",
+                    self._now(),
+                    self._now(),
+                    json.dumps(
+                        {
+                            "notes": notes,
+                            "source_hits": source_hits,
+                            "search_trace": search_trace,
+                            "field_provenance": field_provenance,
+                            "profile": profile_data,
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+            card_id = cur.lastrowid
+            db.commit()
+        self._write_audit("create_autofill", card_id, {"ru_org": ru_org, "en_org": en_org, "status": status})
+        return int(card_id)
+
     def _write_audit(self, action: str, card_id: int | None, details: dict[str, Any]) -> None:
         with self._connect() as db:
             db.execute(
@@ -2986,7 +3038,18 @@ class CompanyWebApp:
             }
             for key, value in profile.items():
                 manual_payload[f"profile_{key}"] = value
-            response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
+
+            missing_fields = [field for field in REQUIRED_FIELDS if not self._normalize_spaces(str(profile.get(field, "")))]
+            if missing_fields:
+                manual_payload["error"] = f"Заполните обязательные поля: {', '.join(missing_fields)}"
+                response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
+            else:
+                card_obj = Card.from_profile(profile)
+                profile["family_name"] = card_obj.family_name or profile.get("family_name", "")
+                profile["first_name"] = card_obj.first_name or profile.get("first_name", "")
+                profile["middle_name_en"] = card_obj.middle_name_en or profile.get("middle_name_en", profile.get("middle_name", ""))
+                card_id = self._create_autofill_card(profile, notes, source_hits, search_trace, field_sources)
+                response = ("", "302 Found", [("Location", f"/card/{card_id}")])
             self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
             return response
         finally:
@@ -3050,32 +3113,7 @@ class CompanyWebApp:
         profile_data["family_name"] = card_obj.family_name or profile_data.get("family_name", "")
         profile_data["first_name"] = card_obj.first_name or profile_data.get("first_name", "")
         profile_data["middle_name_en"] = card_obj.middle_name_en or profile_data.get("middle_name_en", profile_data.get("middle_name", ""))
-        status = self._status(notes, bool(ru_org and en_org))
-        with self._connect() as db:
-            cur = db.execute(
-                "INSERT INTO cards(ru_org,en_org,status,source,created_at,updated_at,data_json) VALUES(?,?,?,?,?,?,?)",
-                (
-                    ru_org,
-                    en_org,
-                    status,
-                    "autofill",
-                    self._now(),
-                    self._now(),
-                    json.dumps(
-                        {
-                            "notes": notes,
-                            "source_hits": source_names,
-                            "search_trace": search_trace,
-                            "field_provenance": field_provenance,
-                            "profile": profile_data,
-                        },
-                        ensure_ascii=False,
-                    ),
-                ),
-            )
-            card_id = cur.lastrowid
-            db.commit()
-        self._write_audit("create_autofill", card_id, {"ru_org": ru_org, "en_org": en_org, "status": status})
+        card_id = self._create_autofill_card(profile_data, notes, [{"source": s} for s in source_names], search_trace, field_provenance)
         return "", "302 Found", [("Location", f"/card/{card_id}")]
 
     def manual_get(self, query: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:

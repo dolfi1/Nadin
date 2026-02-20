@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import web_app
 from web_app import CompanyWebApp
 
@@ -146,7 +147,7 @@ def test_parse_rusprofile_person_page_extracts_name_from_h1(tmp_path, monkeypatc
     assert data["ru_org"] == "ПАО Сбербанк"
 
 
-def test_autofill_review_redirects_to_manual_without_draft_window(tmp_path, monkeypatch):
+def test_autofill_review_creates_card_when_required_fields_present(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
     monkeypatch.setattr(app, "_search_external_sources", lambda *_args, **_kwargs: ([], []))
@@ -179,10 +180,39 @@ def test_autofill_review_redirects_to_manual_without_draft_window(tmp_path, monk
 
     assert status == "302 Found"
     location = dict(headers)["Location"]
-    assert location.startswith("/create/manual?")
-    assert "profile_ru_org=" in location
-    assert "profile_inn=7707083893" in location
+    assert location.startswith("/card/")
 
+    with app._connect() as db:
+        saved = db.execute("SELECT * FROM cards ORDER BY id DESC LIMIT 1").fetchone()
+
+    assert saved is not None
+    payload = json.loads(saved["data_json"])
+    assert payload["profile"]["ru_org"] == "Сбербанк ПАО"
+    assert payload["profile"]["inn"] == "7707083893"
+
+
+
+
+def test_parse_rusprofile_company_page_extracts_leader_position(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_fetch_page(*_args, **_kwargs):
+        return (
+            "<html><body>"
+            "<h1>ПАО Сбербанк</h1>"
+            "ИНН 7707083893"
+            "<div>Руководитель ПРЕЗИДЕНТ, ПРЕДСЕДАТЕЛЬ ПРАВЛЕНИЯ Греф Герман Оскарович</div>"
+            "</body></html>"
+        )
+
+    monkeypatch.setattr(app, "_fetch_page", fake_fetch_page)
+
+    data = app._parse_rusprofile("https://www.rusprofile.ru/id/1027700132195")
+
+    assert data["surname_ru"] == "Греф"
+    assert data["name_ru"] == "Герман"
+    assert data["middle_name_ru"] == "Оскарович"
+    assert data["ru_position"] == "Президент, Председатель Правления"
 
 def test_build_person_candidates_groups_fio_and_org(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
