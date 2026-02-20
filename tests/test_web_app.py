@@ -123,6 +123,67 @@ def test_parse_rusprofile_url_input_uses_detail_page_directly(tmp_path, monkeypa
     assert called["urls"] == [raw_url]
 
 
+def test_parse_rusprofile_person_page_extracts_name_from_h1(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_get(_url, **_kwargs):
+        return FakeResponse(
+            "<html><body>"
+            "<h1>Греф Герман Оскарович</h1>"
+            "<div class='person-main-info-position'>президент, председатель правления</div>"
+            "<a href='/id/1027700132195'>ПАО Сбербанк</a>"
+            "ИНН: 7707083893"
+            "</body></html>"
+        )
+
+    monkeypatch.setattr(web_app.requests, "get", fake_get)
+
+    data = app._parse_rusprofile("https://www.rusprofile.ru/person/gref-go-770303580308")
+
+    assert data["surname_ru"] == "Греф"
+    assert data["name_ru"] == "Герман"
+    assert data["middle_name_ru"] == "Оскарович"
+    assert data["ru_org"] == "ПАО Сбербанк"
+
+
+def test_autofill_review_redirects_to_manual_without_draft_window(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(app, "_search_external_sources", lambda *_args, **_kwargs: ([], []))
+    monkeypatch.setattr(
+        app,
+        "_build_profile_from_sources",
+        lambda *_args, **_kwargs: (
+            {
+                "title": "",
+                "appeal": "Г-н",
+                "family_name": "Gref",
+                "first_name": "German",
+                "middle_name_en": "Oskarovich",
+                "surname_ru": "Греф",
+                "name_ru": "Герман",
+                "middle_name_ru": "Оскарович",
+                "gender": "М",
+                "inn": "7707083893",
+                "ru_org": "ПАО Сбербанк",
+                "en_org": "Sberbank PJSC",
+                "ru_position": "Президент",
+                "position": "President",
+                "en_position": "President",
+            },
+            {},
+        ),
+    )
+
+    _body, status, headers = app.autofill_review({"company_name": ["7707083893"]})
+
+    assert status == "302 Found"
+    location = dict(headers)["Location"]
+    assert location.startswith("/create/manual?")
+    assert "profile_ru_org=" in location
+    assert "profile_inn=7707083893" in location
+
+
 def test_build_person_candidates_groups_fio_and_org(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
