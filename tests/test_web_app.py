@@ -214,6 +214,31 @@ def test_parse_rusprofile_company_page_extracts_leader_position(tmp_path, monkey
     assert data["middle_name_ru"] == "Оскарович"
     assert data["ru_position"] == "Президент, Председатель Правления"
 
+
+
+def test_parse_rusprofile_company_page_extracts_from_meta_keywords_and_chief_title(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_fetch_page(*_args, **_kwargs):
+        return (
+            "<html><head>"
+            '<meta name="keywords" content="ПАО Сбербанк, ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО &quot;СБЕРБАНК РОССИИ&quot;, Греф Герман Оскарович, ИНН 7707083893">'
+            "</head><body>"
+            "<div class='company-info__item'><span class='chief-title'>ПРЕЗИДЕНТ, ПРЕДСЕДАТЕЛЬ ПРАВЛЕНИЯ</span></div>"
+            "</body></html>"
+        )
+
+    monkeypatch.setattr(app, "_fetch_page", fake_fetch_page)
+
+    data = app._parse_rusprofile("https://www.rusprofile.ru/id/1027700132195")
+
+    assert data["ru_org"] == "ПАО Сбербанк"
+    assert data["surname_ru"] == "Греф"
+    assert data["name_ru"] == "Герман"
+    assert data["middle_name_ru"] == "Оскарович"
+    assert data["inn"] == "7707083893"
+    assert data["ru_position"] == "Президент, Председатель Правления"
+
 def test_build_person_candidates_groups_fio_and_org(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
