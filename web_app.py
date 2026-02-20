@@ -189,6 +189,7 @@ class CompanyWebApp:
         self._last_search_time: dict[str, float] = {}
         self._endpoint_rate_limit: dict[str, list[float]] = defaultdict(list)
         self._thread_state = threading.local()
+        self._strict_scraping_mode = True
         self._init_db()
         self._clear_provider_cache_pattern("list-org.com")
         self._clear_provider_cache_pattern("list_org")
@@ -1156,15 +1157,18 @@ class CompanyWebApp:
         attempts = max(1, max_retries)
         blocked_domains = {"rusprofile.ru", "www.rusprofile.ru"}
         host = urlparse(url).netloc.lower()
+        enforce_strict_mode = self._strict_scraping_mode and host in blocked_domains
+        if enforce_strict_mode:
+            logger.info("Strict scraping mode is enabled for %s: proxy/captcha bypass is disabled", host)
         for attempt in range(attempts):
             try:
                 if host in blocked_domains and attempt > 0:
                     time.sleep(random.uniform(3.0, 7.0))
-                if host in blocked_domains:
+                if host in blocked_domains and not enforce_strict_mode:
                     headers = self._get_stealth_headers()
                 else:
                     headers = self._get_random_headers(self._get_random_user_agent())
-                proxies = self._get_random_proxy() if attempt > 0 else None
+                proxies = None if enforce_strict_mode else (self._get_random_proxy() if attempt > 0 else None)
                 response = requests.get(url, timeout=timeout, headers=headers, verify=True, allow_redirects=True, proxies=proxies)
                 status_code = getattr(response, "status_code", 200 if getattr(response, "ok", False) else 500)
                 response_text = response.text
