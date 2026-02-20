@@ -152,7 +152,7 @@ CARD_FIELDS: list[tuple[str, str]] = [
     ("ru_org", "Организация"),
     ("en_org", "Organization"),
     ("ru_position", "Должность"),
-    ("position", "Position"),
+    ("en_position", "Position"),
 ]
 
 REQUIRED_FIELDS = ["surname_ru", "name_ru", "gender", "ru_org", "en_org", "ru_position", "en_position"]
@@ -205,6 +205,11 @@ class CompanyWebApp:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _profile_value(self, profile: dict[str, Any], field: str) -> str:
+        if field == "en_position":
+            return str(profile.get("en_position") or profile.get("position") or "")
+        return str(profile.get(field, ""))
 
     def _init_db(self) -> None:
         with self._connect() as db:
@@ -3533,7 +3538,7 @@ class CompanyWebApp:
             profile = {field: "" for field, _ in CARD_FIELDS}
             profile["ru_org"] = card["ru_org"]
             profile["en_org"] = card["en_org"]
-        lines = "".join(f"<tr><td>{escape(label)}</td><td>{escape(profile.get(field, ''))}</td></tr>" for field, label in CARD_FIELDS)
+        lines = "".join(f"<tr><td>{escape(label)}</td><td>{escape(self._profile_value(profile, field))}</td></tr>" for field, label in CARD_FIELDS)
         content = (
             f"<h2>Карточка #{card['id']}</h2>"
             "<table border='1' cellpadding='6' cellspacing='0'>"
@@ -3554,20 +3559,37 @@ class CompanyWebApp:
         if not card:
             return "Not found", "404 Not Found", [("Content-Type", "text/plain; charset=utf-8")]
 
+        payload = json.loads(card["data_json"] or "{}")
+        profile = payload.get("profile", {})
+        if not profile:
+            profile = {field: "" for field, _ in CARD_FIELDS}
+            profile["ru_org"] = card["ru_org"]
+            profile["en_org"] = card["en_org"]
+        inputs = "".join(
+            "<tr>"
+            f"<td>{escape(label)}</td>"
+            f"<td><input name='{escape(field)}' value='{escape(self._profile_value(profile, field))}'></td>"
+            "</tr>"
+            for field, label in CARD_FIELDS
+        )
         content = (
             f"<h2>Редактирование карточки #{card['id']}</h2>"
             f"<form method='post' action='/card/{card['id']}/edit'>"
-            f"<p>Организация RU <input name='ru_org' value='{escape(card['ru_org'])}'></p>"
-            f"<p>Organization EN <input name='en_org' value='{escape(card['en_org'])}'></p>"
-            "<button>Сохранить изменения</button>"
+            "<table border='1' cellpadding='6' cellspacing='0'>"
+            f"{inputs}</table>"
+            "<p><button>Сохранить изменения</button></p>"
             "</form>"
         )
         body = self._page(f"Редактирование карточки #{card['id']}", content, back_href=f"/card/{card_id}")
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
     def card_edit_post(self, card_id: int, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
-        ru_org, ru_notes = self.normalize_ru_org(self._get_one(form, "ru_org"))
-        en_org, en_notes = self.normalize_en_org(self._get_one(form, "en_org"), ru_org)
+        profile = {field: self._get_one(form, field) for field, _ in CARD_FIELDS}
+        ru_org, ru_notes = self.normalize_ru_org(profile.get("ru_org", ""))
+        en_org, en_notes = self.normalize_en_org(profile.get("en_org", ""), ru_org)
+        profile["ru_org"] = ru_org
+        profile["en_org"] = en_org
+        profile["position"] = profile.get("en_position", "")
         notes = ru_notes + en_notes
         status = self._status(notes, bool(ru_org and en_org))
 
@@ -3578,6 +3600,7 @@ class CompanyWebApp:
 
             payload = json.loads(card["data_json"] or "{}")
             payload["notes"] = notes
+            payload["profile"] = profile
             db.execute(
                 "UPDATE cards SET ru_org=?, en_org=?, status=?, updated_at=?, data_json=? WHERE id=?",
                 (ru_org, en_org, status, self._now(), json.dumps(payload, ensure_ascii=False), card_id),
@@ -3600,7 +3623,7 @@ class CompanyWebApp:
             profile = {field: "" for field, _ in CARD_FIELDS}
             profile["ru_org"] = card["ru_org"]
             profile["en_org"] = card["en_org"]
-        lines = "\n".join(f"{label}: {profile.get(field, '')}" for field, label in CARD_FIELDS)
+        lines = "\n".join(f"{label}: {self._profile_value(profile, field)}" for field, label in CARD_FIELDS)
         source_rows = "".join(
             f"<tr><td>{escape(label)}</td><td>{escape(field_sources.get(field, '—'))}</td></tr>"
             for field, label in CARD_FIELDS

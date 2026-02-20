@@ -796,3 +796,66 @@ def test_build_profile_from_sources_keeps_special_case_position_and_names(tmp_pa
     assert profile["ru_position"] == "Президент, Председатель правления"
     assert profile["en_position"] == "President, Chairman of the Board"
     assert profile["en_org"] == "Sberbank PJSC"
+
+def test_card_view_renders_en_position_from_profile_field(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    profile = {
+        "surname_ru": "Иванов",
+        "name_ru": "Иван",
+        "gender": "М",
+        "ru_org": "ООО Ромашка",
+        "en_org": "Romashka LLC",
+        "ru_position": "Генеральный директор",
+        "en_position": "General Director",
+    }
+    card_id = app._create_autofill_card(profile, [], [], [], {})
+
+    body, status, _headers = app.card_view(card_id)
+
+    assert status == "200 OK"
+    assert "<td>Position</td><td>General Director</td>" in body
+
+
+def test_card_edit_post_updates_profile_and_redirects_to_table_view(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    profile = {
+        "surname_ru": "Иванов",
+        "name_ru": "Иван",
+        "gender": "М",
+        "ru_org": "ООО Ромашка",
+        "en_org": "Romashka LLC",
+        "ru_position": "Генеральный директор",
+        "en_position": "General Director",
+        "first_name": "Ivan",
+    }
+    card_id = app._create_autofill_card(profile, [], [], [], {})
+
+    _body, status, headers = app.card_edit_post(
+        card_id,
+        {
+            "title": ["Mr"],
+            "appeal": ["Г-н"],
+            "family_name": ["Ivanov"],
+            "first_name": ["John"],
+            "middle_name_en": ["Petrovich"],
+            "surname_ru": ["Иванов"],
+            "name_ru": ["Иван"],
+            "middle_name_ru": ["Петрович"],
+            "gender": ["М"],
+            "inn": ["7707083893"],
+            "ru_org": ["ООО Ромашка"],
+            "en_org": ["Romashka LLC"],
+            "ru_position": ["Генеральный директор"],
+            "en_position": ["Chief Executive Officer"],
+        },
+    )
+
+    assert status == "302 Found"
+    assert dict(headers)["Location"] == f"/card/{card_id}"
+
+    body, view_status, _headers = app.card_view(card_id)
+    assert view_status == "200 OK"
+    assert "<td>First name</td><td>John</td>" in body
+    assert "<td>Position</td><td>Chief Executive Officer</td>" in body
