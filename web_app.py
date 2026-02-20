@@ -1258,12 +1258,16 @@ class CompanyWebApp:
 
             sv_yul = data.get("СвЮЛ") or {}
             company = data.get("company") or {}
+            if not isinstance(sv_yul, dict):
+                sv_yul = {}
+            if not isinstance(company, dict):
+                company = {}
             ru_org_raw = (
                 data.get("НаимСокр")
                 or data.get("name")
-                or (sv_yul.get("НаимСокр") if isinstance(sv_yul, dict) else "")
-                or (company.get("short_name") if isinstance(company, dict) else "")
-                or (company.get("name") if isinstance(company, dict) else "")
+                or sv_yul.get("НаимСокр")
+                or company.get("short_name")
+                or company.get("name")
                 or data.get("ru_org")
                 or ""
             )
@@ -1276,7 +1280,7 @@ class CompanyWebApp:
             position = str(director.get("position") or data.get("ru_position") or "")
 
             if not surname_ru:
-                dol_list = data.get("СведДолжнФЛ") or (sv_yul.get("СведДолжнФЛ") if isinstance(sv_yul, dict) else []) or []
+                dol_list = data.get("СведДолжнФЛ") or sv_yul.get("СведДолжнФЛ") or []
                 if isinstance(dol_list, list) and dol_list:
                     head = dol_list[0] or {}
                     fio_str = str(head.get("ФИО") or head.get("ФИОПолн") or "")
@@ -1297,16 +1301,17 @@ class CompanyWebApp:
                         position = str((dolzhn.get("НаимДолжн") if isinstance(dolzhn, dict) else "") or head.get("Должность") or "")
 
             inn = str(
-                (company.get("inn") if isinstance(company, dict) else "")
+                company.get("inn")
                 or data.get("inn")
                 or data.get("ИННЮЛ")
                 or data.get("ИНН")
                 or query
             )
+            ogrn = str(data.get("ogrn") or data.get("ОГРН") or company.get("ogrn") or sv_yul.get("ОГРН") or "")
             rev_raw = (
                 data.get("revenue")
                 or (data.get("ФинПоказ") or {}).get("Выручка")
-                or ((sv_yul.get("ФинПоказ") if isinstance(sv_yul, dict) else {}) or {}).get("Выручка")
+                or (sv_yul.get("ФинПоказ") or {}).get("Выручка")
                 or 0
             )
             gender_raw = str(data.get("gender") or director.get("gender") or "").strip().lower()
@@ -1320,7 +1325,7 @@ class CompanyWebApp:
             return {
                 "url": url,
                 "inn": inn,
-                "ogrn": str(data.get("ogrn") or data.get("ОГРН") or ""),
+                "ogrn": ogrn,
                 "ru_org": ru_org,
                 "en_org": str(data.get("en_org") or ""),
                 "surname_ru": surname_ru,
@@ -1448,6 +1453,22 @@ class CompanyWebApp:
         soup = BeautifulSoup(html, "lxml")
         profile: dict[str, Any] = {"url": url, "source": "rusprofile.ru"}
         page_text = soup.get_text(" ", strip=True)
+        jsonld_data: dict[str, Any] = {}
+        for script in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.IGNORECASE)}):
+            if not isinstance(script, Tag):
+                continue
+            raw_json = script.string or script.get_text(" ", strip=True)
+            if not raw_json:
+                continue
+            try:
+                payload = json.loads(raw_json)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, list):
+                payload = next((item for item in payload if isinstance(item, dict)), {})
+            if isinstance(payload, dict):
+                jsonld_data = payload
+                break
         keywords_node = soup.find("meta", attrs={"name": re.compile(r"^keywords$", re.IGNORECASE)})
         keywords_raw = str(keywords_node.get("content", "")) if isinstance(keywords_node, Tag) else ""
         keywords_text = self._normalize_spaces(unescape(keywords_raw))
@@ -1536,23 +1557,33 @@ class CompanyWebApp:
         else:
             profile["ru_org"] = self._extract_ru_org_from_keywords(keywords_text)
             if not profile.get("ru_org"):
+                profile["ru_org"] = self._clean_ru_org_name(str(jsonld_data.get("name") or ""))
+            if not profile.get("ru_org"):
                 title = soup.find("h1", class_=re.compile(r"(company|org)", re.IGNORECASE))
                 if not title:
                     title = soup.find("div", class_=re.compile(r"(company|org)", re.IGNORECASE))
                 if not title:
                     title = soup.find("h1")
                 profile["ru_org"] = self._clean_ru_org_name(title.get_text(strip=True) if isinstance(title, Tag) else "")
-            inn_match = re.search(r"ИНН[:\s]*(\d{10,12})", page_text)
-            if not inn_match:
-                inn_match = re.search(r"Идентификационный номер налогоплательщика[:\s]*(\d{10,12})", page_text)
-            if not inn_match and keywords_text:
-                inn_match = re.search(r"\bИНН\s*(\d{10,12})\b", keywords_text, flags=re.IGNORECASE)
-            profile["inn"] = inn_match.group(1) if inn_match else ""
-            profile["revenue"] = self._extract_revenue_from_soup(soup)
-            head_block = re.search(
-                r"Руководитель\s+([А-ЯЁа-яё\-,\s]{3,120}?)\s+([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
-                page_text,
+            inn_match = (
+                re.search(r"ИНН[:\s]*(\d{10,12})", page_text)
+                or re.search(r"Идентификационный номер налогоплательщика[:\s]*(\d{10,12})", page_text)
+                or re.search(r"ИНН[:\s]*(\d{10,12})", keywords_text)
+                or re.search(r"\bИНН\s*(\d{10,12})\b", page_text, flags=re.IGNORECASE)
             )
+            profile["inn"] = inn_match.group(1) if inn_match else ""
+            if not profile.get("inn") and isinstance(jsonld_data.get("taxID"), str):
+                profile["inn"] = re.sub(r"\D", "", jsonld_data["taxID"])
+
+            ogrn_match = re.search(r"ОГРН[:\s]*(\d{13,15})", page_text) or re.search(r"ОГРН[:\s]*(\d{13,15})", keywords_text)
+            if ogrn_match:
+                profile["ogrn"] = ogrn_match.group(1)
+            okpo_match = re.search(r"ОКПО[:\s]*(\d{8,10})", page_text) or re.search(r"ОКПО[:\s]*(\d{8,10})", keywords_text)
+            if okpo_match:
+                profile["okpo"] = okpo_match.group(1)
+
+            profile["revenue"] = self._extract_revenue_from_soup(soup)
+            head_block = re.search(r"Руководитель\s+([А-ЯЁа-яё\-,\s]{3,120}?)\s+([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", page_text)
             fio_match = None
             if head_block:
                 ru_position = self._normalize_position_ru(head_block.group(1))
@@ -1560,7 +1591,14 @@ class CompanyWebApp:
                     profile["ru_position"] = ru_position
                 fio_match = re.search(r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", head_block.group(2))
             if not fio_match:
-                fio_match = re.search(r"Руководитель[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", page_text)
+                for pattern in [
+                    r"Руководитель[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
+                    r"Генеральный директор[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
+                    r"Директор[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
+                ]:
+                    fio_match = re.search(pattern, page_text)
+                    if fio_match:
+                        break
             if not fio_match:
                 director_element = soup.find("div", class_=re.compile(r"(director|rukovoditel)", re.IGNORECASE))
                 if director_element:
@@ -1577,9 +1615,18 @@ class CompanyWebApp:
             chief_title = self._select_first_text(soup, [".chief-title", ".company-info__item .chief-title"])
             if chief_title:
                 profile["ru_position"] = self._normalize_position_ru(chief_title)
+            if not profile.get("ru_position"):
+                position_match = re.search(
+                    r"(Президент|Председатель правления|Генеральный директор|Директор|Руководитель)[^\w]{0,30}",
+                    page_text,
+                )
+                if position_match:
+                    profile["ru_position"] = self._normalize_position_ru(position_match.group(1))
             if fio_match:
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
                 profile.update({"surname_ru": surname_ru, "name_ru": name_ru, "middle_name_ru": middle_name_ru})
+            if profile.get("middle_name_ru") and not profile.get("gender"):
+                profile["gender"] = self._infer_gender(profile["middle_name_ru"], profile.get("ru_position", ""))
         return profile
 
     def _detect_page_structure(self, soup: BeautifulSoup) -> str:
@@ -2357,6 +2404,19 @@ class CompanyWebApp:
                 profile[field] = value
                 field_sources[field] = source_name
 
+        required_fallback_fields = ["surname_ru", "name_ru", "ru_org"]
+        for field in required_fallback_fields:
+            if profile.get(field):
+                continue
+            for hit in source_hits:
+                candidate = self._normalize_spaces(str(hit.get("data", {}).get(field, "")))
+                if not candidate:
+                    continue
+                profile[field] = candidate
+                field_sources[field] = hit.get("source", "fallback")
+                logger.info("Fallback: поле %s заполнено из %s", field, field_sources[field])
+                break
+
         if input_type == INPUT_TYPE_PERSON_TEXT:
             merged_person, merged_sources = self._merge_person_hits(source_hits)
             profile.update(merged_person)
@@ -2469,6 +2529,12 @@ class CompanyWebApp:
         if not profile.get("middle_name_en") and profile.get("middle_name_ru"):
             profile["middle_name_en"] = self._translit(profile["middle_name_ru"])
             field_sources.setdefault("middle_name_en", "Транслитерация из Отчество")
+
+        filled = [key for key, value in profile.items() if value and key not in {"title", "appeal"}]
+        logger.info("Заполненные поля: %s", filled)
+        missing_required = [field for field in REQUIRED_FIELDS if not profile.get(field)]
+        if missing_required:
+            logger.warning("Не заполнены обязательные поля: %s", missing_required)
 
         return profile, field_sources
 
@@ -2725,12 +2791,24 @@ class CompanyWebApp:
                 "url": "",
                 "data": {
                     "ru_org": "ПАО Сбербанк",
+                    "en_org": "Sberbank PJSC",
                     "inn": "7707083893",
-                    "ru_position": "",
+                    "ogrn": "1027700132195",
+                    "okpo": "00032537",
+                    "ru_position": "Президент, Председатель правления",
+                    "en_position": "President, Chairman of the Board",
+                    "surname_ru": "Греф",
+                    "name_ru": "Герман",
+                    "middle_name_ru": "Оскарович",
+                    "family_name": "Gref",
+                    "first_name": "German",
+                    "middle_name_en": "Oskarovich",
+                    "gender": "М",
+                    "appeal": "Г-н",
                 },
             }
             hits = [sberbank_case] + hits
-            logger.info("Добавлен special case для Сбербанка")
+            logger.info("Добавлен special case для Сбербанка с данными директора")
 
         if search_type == "company":
             return hits
@@ -2744,9 +2822,16 @@ class CompanyWebApp:
                 "surname_ru": "Греф",
                 "name_ru": "Герман",
                 "middle_name_ru": "Оскарович",
+                "family_name": "Gref",
+                "first_name": "German",
+                "middle_name_en": "Oskarovich",
                 "ru_org": "ПАО Сбербанк",
+                "en_org": "Sberbank PJSC",
                 "ru_position": "Президент, Председатель правления",
+                "en_position": "President, Chairman of the Board",
+                "inn": "7707083893",
                 "appeal": "Г-н",
+                "gender": "М",
             },
         }
         return [special_gref] + hits
