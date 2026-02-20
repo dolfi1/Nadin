@@ -3005,8 +3005,6 @@ class CompanyWebApp:
                 "<h3>Карточка и источники по полям</h3>"
                 f"{source_table_rows}"
                 "<form method='post' action='/autofill/confirm'>"
-                f"<p>RU: <input name='ru_org' value='{escape(ru_org)}'/></p>"
-                f"<p>EN: <input name='en_org' value='{escape(en_org)}'/></p>"
                 "<p style='color:#b22'>* Обязательные поля</p>"
                 f"{editable_fields}"
                 f"<input type='hidden' name='input_value' value='{escape(raw)}'/>"
@@ -3029,8 +3027,6 @@ class CompanyWebApp:
         action = self._get_one(form, "action") or "edit"
         if action == "cancel":
             return "", "302 Found", [("Location", "/")]
-        ru_org = self._get_one(form, "ru_org")
-        en_org = self._get_one(form, "en_org")
         notes = form.get("notes", [])
         source_names = form.get("source_name", [])
         search_trace = form.get("search_trace", [])
@@ -3044,6 +3040,8 @@ class CompanyWebApp:
             for key in form
             if key.startswith("profile_")
         }
+        ru_org = profile_data.get("ru_org", self._get_one(form, "ru_org"))
+        en_org = profile_data.get("en_org", self._get_one(form, "en_org"))
         profile_data["ru_org"] = ru_org
         profile_data["en_org"] = en_org
         if profile_data.get("position") and not profile_data.get("en_position"):
@@ -3124,12 +3122,20 @@ class CompanyWebApp:
         ru_org, _ = self.normalize_ru_org(q) if q else ("", [])
         ru_org = profile_prefill.get("ru_org", ru_org)
         en_org = profile_prefill.get("en_org", en_org)
+        surname_ru = profile_prefill.get("surname_ru", person_ru.split()[0] if person_ru else "")
+        name_ru = profile_prefill.get("name_ru", person_ru.split()[1] if len(person_ru.split()) > 1 else "")
+        middle_name_ru = profile_prefill.get("middle_name_ru", person_ru.split()[2] if len(person_ru.split()) > 2 else "")
+        family_name = profile_prefill.get("family_name", person_en.split()[0] if person_en else "")
+        first_name = profile_prefill.get("first_name", person_en.split()[1] if len(person_en.split()) > 1 else "")
+        middle_name_en = profile_prefill.get("middle_name_en", person_en.split()[2] if len(person_en.split()) > 2 else "")
+        appeal = profile_prefill.get("appeal", self._derive_salutation(gender))
+        inn = profile_prefill.get("inn", (query.get("inn") or [""])[0])
         if profile_prefill:
-            person_ru = " ".join(filter(None, [profile_prefill.get("surname_ru", ""), profile_prefill.get("name_ru", ""), profile_prefill.get("middle_name_ru", "")]))
-            person_en = " ".join(filter(None, [profile_prefill.get("family_name", ""), profile_prefill.get("first_name", ""), profile_prefill.get("middle_name_en", "")]))
             ru_position = profile_prefill.get("ru_position", ru_position)
             en_position = profile_prefill.get("en_position", profile_prefill.get("position", en_position))
             gender = profile_prefill.get("gender", gender)
+            appeal = profile_prefill.get("appeal", appeal)
+            inn = profile_prefill.get("inn", inn)
         male_selected = " selected" if gender == "М" else ""
         female_selected = " selected" if gender == "Ж" else ""
         error_html = f"<p style='color:#b22'>{escape(error)}</p>" if error else ""
@@ -3137,11 +3143,18 @@ class CompanyWebApp:
             "<h2>Ручное создание</h2>"
             f"{error_html}"
             "<form method='post' action='/create/manual'>"
+            f"<p>Титул <input name='title' value='{escape(profile_prefill.get('title', ''))}'></p>"
+            f"<p>Обращение <input name='appeal' value='{escape(appeal)}'></p>"
+            f"<p>Family name <input name='family_name' value='{escape(family_name)}'></p>"
+            f"<p>First name <input name='first_name' value='{escape(first_name)}'></p>"
+            f"<p>Middle name (EN) <input name='middle_name_en' value='{escape(middle_name_en)}'></p>"
+            f"<p>Фамилия <input name='surname_ru' value='{escape(surname_ru)}'></p>"
+            f"<p>Имя <input name='name_ru' value='{escape(name_ru)}'></p>"
+            f"<p>Middle name. рус <input name='middle_name_ru' value='{escape(middle_name_ru)}'></p>"
             f"<p>Организация RU <input name='ru_org' value='{escape(ru_org)}'></p>"
             f"<p>Organization EN <input name='en_org' value='{escape(en_org)}'></p>"
-            f"<p>ФИО RU <input name='person_ru' value='{escape(person_ru)}'></p>"
-            f"<p>FIO EN <input name='person_en' value='{escape(person_en)}'></p>"
             f"<p>Пол <select name='gender'><option value=''>--</option><option{male_selected}>М</option><option{female_selected}>Ж</option></select></p>"
+            f"<p>ИНН <input name='inn' value='{escape(inn)}'></p>"
             f"<p>Должность RU <input name='ru_position' value='{escape(ru_position)}'></p>"
             f"<p>Position EN <input name='en_position' value='{escape(en_position)}'></p>"
             "<button>Сохранить</button></form>"
@@ -3152,15 +3165,21 @@ class CompanyWebApp:
     def manual_post(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         ru_org, ru_notes = self.normalize_ru_org(self._get_one(form, "ru_org"))
         en_org, en_notes = self.normalize_en_org(self._get_one(form, "en_org"), ru_org)
-        person_ru = self._get_one(form, "person_ru")
         gender = self._get_one(form, "gender")
         errors: list[str] = []
-        if person_ru and gender not in {"М", "Ж"}:
+        if (self._get_one(form, "surname_ru") or self._get_one(form, "name_ru")) and gender not in {"М", "Ж"}:
             errors.append("Пол обязателен: М/Ж")
         profile = {
-            "surname_ru": self._get_one(form, "surname_ru") or (person_ru.split()[0] if person_ru else ""),
-            "name_ru": self._get_one(form, "name_ru") or (person_ru.split()[1] if len(person_ru.split()) > 1 else ""),
+            "title": self._get_one(form, "title"),
+            "appeal": self._get_one(form, "appeal") or self._derive_salutation(gender),
+            "family_name": self._get_one(form, "family_name"),
+            "first_name": self._get_one(form, "first_name"),
+            "middle_name_en": self._get_one(form, "middle_name_en"),
+            "surname_ru": self._get_one(form, "surname_ru"),
+            "name_ru": self._get_one(form, "name_ru"),
+            "middle_name_ru": self._get_one(form, "middle_name_ru"),
             "gender": gender,
+            "inn": self._get_one(form, "inn"),
             "ru_org": ru_org,
             "en_org": en_org,
             "ru_position": self._get_one(form, "ru_position"),
@@ -3175,23 +3194,28 @@ class CompanyWebApp:
             params = {
                 "q": ru_org,
                 "en_org": en_org,
-                "person_ru": person_ru,
-                "person_en": self._get_one(form, "person_en"),
+                "inn": profile["inn"],
                 "gender": gender,
                 "ru_position": self._get_one(form, "ru_position"),
                 "en_position": self._get_one(form, "en_position"),
                 "error": "; ".join(errors),
             }
+            for key, value in profile.items():
+                params[f"profile_{key}"] = value
             return "", "302 Found", [("Location", f"/create/manual?{urlencode(params)}")]
+
+        card_obj = Card.from_profile(profile)
+        profile["family_name"] = card_obj.family_name or profile["family_name"]
+        profile["first_name"] = card_obj.first_name or profile["first_name"]
+        profile["middle_name_en"] = card_obj.middle_name_en or profile["middle_name_en"]
 
         data = {
             "notes": notes,
-            "person_ru": person_ru,
-            "person_en": self._get_one(form, "person_en"),
+            "profile": profile,
             "gender": gender,
             "ru_position": self._get_one(form, "ru_position"),
             "en_position": self._get_one(form, "en_position"),
-                    }
+        }
         with self._connect() as db:
             cur = db.execute(
                 "INSERT INTO cards(ru_org,en_org,status,source,created_at,updated_at,data_json) VALUES(?,?,?,?,?,?,?)",
