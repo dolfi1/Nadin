@@ -1543,7 +1543,9 @@ class CompanyWebApp:
         profile["middle_name_ru"] = parts[2] if len(parts) > 2 else ""
 
     def _parse_rusprofile_new(self, soup: BeautifulSoup, profile: dict[str, Any]) -> None:
-        name_element = soup.find("div", class_=re.compile(r"person-main-info", re.IGNORECASE))
+        name_element = soup.find("h1")
+        if not isinstance(name_element, Tag):
+            name_element = soup.select_one(".person-main-info__name, .person-main-info-name, .person-main-info")
         full_name = self._normalize_spaces(name_element.get_text(" ", strip=True)) if isinstance(name_element, Tag) else ""
         parts = full_name.split()
         profile["surname_ru"] = parts[0] if parts else ""
@@ -2968,56 +2970,23 @@ class CompanyWebApp:
             else:
                 notes.append("Источники: не получено (в источниках нет данных по запросу)")
 
-            field_statuses = self._field_statuses(profile, notes)
-
-            source_hidden = "".join(f"<input type='hidden' name='source_name' value='{escape(item['source'])}'/>" for item in source_hits)
-            trace_hidden = "".join(f"<input type='hidden' name='search_trace' value='{escape(step)}'/>" for step in search_trace)
-            editable_fields = ""
-            for field, label in CARD_FIELDS:
-                value = str(profile.get(field, ""))
-                mark = " *" if field in REQUIRED_FIELDS else ""
-                if field == "gender":
-                    editable_fields += (
-                        f"<p><b>{escape(label)}{mark}</b>: <select name='profile_{escape(field)}'>"
-                        f"<option value=''>--</option>"
-                        f"<option value='М'{' selected' if value == 'М' else ''}>М</option>"
-                        f"<option value='Ж'{' selected' if value == 'Ж' else ''}>Ж</option>"
-                        "</select></p>"
-                    )
-                else:
-                    editable_fields += f"<p><b>{escape(label)}{mark}</b>: <input name='profile_{escape(field)}' value='{escape(value)}' style='width:100%'></p>"
-            hidden = "".join(f"<input type='hidden' name='notes' value='{escape(n)}'/>" for n in notes)
-            source_list = (
-                "<h3>Найдено в доступных источниках</h3><ul>"
-                + "".join(
-                    f"<li>{escape(item['source'])}: {escape(item['data'].get('ru_org', '') or '/')} / </li>" for item in source_hits
-                )
-                + "</ul>"
-            ) if source_hits else "<p>В доступных источниках совпадений не найдено.</p>"
-            source_table_rows = self._render_profile(profile, field_sources, notes)
-            if any("автотранслит" in n.lower() for n in notes):
-                source_table_rows = "<div style='background:#fff7cc;padding:8px;border:1px solid #e0c95b'>⚠ Требуется ручная проверка перевода организации EN (автотранслит)</div>" + source_table_rows
-            search_trace_list = "<h3>Как происходил поиск</h3><ol>" + "".join(f"<li>{escape(step)}</li>" for step in search_trace) + "</ol>"
-            content = (
-                "<h2>Автосбор: черновик</h2>"
-                f"{source_list}"
-                f"{search_trace_list}"
-                "<h3>Карточка и источники по полям</h3>"
-                f"{source_table_rows}"
-                "<form method='post' action='/autofill/confirm'>"
-                "<p style='color:#b22'>* Обязательные поля</p>"
-                f"{editable_fields}"
-                f"<input type='hidden' name='input_value' value='{escape(raw)}'/>"
-                f"{hidden}{source_hidden}{trace_hidden}"
-                "<button name='action' value='edit'>✏️ Отредактировать</button>"
-                "<button name='action' value='cancel'>❌ Отмена</button></form>"
-                f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(raw)}'/><input type='hidden' name='no_cache' value='1'/><button>Повторить без кэша</button></form>"
-                + (
-                    f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(raw)}'/><input type='hidden' name='reset_cache' value='1'/><button>Сбросить кэш по этому запросу</button></form>"
-                )
-            )
-            body = self._page("Автосбор: черновик", content, back_href="/")
-            response = (body, "200 OK", [("Content-Type", "text/html; charset=utf-8")])
+            _ = self._field_statuses(profile, notes)
+            manual_payload = {
+                "q": profile.get("ru_org", "") or raw,
+                "en_org": profile.get("en_org", ""),
+                "person_ru": " ".join(
+                    x for x in [profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")] if x
+                ).strip(),
+                "person_en": " ".join(
+                    x for x in [profile.get("family_name", ""), profile.get("first_name", ""), profile.get("middle_name_en", "")] if x
+                ).strip(),
+                "gender": profile.get("gender", ""),
+                "ru_position": profile.get("ru_position", ""),
+                "en_position": profile.get("en_position", profile.get("position", "")),
+            }
+            for key, value in profile.items():
+                manual_payload[f"profile_{key}"] = value
+            response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
             self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
             return response
         finally:
