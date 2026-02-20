@@ -558,5 +558,5 @@ def test_manual_post_validates_required_fields_and_redirects_back(tmp_path):
 def test_provider_chain_for_inn_prioritizes_reliable_sources(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
     providers = app._provider_chain(web_app.INPUT_TYPE_INN, "7707083893")
-    names = [p["name"] for p in providers[:4]]
-    assert names == ["ФНС ЕГРЮЛ", "ФНС Интеграция ЕГРЮЛ/ЕГРИП", "Банк России", "РБК Компании"]
+    names = [p["name"] for p in providers]
+    assert names == ["ФНС ЕГРЮЛ", "rusprofile.ru"]
