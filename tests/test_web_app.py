@@ -193,6 +193,69 @@ def test_autofill_review_creates_card_when_required_fields_present(tmp_path, mon
 
 
 
+
+
+def test_autofill_review_uses_source_hits_when_profile_builder_misses_fields(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(
+        app,
+        "_search_external_sources",
+        lambda *_args, **_kwargs: (
+            [
+                {
+                    "source": "ФНС ЕГРЮЛ",
+                    "type": "company",
+                    "data": {
+                        "surname_ru": "Иванов",
+                        "name_ru": "Иван",
+                        "ru_org": "ООО Ромашка",
+                        "en_org": "Romashka LLC",
+                    },
+                }
+            ],
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        app,
+        "_build_profile_from_sources",
+        lambda *_args, **_kwargs: ({field: "" for field, _ in web_app.CARD_FIELDS}, {}),
+    )
+
+    _body, status, headers = app.autofill_review({"company_name": ["ООО Ромашка"]})
+
+    assert status == "302 Found"
+    location = dict(headers)["Location"]
+    assert location.startswith("/create/manual?")
+    assert "profile_surname_ru=%D0%98%D0%B2%D0%B0%D0%BD%D0%BE%D0%B2" in location
+    assert "profile_name_ru=%D0%98%D0%B2%D0%B0%D0%BD" in location
+    assert "profile_en_org=Romashka+LLC" in location
+
+
+def test_build_profile_from_sources_fills_en_org_from_regular_sources(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    hits = [
+        {
+            "source": "rusprofile.ru",
+            "type": "company",
+            "data": {
+                "ru_org": "ООО Ромашка",
+                "en_org": "Romashka LLC",
+                "en_position": "General Director",
+                "surname_ru": "Иванов",
+                "name_ru": "Иван",
+            },
+        }
+    ]
+
+    profile, sources = app._build_profile_from_sources(hits, "ООО Ромашка", web_app.INPUT_TYPE_ORG_TEXT)
+
+    assert profile["en_org"] == "Romashka LLC"
+    assert sources["en_org"] == "rusprofile.ru"
+
+
 def test_parse_rusprofile_company_page_extracts_leader_position(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 

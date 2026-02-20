@@ -2448,7 +2448,17 @@ class CompanyWebApp:
             )
             if not isinstance(data, dict):
                 continue
-            for field in ["surname_ru", "name_ru", "middle_name_ru", "gender", "ru_org", "inn", "ru_position"]:
+            for field in [
+                "surname_ru",
+                "name_ru",
+                "middle_name_ru",
+                "gender",
+                "ru_org",
+                "inn",
+                "ru_position",
+                "en_org",
+                "en_position",
+            ]:
                 if data.get(field) and not profile.get(field):
                     profile[field] = str(data[field])
                     field_sources[field] = source_name
@@ -2478,8 +2488,15 @@ class CompanyWebApp:
 
         if input_type == INPUT_TYPE_PERSON_TEXT:
             merged_person, merged_sources = self._merge_person_hits(source_hits)
-            profile.update(merged_person)
-            field_sources.update({k: v for k, v in merged_sources.items() if v})
+            for key, value in merged_person.items():
+                if not value:
+                    continue
+                if field_sources.get(key) == "special_case":
+                    continue
+                if not profile.get(key):
+                    profile[key] = value
+                    if merged_sources.get(key):
+                        field_sources[key] = merged_sources[key]
             merged_profile = self._merge_profiles(source_hits, raw_name)
             for key in ["ru_org", "en_org", "ru_position", "en_position", "middle_name_ru", "middle_name_en"]:
                 if not profile.get(key) and merged_profile.get(key):
@@ -3195,7 +3212,30 @@ class CompanyWebApp:
 
             source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache)
             search_trace = reset_note + search_trace
+            extracted_data: dict[str, str] = {}
+            for hit in source_hits:
+                data = hit.get("data", {})
+                if not isinstance(data, dict):
+                    continue
+                for field in [
+                    "surname_ru",
+                    "name_ru",
+                    "middle_name_ru",
+                    "ru_org",
+                    "en_org",
+                    "ru_position",
+                    "en_position",
+                    "gender",
+                    "inn",
+                ]:
+                    value = self._normalize_spaces(str(data.get(field, "")))
+                    if value and not extracted_data.get(field):
+                        extracted_data[field] = value
             profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type)
+            for key, value in extracted_data.items():
+                if value and not profile.get(key):
+                    profile[key] = value
+                    field_sources[key] = "Источник данных"
 
             if "сбербанк" in normalized_raw or "сбер" in normalized_raw:
                 profile.update({
@@ -3370,9 +3410,14 @@ class CompanyWebApp:
             name_ru = person_ru_parts[1] if len(person_ru_parts) > 1 else ""
             middle_name_ru = person_ru_parts[2] if len(person_ru_parts) > 2 else ""
 
-        family_name = profile_prefill.get("family_name", person_en.split()[0] if person_en else "")
-        first_name = profile_prefill.get("first_name", person_en.split()[1] if len(person_en.split()) > 1 else "")
-        middle_name_en = profile_prefill.get("middle_name_en", person_en.split()[2] if len(person_en.split()) > 2 else "")
+        family_name = profile_prefill.get("family_name", "")
+        first_name = profile_prefill.get("first_name", "")
+        middle_name_en = profile_prefill.get("middle_name_en", "")
+        if not family_name and person_en:
+            person_en_parts = person_en.split()
+            family_name = person_en_parts[0] if len(person_en_parts) > 0 else ""
+            first_name = person_en_parts[1] if len(person_en_parts) > 1 else ""
+            middle_name_en = person_en_parts[2] if len(person_en_parts) > 2 else ""
         appeal = profile_prefill.get("appeal", self._derive_salutation(gender))
         inn = profile_prefill.get("inn", (query.get("inn") or [""])[0])
         if profile_prefill:
