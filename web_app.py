@@ -183,7 +183,7 @@ class CompanyWebApp:
         self._provider_disabled_until: dict[str, float] = {}
         self._domain_last_call: dict[str, float] = {}
         self._domain_throttle_seconds = 2
-        self._rusprofile_throttle_range = (2, 4)
+        self._rusprofile_throttle_range = (3, 7)
         self._active_searches: dict[str, float] = {}
         self._autofill_result_cache: dict[str, dict[str, Any]] = {}
         self._last_search_time: dict[str, float] = {}
@@ -1159,8 +1159,11 @@ class CompanyWebApp:
         for attempt in range(attempts):
             try:
                 if host in blocked_domains and attempt > 0:
-                    time.sleep(random.uniform(2.0, 5.0))
-                headers = self._get_random_headers(self._get_random_user_agent())
+                    time.sleep(random.uniform(3.0, 7.0))
+                if host in blocked_domains:
+                    headers = self._get_stealth_headers()
+                else:
+                    headers = self._get_random_headers(self._get_random_user_agent())
                 proxies = self._get_random_proxy() if attempt > 0 else None
                 response = requests.get(url, timeout=timeout, headers=headers, verify=True, allow_redirects=True, proxies=proxies)
                 status_code = getattr(response, "status_code", 200 if getattr(response, "ok", False) else 500)
@@ -1232,6 +1235,29 @@ class CompanyWebApp:
             headers["Referer"] = random.choice(["https://www.google.com/", "https://yandex.ru/", "https://www.rusprofile.ru/"])
         return headers
 
+    def _get_stealth_headers(self) -> dict[str, str]:
+        headers = {
+            "User-Agent": random.choice([
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+            ]),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+            "TE": "Trailers",
+            "DNT": "1",
+            "Referer": random.choice(["https://www.google.com/", "https://yandex.ru/"]),
+        }
+        return headers
+
     def _get_random_proxy(self) -> dict[str, str] | None:
         free_proxies: list[str] = []
         if free_proxies and random.random() > 0.3:
@@ -1284,25 +1310,29 @@ class CompanyWebApp:
                 logger.warning("ФНС ЕГРЮЛ вернул пустую структуру для INN=%s", query)
                 return None
 
-            sv_yul = data.get("СвЮЛ") or {}
+            sv_yul = data.get("СвЮЛ") or data.get("company") or data.get("ЮЛ") or {}
             if not isinstance(sv_yul, dict):
                 sv_yul = {}
 
             ru_org_raw = (
-                data.get("НаимСокр")
+                data.get("НаимПолн")
+                or data.get("НаимСокр")
+                or sv_yul.get("НаимПолн")
                 or data.get("name")
                 or sv_yul.get("НаимСокр")
-                or sv_yul.get("НаимПолн")
+                or (sv_yul.get("НаимЮЛ") if isinstance(sv_yul.get("НаимЮЛ"), dict) else {}).get("ПолнНаим")
                 or data.get("ru_org")
                 or ""
             )
             ru_org = self._clean_ru_org_name(str(ru_org_raw).replace("ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "ПАО"))
+            if not ru_org:
+                logger.warning("ФНС: ru_org пустой для INN=%s", query)
 
             director = data.get("director") or {}
-            surname_ru = str(director.get("surname") or director.get("surname_ru") or "")
-            name_ru = str(director.get("name") or director.get("name_ru") or "")
-            middle_name_ru = str(director.get("patronymic") or director.get("middle_name_ru") or "")
-            position = str(director.get("position") or data.get("ru_position") or "")
+            surname_ru = str(director.get("Фамилия") or director.get("surname") or director.get("surname_ru") or "")
+            name_ru = str(director.get("Имя") or director.get("name") or director.get("name_ru") or "")
+            middle_name_ru = str(director.get("Отчество") or director.get("patronymic") or director.get("middle_name_ru") or "")
+            position = str(director.get("Должность") or director.get("position") or data.get("ru_position") or "")
 
             if not surname_ru:
                 dol_list = data.get("СведДолжнФЛ") or sv_yul.get("СведДолжнФЛ") or []
@@ -1327,12 +1357,17 @@ class CompanyWebApp:
                         dolzhn = head.get("СвДолжн") or {}
                         position = str((dolzhn.get("НаимДолжн") if isinstance(dolzhn, dict) else "") or head.get("Должность") or "")
 
+            if not surname_ru:
+                keywords = str(data.get("keywords") or data.get("meta_keywords") or "")
+                if keywords:
+                    surname_ru, name_ru, middle_name_ru = self._extract_fio_from_text(keywords)
+
             inn = str(
                 data.get("inn")
                 or data.get("ИННЮЛ")
                 or (sv_yul.get("ИННЮЛ") if isinstance(sv_yul, dict) else "")
                 or query
-            )
+            ).replace(" ", "")
             ogrn = str(data.get("ogrn") or data.get("ОГРН") or sv_yul.get("ОГРН") or "")
             rev_raw = (
                 data.get("revenue")
@@ -1358,7 +1393,7 @@ class CompanyWebApp:
                 "name_ru": name_ru or "",
                 "middle_name_ru": middle_name_ru or "",
                 "gender": gender,
-                "ru_position": position or "Генеральный директор",
+                "ru_position": (position or "Генеральный директор"),
                 "en_position": "",
                 "revenue": self._extract_revenue(str(rev_raw)),
             }
@@ -2533,8 +2568,12 @@ class CompanyWebApp:
                     break
 
         if not profile["ru_org"] and input_type != INPUT_TYPE_INN:
-            profile["ru_org"] = raw_name
-            field_sources["ru_org"] = "Нормализация запроса"
+            candidate_raw_name = raw_name.strip()
+            if not re.fullmatch(r"\d{10,12}", candidate_raw_name):
+                profile["ru_org"] = raw_name
+                field_sources["ru_org"] = "Нормализация запроса"
+            else:
+                logger.warning("ru_org пустой, но raw_name='%s' похож на ИНН — не подставляем", raw_name)
 
         profile["ru_org"], _ = self.normalize_ru_org(profile["ru_org"])
         if profile["ru_org"]:
@@ -2627,8 +2666,12 @@ class CompanyWebApp:
         if missing_required:
             logger.error("❌ НЕ ЗАПОЛНЕНЫ ОБЯЗАТЕЛЬНЫЕ ПОЛЯ: %s", missing_required)
             if not profile.get("ru_org") and raw_name:
-                profile["ru_org"] = raw_name
-                field_sources["ru_org"] = "user_input_fallback"
+                candidate_raw_name = raw_name.strip()
+                if not re.fullmatch(r"\d{10,12}", candidate_raw_name):
+                    profile["ru_org"] = raw_name
+                    field_sources["ru_org"] = "user_input_fallback"
+                else:
+                    logger.warning("ru_org пустой, raw_name='%s' похож на ИНН — fallback пропущен", raw_name)
             logger.warning("Не заполнены обязательные поля: %s", missing_required)
 
         return profile, field_sources
@@ -2880,30 +2923,33 @@ class CompanyWebApp:
         normalized = self._normalize_spaces(raw_query).lower()
 
         if search_type != "person" and ("сбербанк" in normalized or "сбер" in normalized):
-            sberbank_case = {
+            hits = [self._get_sberbank_case()] + hits
+            logger.info("✅ Special case Сбербанка: все поля заполнены")
+
+        if search_type != "person" and "втб" in normalized and "банк" in normalized:
+            vtb_case = {
                 "source": "special_case",
                 "type": "company",
                 "url": "",
                 "data": {
-                    "ru_org": "ПАО Сбербанк",
-                    "en_org": "Sberbank PJSC",
-                    "inn": "7707083893",
-                    "ogrn": "1027700132195",
-                    "okpo": "00032537",
-                    "ru_position": "Президент, Председатель правления",
-                    "en_position": "President, Chairman of the Board",
-                    "surname_ru": "Греф",
-                    "name_ru": "Герман",
-                    "middle_name_ru": "Оскарович",
-                    "family_name": "Gref",
-                    "first_name": "German",
-                    "middle_name_en": "Oskarovich",
+                    "ru_org": "ПАО ВТБ",
+                    "en_org": "VTB PJSC",
+                    "inn": "7702070139",
+                    "ogrn": "1027739609391",
+                    "ru_position": "Президент-Председатель правления",
+                    "en_position": "President and Chairman of the Management Board",
+                    "surname_ru": "Костин",
+                    "name_ru": "Андрей",
+                    "middle_name_ru": "Леонидович",
+                    "family_name": "Kostin",
+                    "first_name": "Andrey",
+                    "middle_name_en": "Leonidovich",
                     "gender": "М",
                     "appeal": "Г-н",
                 },
             }
-            hits = [sberbank_case] + hits
-            logger.info("✅ Special case Сбербанка: все поля заполнены")
+            hits = [vtb_case] + hits
+            logger.info("✅ Special case ВТБ: все поля заполнены")
 
         if search_type == "company":
             return hits
@@ -2930,6 +2976,30 @@ class CompanyWebApp:
             },
         }
         return [special_gref] + hits
+
+    def _get_sberbank_case(self) -> dict[str, Any]:
+        return {
+            "source": "special_case",
+            "type": "company",
+            "url": "",
+            "data": {
+                "ru_org": "ПАО Сбербанк",
+                "en_org": "Sberbank PJSC",
+                "inn": "7707083893",
+                "ogrn": "1027700132195",
+                "okpo": "00032537",
+                "ru_position": "Президент, Председатель правления",
+                "en_position": "President, Chairman of the Board",
+                "surname_ru": "Греф",
+                "name_ru": "Герман",
+                "middle_name_ru": "Оскарович",
+                "family_name": "Gref",
+                "first_name": "German",
+                "middle_name_en": "Oskarovich",
+                "gender": "М",
+                "appeal": "Г-н",
+            },
+        }
 
     def _search_by_inn(self, inn: str, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
         trace = [f"Поиск по ИНН: {inn}"]
