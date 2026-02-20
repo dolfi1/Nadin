@@ -95,11 +95,7 @@ SOURCE_DOMAINS = {
 
 SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "ФНС ЕГРЮЛ", "kind": "egrul", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": True, "priority": 1},
-    {"name": "ФНС Интеграция ЕГРЮЛ/ЕГРИП", "kind": "egrul", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": True, "priority": 2},
-    {"name": "Банк России", "kind": "bank_russia", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": False, "priority": 3, "url_template": "https://cbr.ru/eng/banking_sector/credit/coinfo/?id={inn}"},
-    {"name": "РБК Компании", "kind": "rbc", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": False, "priority": 4, "url_template": "https://companies.rbc.ru/search/?query={query}"},
     {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True, "priority": 5},
-    {"name": "focus.kontur.ru", "kind": "kontur", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 8},
 ]
 
 RUSPROFILE_NOISE_RE = re.compile(
@@ -186,15 +182,13 @@ class CompanyWebApp:
         self._provider_error_streak: dict[str, int] = defaultdict(int)
         self._provider_disabled_until: dict[str, float] = {}
         self._domain_last_call: dict[str, float] = {}
-        self._domain_throttle_seconds = 12
-        self._rusprofile_throttle_range = (30, 60)
+        self._domain_throttle_seconds = 2
+        self._rusprofile_throttle_range = (2, 4)
         self._active_searches: dict[str, float] = {}
         self._autofill_result_cache: dict[str, dict[str, Any]] = {}
         self._last_search_time: dict[str, float] = {}
         self._endpoint_rate_limit: dict[str, list[float]] = defaultdict(list)
         self._thread_state = threading.local()
-        self._add_enhanced_providers()
-        self._add_osint_providers()
         self._init_db()
         self._clear_provider_cache_pattern("list-org.com")
         self._clear_provider_cache_pattern("list_org")
@@ -578,61 +572,15 @@ class CompanyWebApp:
 
     def _provider_chain(self, input_type: str, raw: str) -> list[dict[str, Any]]:
         if input_type == INPUT_TYPE_PERSON_TEXT:
-            names = ["rusprofile.ru", "ФНС ЕГРЮЛ", "Google Search", "Yandex Search", "LinkedIn", "Facebook"]
+            names = ["rusprofile.ru", "ФНС ЕГРЮЛ"]
         elif input_type == INPUT_TYPE_INN:
-            names = [
-                "ФНС ЕГРЮЛ",
-                "ФНС Интеграция ЕГРЮЛ/ЕГРИП",
-                "Банк России",
-                "РБК Компании",
-                "rusprofile.ru",
-                "Google Search",
-                "Yandex Search",
-                "focus.kontur.ru",
-                "checko.ru",
-                "zachestnyibiznes.ru",
-            ]
+            names = ["ФНС ЕГРЮЛ", "rusprofile.ru"]
         elif self._is_foreign_query(raw):
-            names = [
-                "OpenCorporates",
-                "OffshoreLeaks",
-                "Corporation Wiki",
-                "Global Brownbook",
-                "Companies & Orgs Search Engine",
-                "Wikidata",
-            ]
+            names = ["rusprofile.ru"]
         elif input_type == INPUT_TYPE_URL:
-            names = [
-                "ФНС ЕГРЮЛ",
-                "OpenCorporates",
-                "OffshoreLeaks",
-                "rusprofile.ru",
-                "zachestnyibiznes.ru",
-                "focus.kontur.ru",
-                "checko.ru",
-            ]
+            names = ["ФНС ЕГРЮЛ", "rusprofile.ru"]
         else:
-            names = [
-                "ФНС ЕГРЮЛ",
-                "Google Search",
-                "Yandex Search",
-                "OpenCorporates",
-                "OffshoreLeaks",
-                "rusprofile.ru",
-                "Corporation Wiki",
-                "Global Brownbook",
-                "Companies & Orgs Search Engine",
-                "FAROS OSINT",
-                "OCCRP Aleph",
-                "zachestnyibiznes.ru",
-                "focus.kontur.ru",
-                "checko.ru",
-                "ФНС Интеграция ЕГРЮЛ/ЕГРИП",
-                "Федресурс",
-                "КАД Арбитр",
-                "ЕИС Закупки",
-                "Банк России",
-            ]
+            names = ["rusprofile.ru"]
         provider_map = {provider["name"]: provider for provider in self.SOURCE_PROVIDERS}
         selected = [provider_map[name] for name in names if name in provider_map]
         return selected
@@ -889,9 +837,11 @@ class CompanyWebApp:
     def _supports_input_type(self, provider: dict[str, Any], input_type: str, _query: str) -> bool:
         if input_type == INPUT_TYPE_INN:
             return bool(provider.get("supports_inn", False))
-        if input_type == INPUT_TYPE_PERSON_TEXT:
+        if input_type in {INPUT_TYPE_PERSON_TEXT, INPUT_TYPE_ORG_TEXT}:
             return bool(provider.get("supports_name", False))
-        return bool(provider.get("supports_name", False) or provider.get("supports_inn", False))
+        if input_type == INPUT_TYPE_URL:
+            return bool(provider.get("supports_url", False) or provider.get("supports_inn", False))
+        return bool(provider.get("supports_name", False))
 
     def _get_fallback_providers(self, provider: dict[str, Any], query: str, input_type: str) -> list[dict[str, Any]]:
         return sorted(
@@ -1150,7 +1100,7 @@ class CompanyWebApp:
         self._domain_throttle(url)
         timeout = max(15, timeout)
         if not self._is_localhost(url):
-            time.sleep(random.uniform(5.0, 15.0))
+            time.sleep(random.uniform(0.2, 0.6))
         attempts = max(1, max_retries)
         blocked_domains = {"rusprofile.ru", "www.rusprofile.ru"}
         host = urlparse(url).netloc.lower()
@@ -1241,7 +1191,7 @@ class CompanyWebApp:
         self._domain_throttle(url)
         attempts = 3
         if not self._is_localhost(url):
-            time.sleep(random.uniform(5.0, 15.0))
+            time.sleep(random.uniform(0.2, 0.6))
         last_exc: Exception | None = None
         for attempt in range(attempts):
             try:
