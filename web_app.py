@@ -602,7 +602,16 @@ class CompanyWebApp:
         if input_type == INPUT_TYPE_PERSON_TEXT:
             names = ["rusprofile.ru", "ФНС ЕГРЮЛ"]
         elif input_type == INPUT_TYPE_INN:
-            names = ["ФНС ЕГРЮЛ", "rusprofile.ru"]
+            names = [
+                "ФНС ЕГРЮЛ",
+                "ФНС Интеграция ЕГРЮЛ/ЕГРИП",
+                "rusprofile.ru",
+                "focus.kontur.ru",
+                "checko.ru",
+                "zachestnyibiznes.ru",
+            ]
+        elif input_type == INPUT_TYPE_ORG_TEXT:
+            names = ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"]
         elif self._is_foreign_query(raw):
             names = ["rusprofile.ru"]
         elif input_type == INPUT_TYPE_URL:
@@ -781,7 +790,13 @@ class CompanyWebApp:
         if kind == "kontur":
             return self._parse_kontur(raw)
         if kind in {"bank_russia", "rbc"}:
-            url = provider.get("url_template", "").format(inn=inn or "", query=quote(raw))
+            if not inn and not raw:
+                logger.warning("Provider %s skipped: no INN or query", provider.get("name"))
+                return None
+            url = provider.get("url_template", "").format(inn=inn or quote(raw), query=quote(raw))
+            if not url.startswith(("http://", "https://")):
+                logger.error("Invalid URL generated for %s: %s", provider.get("name"), url)
+                return None
             return self._parse_generic_osint(url, provider.get("name", kind))
         if kind in {"google_search", "yandex_search", "linkedin_search", "facebook_search", "offshoreleaks", "checko", "zachestnyibiznes", "sherlock", "maigret", "holehe", "theharvester"}:
             url = provider.get("url_template", "").format(inn=inn or "", query=quote(raw))
@@ -1249,14 +1264,16 @@ class CompanyWebApp:
             if "json" not in content_type and "javascript" not in content_type:
                 return None
             data = resp.json()
-            logger.debug("ФНС ЕГРЮЛ сырые данные keys: %s", list(data.keys()))
+            logger.debug("ФНС ЕГРЮЛ ВСЕ КЛЮЧИ: %s", list(data.keys()))
+            logger.debug("ФНС ЕГРЮЛ СвЮЛ: %s", data.get("СвЮЛ"))
+            logger.debug("ФНС ЕГРЮЛ СведДолжнФЛ: %s", data.get("СведДолжнФЛ"))
             logger.debug("ФНС ЕГРЮЛ ru_org_raw: %s", data.get("НаимСокр") or data.get("name"))
 
             if not any([data.get("СвЮЛ"), data.get("company"), data.get("name"), data.get("НаимСокр")]):
                 logger.warning("ФНС ЕГРЮЛ вернул пустую структуру для INN=%s", query)
                 return None
 
-            sv_yul = data.get("СвЮЛ") or {}
+            sv_yul = data.get("СвЮЛ") or data.get("company") or {}
             company = data.get("company") or {}
             if not isinstance(sv_yul, dict):
                 sv_yul = {}
@@ -1281,21 +1298,23 @@ class CompanyWebApp:
 
             if not surname_ru:
                 dol_list = data.get("СведДолжнФЛ") or sv_yul.get("СведДолжнФЛ") or []
-                if isinstance(dol_list, list) and dol_list:
-                    head = dol_list[0] or {}
+                if dol_list:
+                    head = (dol_list[0] if isinstance(dol_list, list) else dol_list) or {}
                     fio_str = str(head.get("ФИО") or head.get("ФИОПолн") or "")
                     if fio_str:
                         surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_str)
                     else:
-                        sv_fl = head.get("СвФЛ") or {}
+                        sv_fl = head.get("СвФЛ") or head.get("ФИО") or {}
                         if isinstance(sv_fl, dict):
                             fio_full = str(sv_fl.get("ФИОПолн") or "")
                             if fio_full:
                                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_full)
                             else:
-                                surname_ru = str(sv_fl.get("Фамилия") or "").capitalize()
-                                name_ru = str(sv_fl.get("Имя") or "").capitalize()
-                                middle_name_ru = str(sv_fl.get("Отчество") or "").capitalize()
+                                surname_ru = str(sv_fl.get("Фамилия") or sv_fl.get("surname") or "").capitalize()
+                                name_ru = str(sv_fl.get("Имя") or sv_fl.get("name") or "").capitalize()
+                                middle_name_ru = str(sv_fl.get("Отчество") or sv_fl.get("patronymic") or "").capitalize()
+                        elif isinstance(sv_fl, str):
+                            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(sv_fl)
                     if not position:
                         dolzhn = head.get("СвДолжн") or {}
                         position = str((dolzhn.get("НаимДолжн") if isinstance(dolzhn, dict) else "") or head.get("Должность") or "")
@@ -1324,13 +1343,13 @@ class CompanyWebApp:
 
             return {
                 "url": url,
-                "inn": inn,
-                "ogrn": ogrn,
-                "ru_org": ru_org,
+                "inn": inn or query,
+                "ogrn": ogrn or "",
+                "ru_org": ru_org or "",
                 "en_org": str(data.get("en_org") or ""),
-                "surname_ru": surname_ru,
-                "name_ru": name_ru,
-                "middle_name_ru": middle_name_ru,
+                "surname_ru": surname_ru or "",
+                "name_ru": name_ru or "",
+                "middle_name_ru": middle_name_ru or "",
                 "gender": gender,
                 "ru_position": position or "Генеральный директор",
                 "en_position": str(data.get("en_position") or ""),
@@ -1454,6 +1473,12 @@ class CompanyWebApp:
         profile: dict[str, Any] = {"url": url, "source": "rusprofile.ru"}
         page_text = soup.get_text(" ", strip=True)
         jsonld_data: dict[str, Any] = {}
+        keywords_node = soup.find("meta", attrs={"name": re.compile(r"^keywords$", re.IGNORECASE)})
+        keywords_raw = str(keywords_node.get("content", "")) if isinstance(keywords_node, Tag) else ""
+        keywords_text = self._normalize_spaces(unescape(keywords_raw))
+        if keywords_text:
+            profile["ru_org"] = self._extract_ru_org_from_keywords(keywords_text)
+            logger.debug("RusProfile keywords: %s", keywords_text[:200])
         for script in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.IGNORECASE)}):
             if not isinstance(script, Tag):
                 continue
@@ -1468,10 +1493,13 @@ class CompanyWebApp:
                 payload = next((item for item in payload if isinstance(item, dict)), {})
             if isinstance(payload, dict):
                 jsonld_data = payload
-                break
-        keywords_node = soup.find("meta", attrs={"name": re.compile(r"^keywords$", re.IGNORECASE)})
-        keywords_raw = str(keywords_node.get("content", "")) if isinstance(keywords_node, Tag) else ""
-        keywords_text = self._normalize_spaces(unescape(keywords_raw))
+                if isinstance(payload.get("name"), str):
+                    profile["ru_org"] = profile.get("ru_org") or self._clean_ru_org_name(payload.get("name", ""))
+                identifier = payload.get("identifier")
+                if isinstance(identifier, dict) and isinstance(identifier.get("value"), str):
+                    profile["inn"] = profile.get("inn") or re.sub(r"\D", "", identifier["value"])
+                elif isinstance(payload.get("taxID"), str):
+                    profile["inn"] = profile.get("inn") or re.sub(r"\D", "", payload["taxID"])
         is_person = "/person/" in url or "/ip/" in url
 
         if is_person:
@@ -2404,7 +2432,7 @@ class CompanyWebApp:
                 profile[field] = value
                 field_sources[field] = source_name
 
-        required_fallback_fields = ["surname_ru", "name_ru", "ru_org"]
+        required_fallback_fields = ["surname_ru", "name_ru", "ru_org", "inn"]
         for field in required_fallback_fields:
             if profile.get(field):
                 continue
@@ -2414,7 +2442,7 @@ class CompanyWebApp:
                     continue
                 profile[field] = candidate
                 field_sources[field] = hit.get("source", "fallback")
-                logger.info("Fallback: поле %s заполнено из %s", field, field_sources[field])
+                logger.info("FALLBACK: поле %s заполнено из %s", field, field_sources[field])
                 break
 
         if input_type == INPUT_TYPE_PERSON_TEXT:
@@ -2534,6 +2562,10 @@ class CompanyWebApp:
         logger.info("Заполненные поля: %s", filled)
         missing_required = [field for field in REQUIRED_FIELDS if not profile.get(field)]
         if missing_required:
+            logger.error("КРИТИЧЕСКИ НЕ ЗАПОЛНЕНЫ: %s", missing_required)
+            if not profile.get("ru_org") and raw_name:
+                profile["ru_org"] = raw_name
+                field_sources["ru_org"] = "Ввод пользователя"
             logger.warning("Не заполнены обязательные поля: %s", missing_required)
 
         return profile, field_sources
