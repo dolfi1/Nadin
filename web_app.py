@@ -2445,6 +2445,22 @@ class CompanyWebApp:
                 logger.info("FALLBACK: поле %s заполнено из %s", field, field_sources[field])
                 break
 
+        for hit in source_hits:
+            if hit.get("source") == "special_case" and hit.get("type") == "company":
+                data = hit.get("data", {})
+                if isinstance(data, dict):
+                    for field in ["surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en"]:
+                        if data.get(field) and not profile.get(field):
+                            profile[field] = str(data[field])
+                            field_sources[field] = "special_case"
+                            logger.info("Поле %s заполнено из special_case", field)
+                    for field in ["ru_org", "en_org", "ru_position", "en_position", "inn", "gender", "appeal"]:
+                        if data.get(field) and not profile.get(field):
+                            profile[field] = str(data[field])
+                            field_sources[field] = "special_case"
+                            logger.info("Поле %s заполнено из special_case", field)
+                    break
+
         if input_type == INPUT_TYPE_PERSON_TEXT:
             merged_person, merged_sources = self._merge_person_hits(source_hits)
             profile.update(merged_person)
@@ -3159,9 +3175,23 @@ class CompanyWebApp:
                 reset_note = [f"Кэш по персоне очищен: {dropped}"]
             else:
                 reset_note = []
+
             source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache)
             search_trace = reset_note + search_trace
             profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type)
+
+            logger.info("=== AUTOFILL REVIEW ===")
+            logger.info("source_hits count: %d", len(source_hits))
+            for i, hit in enumerate(source_hits):
+                logger.info("Hit %d: source=%s, type=%s", i, hit.get("source"), hit.get("type"))
+                logger.info("  data keys: %s", list(hit.get("data", {}).keys()) if isinstance(hit.get("data"), dict) else "N/A")
+                logger.info("  ru_org: %s", hit.get("data", {}).get("ru_org") if isinstance(hit.get("data"), dict) else "N/A")
+                logger.info("  surname_ru: %s", hit.get("data", {}).get("surname_ru") if isinstance(hit.get("data"), dict) else "N/A")
+
+            logger.info("Profile after build:")
+            for field in REQUIRED_FIELDS:
+                logger.info("  %s: '%s' (from %s)", field, profile.get(field), field_sources.get(field))
+
             if not profile.get("ru_org") and not profile.get("surname_ru") and not profile.get("name_ru"):
                 logger.error("Профиль пустой после построения из %d хитов!", len(source_hits))
             filled_fields = [k for k, v in profile.items() if v and k not in {"title", "appeal"}]
@@ -3186,10 +3216,10 @@ class CompanyWebApp:
             manual_payload = {
                 "q": profile.get("ru_org", "") or raw,
                 "en_org": profile.get("en_org", ""),
-                "person_ru": " ".join(
+                "person_ru": "  ".join(
                     x for x in [profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")] if x
                 ).strip(),
-                "person_en": " ".join(
+                "person_en": "  ".join(
                     x for x in [profile.get("family_name", ""), profile.get("first_name", ""), profile.get("middle_name_en", "")] if x
                 ).strip(),
                 "gender": profile.get("gender", ""),
@@ -3201,14 +3231,17 @@ class CompanyWebApp:
 
             missing_fields = [field for field in REQUIRED_FIELDS if not self._normalize_spaces(str(profile.get(field, "")))]
             if missing_fields:
+                logger.warning("Не заполнены обязательные поля: %s", missing_fields)
                 manual_payload["error"] = f"Заполните обязательные поля: {', '.join(missing_fields)}"
                 response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
             else:
+                logger.info("Все обязательные поля заполнены! Создаем карточку автоматически.")
                 card_obj = Card.from_profile(profile)
                 profile["family_name"] = card_obj.family_name or profile.get("family_name", "")
                 profile["first_name"] = card_obj.first_name or profile.get("first_name", "")
                 profile["middle_name_en"] = card_obj.middle_name_en or profile.get("middle_name_en", profile.get("middle_name", ""))
                 card_id = self._create_autofill_card(profile, notes, source_hits, search_trace, field_sources)
+                logger.info("Карточка #%d создана автоматически", card_id)
                 response = ("", "302 Found", [("Location", f"/card/{card_id}")])
             self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
             return response
