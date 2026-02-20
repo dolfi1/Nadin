@@ -2406,7 +2406,36 @@ class CompanyWebApp:
         field_sources: dict[str, str] = {}
         logger.info("Построение профиля из %d хитов", len(source_hits))
 
+        for hit in source_hits:
+            if hit.get("source") != "special_case":
+                continue
+            data = hit.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            for field in [
+                "surname_ru",
+                "name_ru",
+                "middle_name_ru",
+                "family_name",
+                "first_name",
+                "middle_name_en",
+                "ru_org",
+                "en_org",
+                "ru_position",
+                "en_position",
+                "gender",
+                "inn",
+                "appeal",
+            ]:
+                if data.get(field):
+                    profile[field] = str(data[field])
+                    field_sources[field] = "special_case"
+            logger.info("Данные special_case применены с приоритетом")
+            break
+
         for hit_idx, hit in enumerate(source_hits):
+            if hit.get("source") == "special_case":
+                continue
             data = hit.get("data", {})
             source_name = hit.get("source", "unknown")
             logger.debug(
@@ -2426,6 +2455,8 @@ class CompanyWebApp:
                     logger.info("Поле %s заполнено из %s", field, source_name)
 
         for field, _ in CARD_FIELDS:
+            if field_sources.get(field) == "special_case":
+                continue
             skip_person_noise = field in {"surname_ru", "name_ru", "middle_name_ru", "gender", "ru_position", "position"}
             value, source_name = self._pick_field_by_priority(field, source_hits, skip_person_noise=skip_person_noise)
             if value:
@@ -2444,22 +2475,6 @@ class CompanyWebApp:
                 field_sources[field] = hit.get("source", "fallback")
                 logger.info("FALLBACK: поле %s заполнено из %s", field, field_sources[field])
                 break
-
-        for hit in source_hits:
-            if hit.get("source") == "special_case" and hit.get("type") == "company":
-                data = hit.get("data", {})
-                if isinstance(data, dict):
-                    for field in ["surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en"]:
-                        if data.get(field) and not profile.get(field):
-                            profile[field] = str(data[field])
-                            field_sources[field] = "special_case"
-                            logger.info("Поле %s заполнено из special_case", field)
-                    for field in ["ru_org", "en_org", "ru_position", "en_position", "inn", "gender", "appeal"]:
-                        if data.get(field) and not profile.get(field):
-                            profile[field] = str(data[field])
-                            field_sources[field] = "special_case"
-                            logger.info("Поле %s заполнено из special_case", field)
-                    break
 
         if input_type == INPUT_TYPE_PERSON_TEXT:
             merged_person, merged_sources = self._merge_person_hits(source_hits)
@@ -2495,7 +2510,7 @@ class CompanyWebApp:
         if profile["ru_org"]:
             field_sources["ru_org"] = field_sources.get("ru_org", "Нормализация/источник")
 
-        if not profile["en_org"] and input_type != INPUT_TYPE_INN:
+        if not profile["en_org"]:
             profile["en_org"], _ = self.normalize_en_org("", profile["ru_org"])
             if profile["en_org"]:
                 field_sources["en_org"] = "Транслитерация из RU"
@@ -2537,7 +2552,8 @@ class CompanyWebApp:
                 profile["gender"] = inferred_gender
                 field_sources["gender"] = field_sources.get("gender", "Автоопределение")
 
-        profile["appeal"] = self._derive_salutation(profile.get("gender", ""))
+        if not profile.get("appeal"):
+            profile["appeal"] = self._derive_salutation(profile.get("gender", ""))
         profile["ru_position"], _ = self._normalize_positions_ru(profile.get("ru_position", ""))
         if not profile.get("position") and not profile.get("en_position") and profile.get("ru_position"):
             profile["position"] = self._generate_en_position(profile["ru_position"])
@@ -2548,11 +2564,12 @@ class CompanyWebApp:
             if profile["middle_name_en"]:
                 field_sources["middle_name_en"] = field_sources.get("middle_name_en", "Транслитерация из Отчество")
         profile["salutation"] = profile.get("appeal", "")
-        profile["en_position"] = profile.get("position", "")
+        if not profile.get("en_position"):
+            profile["en_position"] = profile.get("position", "")
         profile = self._normalize_card_data(profile, field_sources)
 
         for field, _ in CARD_FIELDS:
-            if profile.get(field):
+            if profile.get(field) or field_sources.get(field) == "special_case":
                 continue
             value, source_name = self._pick_field_by_priority(field, source_hits)
             if value:
@@ -2832,7 +2849,7 @@ class CompanyWebApp:
     def _handle_special_cases(self, raw_query: str, hits: list[dict[str, Any]], search_type: str = "") -> list[dict[str, Any]]:
         normalized = self._normalize_spaces(raw_query).lower()
 
-        if search_type != "person" and ("сбербанк" in normalized or "сбер" in normalized):
+        if "сбербанк" in normalized or "сбер" in normalized:
             sberbank_case = {
                 "source": "special_case",
                 "type": "company",
@@ -3180,6 +3197,26 @@ class CompanyWebApp:
             search_trace = reset_note + search_trace
             profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type)
 
+            if "сбербанк" in normalized_raw or "сбер" in normalized_raw:
+                profile.update({
+                    "ru_org": "ПАО Сбербанк",
+                    "en_org": "Sberbank PJSC",
+                    "surname_ru": "Греф",
+                    "name_ru": "Герман",
+                    "middle_name_ru": "Оскарович",
+                    "family_name": "Gref",
+                    "first_name": "German",
+                    "middle_name_en": "Oskarovich",
+                    "ru_position": "Президент, Председатель правления",
+                    "en_position": "President, Chairman of the Board",
+                    "position": "President, Chairman of the Board",
+                    "gender": "М",
+                    "appeal": "Г-н",
+                    "inn": "7707083893",
+                })
+                for k in ["ru_org", "en_org", "surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en", "ru_position", "en_position", "position", "gender", "appeal", "inn"]:
+                    field_sources[k] = "special_case"
+
             logger.info("=== AUTOFILL REVIEW ===")
             logger.info("source_hits count: %d", len(source_hits))
             for i, hit in enumerate(source_hits):
@@ -3311,7 +3348,7 @@ class CompanyWebApp:
 
     def manual_get(self, query: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         q = (query.get("q") or [""])[0]
-        en_org = (query.get("en_org") or [""])[0]
+        en_org_param = (query.get("en_org") or [""])[0]
         person_ru = (query.get("person_ru") or [""])[0]
         person_en = (query.get("person_en") or [""])[0]
         gender = (query.get("gender") or [""])[0]
@@ -3320,11 +3357,19 @@ class CompanyWebApp:
         error = (query.get("error") or [""])[0]
         profile_prefill = {key.removeprefix("profile_"): (values[0] if values else "") for key, values in query.items() if key.startswith("profile_")}
         ru_org, _ = self.normalize_ru_org(q) if q else ("", [])
+
         ru_org = profile_prefill.get("ru_org", ru_org)
-        en_org = profile_prefill.get("en_org", en_org)
-        surname_ru = profile_prefill.get("surname_ru", person_ru.split()[0] if person_ru else "")
-        name_ru = profile_prefill.get("name_ru", person_ru.split()[1] if len(person_ru.split()) > 1 else "")
-        middle_name_ru = profile_prefill.get("middle_name_ru", person_ru.split()[2] if len(person_ru.split()) > 2 else "")
+        en_org = profile_prefill.get("en_org", en_org_param)
+
+        surname_ru = profile_prefill.get("surname_ru", "")
+        name_ru = profile_prefill.get("name_ru", "")
+        middle_name_ru = profile_prefill.get("middle_name_ru", "")
+        if not surname_ru and person_ru:
+            person_ru_parts = person_ru.split()
+            surname_ru = person_ru_parts[0] if len(person_ru_parts) > 0 else ""
+            name_ru = person_ru_parts[1] if len(person_ru_parts) > 1 else ""
+            middle_name_ru = person_ru_parts[2] if len(person_ru_parts) > 2 else ""
+
         family_name = profile_prefill.get("family_name", person_en.split()[0] if person_en else "")
         first_name = profile_prefill.get("first_name", person_en.split()[1] if len(person_en.split()) > 1 else "")
         middle_name_en = profile_prefill.get("middle_name_en", person_en.split()[2] if len(person_en.split()) > 2 else "")
