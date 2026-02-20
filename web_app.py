@@ -604,11 +604,8 @@ class CompanyWebApp:
         elif input_type == INPUT_TYPE_INN:
             names = [
                 "ФНС ЕГРЮЛ",
-                "ФНС Интеграция ЕГРЮЛ/ЕГРИП",
                 "rusprofile.ru",
                 "focus.kontur.ru",
-                "checko.ru",
-                "zachestnyibiznes.ru",
             ]
         elif input_type == INPUT_TYPE_ORG_TEXT:
             names = ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"]
@@ -1122,21 +1119,33 @@ class CompanyWebApp:
             time.sleep(wait_for)
         self._domain_last_call[host] = time.time()
 
-    def _is_captcha_or_block(self, response_text: str) -> bool:
-        response_text_lower = response_text.lower()
-        response_length = len(response_text)
-        block_keywords = (
-            "captcha",
-            "доступ ограничен",
-            "block",
-            "браузер не подходит",
-            "проверка",
-        )
-        if any(keyword in response_text_lower for keyword in block_keywords):
+    def _is_captcha_or_block(self, response_text: str, url: str = "") -> bool:
+        text_lower = response_text.lower()
+
+        block_markers = [
+            "captcha", "проверка браузера", "cloudflare", "ddos-guard",
+            "access denied", "just a moment", "введите код", "подтвердите, что вы человек",
+            "браузер не подходит", "включите javascript", "разрешите куки",
+        ]
+        if any(marker in text_lower for marker in block_markers):
             return True
-        if response_length < 5000:
-            meaningful_markers = ("<h1", "search-result", "/person/", "/id/", "инн")
-            return not any(marker in response_text_lower for marker in meaningful_markers)
+
+        if "rusprofile.ru" in url.lower() and len(response_text) > 50000:
+            has_data = any(token in text_lower for token in [
+                "инн", "огрн", "наименование", "адрес", "директор",
+                "выручка", "учредитель", "вид деятельности",
+            ])
+            if not has_data:
+                return True
+
+        if len(response_text) < 3000:
+            has_structure = any(token in text_lower for token in [
+                "<h1", "<table", "search-result", "/person/", "/id/",
+                "инн", "огрн", "наименование",
+            ])
+            if not has_structure:
+                return True
+
         return False
 
     def _fetch_page(self, url: str, timeout: int = 15, max_retries: int = 5) -> str | None:
@@ -1159,7 +1168,7 @@ class CompanyWebApp:
                 response_text_lower = response_text.lower()
                 response_length = len(response_text)
                 logger.info("Fetched %s status=%d len=%d", url, status_code, response_length)
-                if self._is_captcha_or_block(response_text):
+                if self._is_captcha_or_block(response_text, url=url):
                     self._thread_state.blocked_fetch = True
                     logger.warning("%s returned captcha/block page (content check, len=%d)", url, response_length)
                     return None
@@ -1264,27 +1273,26 @@ class CompanyWebApp:
             if "json" not in content_type and "javascript" not in content_type:
                 return None
             data = resp.json()
-            logger.debug("ФНС ЕГРЮЛ ВСЕ КЛЮЧИ: %s", list(data.keys()))
-            logger.debug("ФНС ЕГРЮЛ СвЮЛ: %s", data.get("СвЮЛ"))
-            logger.debug("ФНС ЕГРЮЛ СведДолжнФЛ: %s", data.get("СведДолжнФЛ"))
-            logger.debug("ФНС ЕГРЮЛ ru_org_raw: %s", data.get("НаимСокр") or data.get("name"))
+            logger.debug("=== ФНС ЕГРЮЛ RAW DATA ===")
+            logger.debug("TOP KEYS: %s", list(data.keys()))
+            if data.get("СвЮЛ"):
+                logger.debug("СвЮЛ KEYS: %s", list(data["СвЮЛ"].keys()) if isinstance(data["СвЮЛ"], dict) else "NOT DICT")
+            if data.get("СведДолжнФЛ"):
+                logger.debug("СведДолжнФЛ: %s", data["СведДолжнФЛ"][:2] if isinstance(data["СведДолжнФЛ"], list) else data["СведДолжнФЛ"])
 
             if not any([data.get("СвЮЛ"), data.get("company"), data.get("name"), data.get("НаимСокр")]):
                 logger.warning("ФНС ЕГРЮЛ вернул пустую структуру для INN=%s", query)
                 return None
 
-            sv_yul = data.get("СвЮЛ") or data.get("company") or {}
-            company = data.get("company") or {}
+            sv_yul = data.get("СвЮЛ") or {}
             if not isinstance(sv_yul, dict):
                 sv_yul = {}
-            if not isinstance(company, dict):
-                company = {}
+
             ru_org_raw = (
                 data.get("НаимСокр")
                 or data.get("name")
                 or sv_yul.get("НаимСокр")
-                or company.get("short_name")
-                or company.get("name")
+                or sv_yul.get("НаимПолн")
                 or data.get("ru_org")
                 or ""
             )
@@ -1298,8 +1306,8 @@ class CompanyWebApp:
 
             if not surname_ru:
                 dol_list = data.get("СведДолжнФЛ") or sv_yul.get("СведДолжнФЛ") or []
-                if dol_list:
-                    head = (dol_list[0] if isinstance(dol_list, list) else dol_list) or {}
+                if isinstance(dol_list, list) and dol_list:
+                    head = dol_list[0] or {}
                     fio_str = str(head.get("ФИО") or head.get("ФИОПолн") or "")
                     if fio_str:
                         surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_str)
@@ -1320,13 +1328,12 @@ class CompanyWebApp:
                         position = str((dolzhn.get("НаимДолжн") if isinstance(dolzhn, dict) else "") or head.get("Должность") or "")
 
             inn = str(
-                company.get("inn")
-                or data.get("inn")
+                data.get("inn")
                 or data.get("ИННЮЛ")
-                or data.get("ИНН")
+                or (sv_yul.get("ИННЮЛ") if isinstance(sv_yul, dict) else "")
                 or query
             )
-            ogrn = str(data.get("ogrn") or data.get("ОГРН") or company.get("ogrn") or sv_yul.get("ОГРН") or "")
+            ogrn = str(data.get("ogrn") or data.get("ОГРН") or sv_yul.get("ОГРН") or "")
             rev_raw = (
                 data.get("revenue")
                 or (data.get("ФинПоказ") or {}).get("Выручка")
@@ -1343,16 +1350,16 @@ class CompanyWebApp:
 
             return {
                 "url": url,
-                "inn": inn or query,
+                "inn": inn or "",
                 "ogrn": ogrn or "",
                 "ru_org": ru_org or "",
-                "en_org": str(data.get("en_org") or ""),
+                "en_org": "",
                 "surname_ru": surname_ru or "",
                 "name_ru": name_ru or "",
                 "middle_name_ru": middle_name_ru or "",
                 "gender": gender,
                 "ru_position": position or "Генеральный директор",
-                "en_position": str(data.get("en_position") or ""),
+                "en_position": "",
                 "revenue": self._extract_revenue(str(rev_raw)),
             }
         except Exception as exc:  # noqa: BLE001
@@ -2403,6 +2410,7 @@ class CompanyWebApp:
         input_type: str,
     ) -> tuple[dict[str, str], dict[str, str]]:
         profile = {field: "" for field, _ in CARD_FIELDS}
+        query = self._extract_inn(raw_name) if input_type == INPUT_TYPE_INN else self._normalize_spaces(raw_name)
         field_sources: dict[str, str] = {}
         logger.info("Построение профиля из %d хитов", len(source_hits))
 
@@ -2473,18 +2481,23 @@ class CompanyWebApp:
                 profile[field] = value
                 field_sources[field] = source_name
 
-        required_fallback_fields = ["surname_ru", "name_ru", "ru_org", "inn"]
+        required_fallback_fields = ["surname_ru", "name_ru", "ru_org", "en_org", "inn"]
         for field in required_fallback_fields:
             if profile.get(field):
                 continue
             for hit in source_hits:
-                candidate = self._normalize_spaces(str(hit.get("data", {}).get(field, "")))
-                if not candidate:
-                    continue
-                profile[field] = candidate
-                field_sources[field] = hit.get("source", "fallback")
-                logger.info("FALLBACK: поле %s заполнено из %s", field, field_sources[field])
-                break
+                data = hit.get("data", {})
+                candidate = str(data.get(field) or "").strip()
+                if candidate and candidate not in {"", " ", query}:
+                    profile[field] = candidate
+                    field_sources[field] = f"fallback:{hit.get('source', 'unknown')}"
+                    logger.info("FALLBACK: %s = '%s' из %s", field, candidate[:50], field_sources[field])
+                    break
+
+        if profile.get("ru_org") == query and input_type == INPUT_TYPE_INN:
+            profile["ru_org"] = raw_name
+            field_sources["ru_org"] = "raw_query_fallback"
+            logger.info("ru_org был равен ИНН, заменено на raw_name: %s", raw_name)
 
         if input_type == INPUT_TYPE_PERSON_TEXT:
             merged_person, merged_sources = self._merge_person_hits(source_hits)
@@ -2612,10 +2625,10 @@ class CompanyWebApp:
         logger.info("Заполненные поля: %s", filled)
         missing_required = [field for field in REQUIRED_FIELDS if not profile.get(field)]
         if missing_required:
-            logger.error("КРИТИЧЕСКИ НЕ ЗАПОЛНЕНЫ: %s", missing_required)
+            logger.error("❌ НЕ ЗАПОЛНЕНЫ ОБЯЗАТЕЛЬНЫЕ ПОЛЯ: %s", missing_required)
             if not profile.get("ru_org") and raw_name:
                 profile["ru_org"] = raw_name
-                field_sources["ru_org"] = "Ввод пользователя"
+                field_sources["ru_org"] = "user_input_fallback"
             logger.warning("Не заполнены обязательные поля: %s", missing_required)
 
         return profile, field_sources
@@ -2866,7 +2879,7 @@ class CompanyWebApp:
     def _handle_special_cases(self, raw_query: str, hits: list[dict[str, Any]], search_type: str = "") -> list[dict[str, Any]]:
         normalized = self._normalize_spaces(raw_query).lower()
 
-        if "сбербанк" in normalized or "сбер" in normalized:
+        if search_type != "person" and ("сбербанк" in normalized or "сбер" in normalized):
             sberbank_case = {
                 "source": "special_case",
                 "type": "company",
@@ -2890,7 +2903,7 @@ class CompanyWebApp:
                 },
             }
             hits = [sberbank_case] + hits
-            logger.info("Добавлен special case для Сбербанка с данными директора")
+            logger.info("✅ Special case Сбербанка: все поля заполнены")
 
         if search_type == "company":
             return hits
