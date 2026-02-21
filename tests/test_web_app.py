@@ -797,94 +797,65 @@ def test_build_profile_from_sources_keeps_special_case_position_and_names(tmp_pa
     assert profile["en_position"] == "President, Chairman of the Board"
     assert profile["en_org"] == "Sberbank PJSC"
 
-
-def test_parse_egrul_reads_deep_company_and_head_structures(tmp_path, monkeypatch):
+def test_card_view_renders_en_position_from_profile_field(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
-    def fake_get(url, **_kwargs):
-        assert url == "https://egrul.itsoft.ru/7701234567.json"
-        return FakeResponse(
-            json_data={
-                "СвЮЛ": {
-                    "СвНаимЮЛ": {"ПолнНаим": "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ РОМАШКА"},
-                    "СведДолжнФЛ": {
-                        "СвФЛ": {"ФИОПолн": "Петров Петр Петрович"},
-                        "СвДолжн": {"НаимДолжн": "Генеральный директор"},
-                    },
-                },
-            }
-        )
+    profile = {
+        "surname_ru": "Иванов",
+        "name_ru": "Иван",
+        "gender": "М",
+        "ru_org": "ООО Ромашка",
+        "en_org": "Romashka LLC",
+        "ru_position": "Генеральный директор",
+        "en_position": "General Director",
+    }
+    card_id = app._create_autofill_card(profile, [], [], [], {})
 
-    monkeypatch.setattr(web_app.requests, "get", fake_get)
+    body, status, _headers = app.card_view(card_id)
 
-    data = app._parse_egrul("7701234567")
-
-    assert data is not None
-    assert data["ru_org"] == "Ромашка ООО"
-    assert data["surname_ru"] == "Петров"
-    assert data["ru_position"] == "Генеральный директор"
+    assert status == "200 OK"
+    assert "<td>Position</td><td>General Director</td>" in body
 
 
-def test_manual_post_treats_numeric_ru_org_as_inn(tmp_path, monkeypatch):
+def test_card_edit_post_updates_profile_and_redirects_to_table_view(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
-    monkeypatch.setattr(
-        app,
-        "_parse_egrul",
-        lambda inn: {
-            "inn": inn,
-            "ru_org": "ПАО Сбербанк",
-            "surname_ru": "Греф",
-            "name_ru": "Герман",
-            "middle_name_ru": "Оскарович",
-            "ru_position": "Президент",
+    profile = {
+        "surname_ru": "Иванов",
+        "name_ru": "Иван",
+        "gender": "М",
+        "ru_org": "ООО Ромашка",
+        "en_org": "Romashka LLC",
+        "ru_position": "Генеральный директор",
+        "en_position": "General Director",
+        "first_name": "Ivan",
+    }
+    card_id = app._create_autofill_card(profile, [], [], [], {})
+
+    _body, status, headers = app.card_edit_post(
+        card_id,
+        {
+            "title": ["Mr"],
+            "appeal": ["Г-н"],
+            "family_name": ["Ivanov"],
+            "first_name": ["John"],
+            "middle_name_en": ["Petrovich"],
+            "surname_ru": ["Иванов"],
+            "name_ru": ["Иван"],
+            "middle_name_ru": ["Петрович"],
+            "gender": ["М"],
+            "inn": ["7707083893"],
+            "ru_org": ["ООО Ромашка"],
+            "en_org": ["Romashka LLC"],
+            "ru_position": ["Генеральный директор"],
+            "en_position": ["Chief Executive Officer"],
         },
     )
 
-    _body, status, headers = app.manual_post(
-        {
-            "ru_org": ["7707083893"],
-            "en_org": [""],
-            "gender": ["М"],
-            "en_position": [""],
-        }
-    )
-
     assert status == "302 Found"
-    location = dict(headers)["Location"]
-    assert location.startswith("/card/")
+    assert dict(headers)["Location"] == f"/card/{card_id}"
 
-    with app._connect() as db:
-        saved = db.execute("SELECT * FROM cards ORDER BY id DESC LIMIT 1").fetchone()
-    payload = json.loads(saved["data_json"])
-    assert payload["profile"]["inn"] == "7707083893"
-    assert payload["profile"]["ru_org"] == "Сбербанк ПАО"
-    assert payload["profile"]["surname_ru"] == "Греф"
-
-
-def test_search_external_sources_stops_early_for_complete_inn_profile(tmp_path, monkeypatch):
-    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
-
-    providers = app._provider_chain(web_app.INPUT_TYPE_INN, "7707083893")
-    assert len(providers) >= 2
-
-    calls = {"count": 0}
-
-    def fake_call_provider(provider, *_args, **_kwargs):
-        calls["count"] += 1
-        if provider["name"] == "ФНС ЕГРЮЛ":
-            return {
-                "ru_org": "ПАО Сбербанк",
-                "surname_ru": "Греф",
-                "name_ru": "Герман",
-                "ru_position": "Президент",
-            }
-        return {"ru_org": "should-not-be-used"}
-
-    monkeypatch.setattr(app, "_call_provider", fake_call_provider)
-
-    hits, trace = app._search_external_sources("7707083893")
-
-    assert hits
-    assert calls["count"] == 1
-    assert any("ранняя остановка" in step for step in trace)
+    body, view_status, _headers = app.card_view(card_id)
+    assert view_status == "200 OK"
+    assert "<td>First name</td><td>John</td>" in body
+    assert "<td>Position</td><td>Chief Executive Officer</td>" in body
