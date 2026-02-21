@@ -515,7 +515,7 @@ def test_parse_egrul_supports_legacy_payload_fields(tmp_path, monkeypatch):
     data = app._parse_egrul("7707083893")
     assert data is not None
     assert data["inn"] == "7707083893"
-    assert data["ru_org"].startswith("ПАО")
+    assert data["ru_org"] == "Сбербанк ПАО"
     assert data
     assert data["revenue"] == 5200000
 
@@ -754,8 +754,8 @@ def test_manual_get_prefers_profile_prefill_and_person_name(tmp_path):
     )
 
     assert status == "200 OK"
-    assert "name='ru_org' value='ПАО Сбербанк'" in body
-    assert "name='en_org' value='Sberbank PJSC'" in body
+    assert "name='ru_org' required value='ПАО Сбербанк'" in body
+    assert "name='en_org' required value='Sberbank PJSC'" in body
     assert "name='surname_ru' value='Греф'" in body
     assert "name='name_ru' value='Герман'" in body
 
@@ -796,3 +796,95 @@ def test_build_profile_from_sources_keeps_special_case_position_and_names(tmp_pa
     assert profile["ru_position"] == "Президент, Председатель правления"
     assert profile["en_position"] == "President, Chairman of the Board"
     assert profile["en_org"] == "Sberbank PJSC"
+
+
+def test_parse_egrul_reads_deep_company_and_head_structures(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_get(url, **_kwargs):
+        assert url == "https://egrul.itsoft.ru/7701234567.json"
+        return FakeResponse(
+            json_data={
+                "СвЮЛ": {
+                    "СвНаимЮЛ": {"ПолнНаим": "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ РОМАШКА"},
+                    "СведДолжнФЛ": {
+                        "СвФЛ": {"ФИОПолн": "Петров Петр Петрович"},
+                        "СвДолжн": {"НаимДолжн": "Генеральный директор"},
+                    },
+                },
+            }
+        )
+
+    monkeypatch.setattr(web_app.requests, "get", fake_get)
+
+    data = app._parse_egrul("7701234567")
+
+    assert data is not None
+    assert data["ru_org"] == "Ромашка ООО"
+    assert data["surname_ru"] == "Петров"
+    assert data["ru_position"] == "Генеральный директор"
+
+
+def test_manual_post_treats_numeric_ru_org_as_inn(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(
+        app,
+        "_parse_egrul",
+        lambda inn: {
+            "inn": inn,
+            "ru_org": "ПАО Сбербанк",
+            "surname_ru": "Греф",
+            "name_ru": "Герман",
+            "middle_name_ru": "Оскарович",
+            "ru_position": "Президент",
+        },
+    )
+
+    _body, status, headers = app.manual_post(
+        {
+            "ru_org": ["7707083893"],
+            "en_org": [""],
+            "gender": ["М"],
+            "en_position": [""],
+        }
+    )
+
+    assert status == "302 Found"
+    location = dict(headers)["Location"]
+    assert location.startswith("/card/")
+
+    with app._connect() as db:
+        saved = db.execute("SELECT * FROM cards ORDER BY id DESC LIMIT 1").fetchone()
+    payload = json.loads(saved["data_json"])
+    assert payload["profile"]["inn"] == "7707083893"
+    assert payload["profile"]["ru_org"] == "Сбербанк ПАО"
+    assert payload["profile"]["surname_ru"] == "Греф"
+
+
+def test_search_external_sources_stops_early_for_complete_inn_profile(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    providers = app._provider_chain(web_app.INPUT_TYPE_INN, "7707083893")
+    assert len(providers) >= 2
+
+    calls = {"count": 0}
+
+    def fake_call_provider(provider, *_args, **_kwargs):
+        calls["count"] += 1
+        if provider["name"] == "ФНС ЕГРЮЛ":
+            return {
+                "ru_org": "ПАО Сбербанк",
+                "surname_ru": "Греф",
+                "name_ru": "Герман",
+                "ru_position": "Президент",
+            }
+        return {"ru_org": "should-not-be-used"}
+
+    monkeypatch.setattr(app, "_call_provider", fake_call_provider)
+
+    hits, trace = app._search_external_sources("7707083893")
+
+    assert hits
+    assert calls["count"] == 1
+    assert any("ранняя остановка" in step for step in trace)
