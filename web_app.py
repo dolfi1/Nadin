@@ -608,11 +608,7 @@ class CompanyWebApp:
         if input_type == INPUT_TYPE_PERSON_TEXT:
             names = ["rusprofile.ru", "ФНС ЕГРЮЛ"]
         elif input_type == INPUT_TYPE_INN:
-            names = [
-                "ФНС ЕГРЮЛ",
-                "rusprofile.ru",
-                "focus.kontur.ru",
-            ]
+            names = ["ФНС ЕГРЮЛ", "rusprofile.ru"]
         elif input_type == INPUT_TYPE_ORG_TEXT:
             names = ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"]
         elif self._is_foreign_query(raw):
@@ -755,7 +751,11 @@ class CompanyWebApp:
         fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn, search_type=search_type)
         if not fallback_hits:
             if getattr(self._thread_state, "blocked_fetch", False):
-                logger.warning("Provider %s returned captcha/block for '%s'; skip negative cache", provider.get("name", "unknown"), raw)
+                blocked_ttl = 12 * 60 * 60
+                if not no_cache:
+                    self._set_cache(cache_key, [], ttl=blocked_ttl)
+                self._provider_disabled_until[provider.get("name", "")] = time.time() + blocked_ttl
+                logger.warning("Provider %s returned captcha/block for '%s'; cached as blocked", provider.get("name", "unknown"), raw)
                 return None
             if not no_cache:
                 negative_ttl = self._negative_ttl_for_provider(provider)
@@ -962,6 +962,41 @@ class CompanyWebApp:
         digits = re.sub(r"[^\d]", "", text or "")
         return int(digits) if digits else 0
 
+    def _deep_values_for_keys(self, payload: Any, keys: set[str]) -> list[Any]:
+        matches: list[Any] = []
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if key in keys:
+                    matches.append(value)
+                matches.extend(self._deep_values_for_keys(value, keys))
+        elif isinstance(payload, list):
+            for item in payload:
+                matches.extend(self._deep_values_for_keys(item, keys))
+        return matches
+
+    def _first_non_empty_deep_value(self, payload: Any, keys: set[str]) -> str:
+        for value in self._deep_values_for_keys(payload, keys):
+            text = self._normalize_spaces(str(value))
+            if text:
+                return text
+        return ""
+
+    def _is_inn_profile_complete(self, hits: list[dict[str, Any]]) -> bool:
+        merged: dict[str, str] = {}
+        for hit in hits:
+            data = hit.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            for field in ("ru_org", "surname_ru", "name_ru", "ru_position"):
+                if not merged.get(field):
+                    merged[field] = self._normalize_spaces(str(data.get(field, "")))
+        if not merged.get("en_org") and merged.get("ru_org"):
+            merged["en_org"], _ = self.normalize_en_org("", merged["ru_org"])
+        if not merged.get("en_position") and merged.get("ru_position"):
+            merged["en_position"] = self._generate_en_position(merged["ru_position"])
+        required = ("ru_org", "surname_ru", "name_ru", "ru_position", "en_org", "en_position")
+        return all(merged.get(field) for field in required)
+
     def _extract_revenue_from_soup(self, soup: BeautifulSoup) -> int:
         rev_tag = soup.find("td", string=re.compile(r"Выручка|Доход|Revenue", re.IGNORECASE))
         if isinstance(rev_tag, Tag):
@@ -1074,7 +1109,18 @@ class CompanyWebApp:
 
         try:
             active_providers = [provider for provider in providers if self._should_call_provider(provider, input_type)]
-            if active_providers:
+            if active_providers and input_type == INPUT_TYPE_INN:
+                for provider in active_providers:
+                    provider_name, provider_hits, state = load_provider(provider)
+                    if provider_hits:
+                        hits.extend(provider_hits)
+                    hits_by_provider[provider_name] = len(provider_hits)
+                    icon = "✅" if provider_hits else "❌"
+                    trace.append(f"{icon} Источник: {provider_name} — {state}")
+                    if self._is_inn_profile_complete(hits):
+                        trace.append("⏹️ Источники: ранняя остановка (профиль по ИНН заполнен)")
+                        break
+            elif active_providers:
                 with ThreadPoolExecutor(max_workers=min(5, len(active_providers))) as executor:
                     futures = {executor.submit(load_provider, provider): provider for provider in active_providers}
                     try:
@@ -1182,6 +1228,9 @@ class CompanyWebApp:
                 logger.info("Fetched %s status=%d len=%d", url, status_code, response_length)
                 if self._is_captcha_or_block(response_text, url=url):
                     self._thread_state.blocked_fetch = True
+                    block_ttl = 12 * 60 * 60
+                    self._save_rate_limited(host or "source", f"blocked:{url}", retry_seconds=block_ttl)
+                    self._provider_disabled_until[host or "source"] = time.time() + block_ttl
                     logger.warning("%s returned captcha/block page (content check, len=%d)", url, response_length)
                     return None
                 if status_code == 200:
@@ -1333,7 +1382,14 @@ class CompanyWebApp:
                 or data.get("ru_org")
                 or ""
             )
+            if not self._normalize_spaces(str(ru_org_raw)):
+                ru_org_raw = self._first_non_empty_deep_value(
+                    data,
+                    {"НаимПолн", "НаимСокр", "ПолнНаим", "КраткНаим", "Name", "name", "ru_org"},
+                )
             ru_org = self._clean_ru_org_name(str(ru_org_raw).replace("ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "ПАО"))
+            if ru_org:
+                ru_org, _ = self.normalize_ru_org(ru_org)
             if not ru_org:
                 logger.warning("ФНС: ru_org пустой для INN=%s", query)
 
@@ -1344,10 +1400,18 @@ class CompanyWebApp:
             position = str(director.get("Должность") or director.get("position") or data.get("ru_position") or "")
 
             if not surname_ru:
-                dol_list = data.get("СведДолжнФЛ") or sv_yul.get("СведДолжнФЛ") or []
-                if isinstance(dol_list, list) and dol_list:
-                    head = dol_list[0] or {}
+                dol_candidates = self._deep_values_for_keys(data, {"СведДолжнФЛ"})
+                dol_list: list[dict[str, Any]] = []
+                for candidate in dol_candidates:
+                    if isinstance(candidate, list):
+                        dol_list.extend([item for item in candidate if isinstance(item, dict)])
+                    elif isinstance(candidate, dict):
+                        dol_list.append(candidate)
+                if dol_list:
+                    head = dol_list[0]
                     fio_str = str(head.get("ФИО") or head.get("ФИОПолн") or "")
+                    if not fio_str:
+                        fio_str = self._first_non_empty_deep_value(head, {"ФИО", "ФИОПолн", "head_ru"})
                     if fio_str:
                         surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_str)
                     else:
@@ -1365,6 +1429,13 @@ class CompanyWebApp:
                     if not position:
                         dolzhn = head.get("СвДолжн") or {}
                         position = str((dolzhn.get("НаимДолжн") if isinstance(dolzhn, dict) else "") or head.get("Должность") or "")
+                    if not position:
+                        position = self._first_non_empty_deep_value(head, {"НаимДолжн", "Должность", "ru_position", "position"})
+
+            if not surname_ru:
+                deep_fio = self._first_non_empty_deep_value(data, {"head_ru", "ФИО", "ФИОПолн"})
+                if deep_fio:
+                    surname_ru, name_ru, middle_name_ru = self._split_fio_ru(deep_fio)
 
             if not surname_ru:
                 keywords = str(data.get("keywords") or data.get("meta_keywords") or "")
@@ -3533,23 +3604,59 @@ class CompanyWebApp:
             f"<p>Фамилия <input name='surname_ru' value='{escape(surname_ru)}'></p>"
             f"<p>Имя <input name='name_ru' value='{escape(name_ru)}'></p>"
             f"<p>Middle name. рус <input name='middle_name_ru' value='{escape(middle_name_ru)}'></p>"
-            f"<p>Организация RU <input name='ru_org' value='{escape(ru_org)}'></p>"
-            f"<p>Organization EN <input name='en_org' value='{escape(en_org)}'></p>"
+            f"<p>ИНН организации <input name='inn' value='{escape(inn)}' pattern='[0-9]{10,12}' title='10-12 цифр'></p>"
+            f"<p>Организация RU (название) * <input name='ru_org' required value='{escape(ru_org)}'></p>"
+            f"<p>Organization EN * <input name='en_org' required value='{escape(en_org)}'></p>"
             f"<p>Пол <select name='gender'><option value=''>--</option><option{male_selected}>М</option><option{female_selected}>Ж</option></select></p>"
-            f"<p>ИНН <input name='inn' value='{escape(inn)}'></p>"
-            f"<p>Должность RU <input name='ru_position' value='{escape(ru_position)}'></p>"
-            f"<p>Position EN <input name='en_position' value='{escape(en_position)}'></p>"
+            f"<p>Должность RU * <input name='ru_position' required value='{escape(ru_position)}'></p>"
+            f"<p>Position EN * <input name='en_position' required value='{escape(en_position)}'></p>"
             "<button>Сохранить</button></form>"
+            "<script>document.querySelector(\"form[action='/create/manual']\")?.addEventListener('submit', function (e) {"
+            "  const required = this.querySelectorAll('[required]');"
+            "  let invalid = false;"
+            "  required.forEach(function (el) {"
+            "    if (!el.value.trim()) { el.style.borderColor = '#b22'; invalid = true; } else { el.style.borderColor = ''; }"
+            "  });"
+            "  if (invalid) { e.preventDefault(); alert('Заполните обязательные поля, выделенные *'); }"
+            "});</script>"
         )
         body = self._page("Ручное создание", content, back_href="/")
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
     def manual_post(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
-        ru_org, ru_notes = self.normalize_ru_org(self._get_one(form, "ru_org"))
+        ru_org_raw = self._normalize_spaces(self._get_one(form, "ru_org"))
+        inn_input = self._extract_inn(self._get_one(form, "inn") or ru_org_raw)
+        ru_org_input = ru_org_raw
+        autofill_notes: list[str] = []
+        auto_profile: dict[str, str] = {}
+
+        if re.fullmatch(r"\d{10,12}", ru_org_raw):
+            inn_input = ru_org_raw
+            egrul = self._parse_egrul(ru_org_raw)
+            if egrul:
+                ru_org_input = str(egrul.get("ru_org", ""))
+                auto_profile = {
+                    "surname_ru": str(egrul.get("surname_ru", "")),
+                    "name_ru": str(egrul.get("name_ru", "")),
+                    "middle_name_ru": str(egrul.get("middle_name_ru", "")),
+                    "ru_position": str(egrul.get("ru_position", "")),
+                }
+                autofill_notes.append("Организация RU определена по ИНН из ФНС ЕГРЮЛ")
+
+        ru_org, ru_notes = self.normalize_ru_org(ru_org_input)
         en_org, en_notes = self.normalize_en_org(self._get_one(form, "en_org"), ru_org)
         gender = self._get_one(form, "gender")
         errors: list[str] = []
-        if (self._get_one(form, "surname_ru") or self._get_one(form, "name_ru")) and gender not in {"М", "Ж"}:
+        surname_ru = self._get_one(form, "surname_ru") or auto_profile.get("surname_ru", "")
+        name_ru = self._get_one(form, "name_ru") or auto_profile.get("name_ru", "")
+        middle_name_ru = self._get_one(form, "middle_name_ru") or auto_profile.get("middle_name_ru", "")
+        ru_position = self._get_one(form, "ru_position") or auto_profile.get("ru_position", "")
+        en_position = self._get_one(form, "en_position")
+        if not en_position and ru_position:
+            en_position = self._generate_en_position(ru_position)
+        if not gender and (middle_name_ru or ru_position):
+            gender = self._infer_gender(middle_name_ru, ru_position)
+        if (surname_ru or name_ru) and gender not in {"М", "Ж"}:
             errors.append("Пол обязателен: М/Ж")
         profile = {
             "title": self._get_one(form, "title"),
@@ -3557,20 +3664,20 @@ class CompanyWebApp:
             "family_name": self._get_one(form, "family_name"),
             "first_name": self._get_one(form, "first_name"),
             "middle_name_en": self._get_one(form, "middle_name_en"),
-            "surname_ru": self._get_one(form, "surname_ru"),
-            "name_ru": self._get_one(form, "name_ru"),
-            "middle_name_ru": self._get_one(form, "middle_name_ru"),
+            "surname_ru": surname_ru,
+            "name_ru": name_ru,
+            "middle_name_ru": middle_name_ru,
             "gender": gender,
-            "inn": self._get_one(form, "inn"),
+            "inn": inn_input,
             "ru_org": ru_org,
             "en_org": en_org,
-            "ru_position": self._get_one(form, "ru_position"),
-            "en_position": self._get_one(form, "en_position"),
+            "ru_position": ru_position,
+            "en_position": en_position,
         }
         missing_required = [field for field in REQUIRED_FIELDS if not self._normalize_spaces(str(profile.get(field, "")))]
         if missing_required:
             errors.append(f"Заполните обязательные поля: {', '.join(missing_required)}")
-        notes = ru_notes + en_notes + errors
+        notes = ru_notes + en_notes + autofill_notes + errors
         status = self._status(notes, bool(ru_org and en_org))
         if errors:
             params = {

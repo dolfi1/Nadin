@@ -515,7 +515,7 @@ def test_parse_egrul_supports_legacy_payload_fields(tmp_path, monkeypatch):
     data = app._parse_egrul("7707083893")
     assert data is not None
     assert data["inn"] == "7707083893"
-    assert data["ru_org"].startswith("ПАО")
+    assert data["ru_org"] == "Сбербанк ПАО"
     assert data
     assert data["revenue"] == 5200000
 
@@ -754,8 +754,8 @@ def test_manual_get_prefers_profile_prefill_and_person_name(tmp_path):
     )
 
     assert status == "200 OK"
-    assert "name='ru_org' value='ПАО Сбербанк'" in body
-    assert "name='en_org' value='Sberbank PJSC'" in body
+    assert "name='ru_org' required value='ПАО Сбербанк'" in body
+    assert "name='en_org' required value='Sberbank PJSC'" in body
     assert "name='surname_ru' value='Греф'" in body
     assert "name='name_ru' value='Герман'" in body
 
