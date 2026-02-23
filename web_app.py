@@ -60,7 +60,7 @@ RU_TO_EN_OPF = {
     "ЧУ": "PI",
 }
 EN_TO_RU_OPF = {v: k for k, v in RU_TO_EN_OPF.items()}
-SPECIAL_EN_ORG_NAMES = {"сбербанк": "Sberbank PJSC", "газпром": "Gazprom PJSC", "лукойл": "Lukoil PJSC"}
+SPECIAL_EN_ORG_NAMES = {"газпром": "Gazprom PJSC", "лукойл": "Lukoil PJSC"}
 FULL_RU_OPF = {
     "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ": "ООО",
     "ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО": "ПАО",
@@ -98,6 +98,9 @@ SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "Wikipedia", "kind": "wikipedia_html", "supports_inn": False, "supports_name": True, "supports_url": True, "is_person_source": False, "priority": 3},
     {"name": "DuckDuckGo HTML", "kind": "duckduckgo_html", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 4},
     {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True, "priority": 5},
+    {"name": "zachestnyibiznes.ru", "kind": "zachestnyibiznes_scrape", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 6},
+    {"name": "companies.rbc.ru", "kind": "rbc_companies_scrape", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 7},
+    {"name": "tbank/tinkoff", "kind": "tbank_leadership_scrape", "supports_inn": False, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 8},
 ]
 
 RUSPROFILE_NOISE_RE = re.compile(
@@ -159,6 +162,7 @@ CARD_FIELDS: list[tuple[str, str]] = [
 
 PERSON_REQUIRED_FIELDS = ["surname_ru", "name_ru"]
 COMPANY_REQUIRED_FIELDS = ["ru_org", "en_org"]
+PERSON_IN_COMPANY_REQUIRED_FIELDS = ["surname_ru", "name_ru", "ru_org", "en_org"]
 PROBLEMATIC_PROVIDERS = {"rusprofile", "rusprofile_enhanced", "zachestnyibiznes"}
 NO_NEGATIVE_CACHE_KINDS = {"rusprofile", "rusprofile_enhanced", "zachestnyibiznes"}
 
@@ -226,7 +230,11 @@ class CompanyWebApp:
         return "company"
 
     def _required_fields_for_profile(self, profile: dict[str, Any]) -> list[str]:
-        if self._detect_profile_type(profile) == "person":
+        profile_type = self._detect_profile_type(profile)
+        has_org = bool(self._normalize_spaces(str(profile.get("ru_org", ""))) or self._normalize_spaces(str(profile.get("en_org", ""))))
+        if profile_type == "person" and has_org:
+            return PERSON_IN_COMPANY_REQUIRED_FIELDS
+        if profile_type == "person":
             return PERSON_REQUIRED_FIELDS
         return COMPANY_REQUIRED_FIELDS
 
@@ -371,6 +379,13 @@ class CompanyWebApp:
         parts = norm.split()
         if not (1 <= len(parts) <= 3):
             return False
+        if len(parts) == 1:
+            token = parts[0]
+            # Однословные запросы вроде "ВТБ" обычно означают организацию.
+            if token.isupper():
+                return False
+            if not re.fullmatch(r"[А-Яа-яЁё-]+", token):
+                return False
         return all(re.fullmatch(r"[А-Яа-яЁё]+", part) for part in parts)
 
     def _clean_ru_org_name(self, value: str) -> str:
@@ -822,6 +837,13 @@ class CompanyWebApp:
             else:
                 url = url.format(inn=inn or "", query=quote(raw))
             return self._parse_generic_osint(url, provider.get("name", kind))
+        if kind == "zachestnyibiznes_scrape":
+            return self._parse_from_ddg_site(raw, ["zachestnyibiznes.ru"], provider.get("name", kind))
+        if kind == "rbc_companies_scrape":
+            return self._parse_from_ddg_site(raw, ["companies.rbc.ru"], provider.get("name", kind))
+        if kind == "tbank_leadership_scrape":
+            leadership_query = f"{raw} руководство"
+            return self._parse_from_ddg_site(leadership_query, ["tbank.ru", "tinkoff.ru"], provider.get("name", kind))
         if kind == "kontur":
             return self._parse_kontur(raw)
         if kind in {"bank_russia", "rbc"}:
@@ -915,7 +937,9 @@ class CompanyWebApp:
     def _supports_input_type(self, provider: dict[str, Any], input_type: str, _query: str) -> bool:
         if input_type == INPUT_TYPE_INN:
             return bool(provider.get("supports_inn", False))
-        if input_type in {INPUT_TYPE_PERSON_TEXT, INPUT_TYPE_ORG_TEXT}:
+        if input_type == INPUT_TYPE_PERSON_TEXT:
+            return bool(provider.get("supports_name", False) and provider.get("is_person_source", False))
+        if input_type == INPUT_TYPE_ORG_TEXT:
             return bool(provider.get("supports_name", False))
         if input_type == INPUT_TYPE_URL:
             return bool(provider.get("supports_url", False) or provider.get("supports_inn", False))
@@ -1205,6 +1229,11 @@ class CompanyWebApp:
 
     def _is_captcha_or_block(self, response_text: str, url: str = "") -> bool:
         text_lower = response_text.lower()
+        host = urlparse(url).netloc.lower()
+
+        if host in {"ru.wikipedia.org", "wikipedia.org", "duckduckgo.com", "html.duckduckgo.com", "www.duckduckgo.com"}:
+            strict_markers = ["cf-chl", "g-recaptcha", "hcaptcha", "just a moment", "access denied"]
+            return any(marker in text_lower for marker in strict_markers)
 
         block_markers = [
             "captcha", "проверка браузера", "cloudflare", "ddos-guard",
@@ -2069,6 +2098,42 @@ class CompanyWebApp:
         position = self._select_first_text(soup, [".director-position", ".manager-position", ".position"])
         return self._build_osint_profile(url, source, org_name, director, position, soup.get_text(" ", strip=True))
 
+    def _parse_from_ddg_site(self, raw_query: str, domains: list[str], source: str) -> dict[str, Any]:
+        target_urls = self._ddg_site_search(raw_query, domains, max_urls=3)
+        for target_url in target_urls:
+            profile = self._parse_generic_osint(target_url, source)
+            if profile and (profile.get("ru_org") or profile.get("inn") or profile.get("surname_ru")):
+                profile["url"] = target_url
+                return profile
+        return {}
+
+    def _ddg_site_search(self, raw_query: str, domains: list[str], max_urls: int = 3) -> list[str]:
+        query_text = self._normalize_spaces(raw_query)
+        if not query_text:
+            return []
+        site_query = " OR ".join(f"site:{domain}" for domain in domains)
+        search_url = f"https://duckduckgo.com/html/?q={quote(f'{site_query} {query_text}') }"
+        html = self._fetch_page(search_url, timeout=20, max_retries=2)
+        if not html:
+            return []
+        soup = BeautifulSoup(html, "lxml")
+        urls: list[str] = []
+        for anchor in soup.select("a.result__a, a[href^='http']"):
+            href = str(anchor.get("href") or "").strip()
+            if not href:
+                continue
+            parsed = urlparse(href)
+            host = parsed.netloc.lower()
+            if not host:
+                continue
+            if any(domain in host for domain in domains):
+                cleaned = href.split("&rut=", 1)[0]
+                if cleaned not in urls:
+                    urls.append(cleaned)
+            if len(urls) >= max_urls:
+                break
+        return urls
+
     def _build_osint_profile(self, url: str, source: str, org_name: str, director: str, position: str, page_text: str) -> dict[str, Any]:
         surname_ru, name_ru, middle_name_ru = "", "", ""
         if director:
@@ -2555,11 +2620,13 @@ class CompanyWebApp:
         source_hits: list[dict[str, Any]],
         raw_name: str,
         input_type: str,
+        forced_type: str = "",
     ) -> tuple[dict[str, str], dict[str, str]]:
         profile = {field: "" for field, _ in CARD_FIELDS}
         query = self._extract_inn(raw_name) if input_type == INPUT_TYPE_INN else self._normalize_spaces(raw_name)
         field_sources: dict[str, str] = {}
         logger.info("Построение профиля из %d хитов", len(source_hits))
+        profile_type = forced_type if forced_type in {"person", "company"} else ""
 
         for hit in source_hits:
             if hit.get("source") != "special_case":
@@ -2646,7 +2713,7 @@ class CompanyWebApp:
             field_sources["ru_org"] = "raw_query_fallback"
             logger.info("ru_org был равен ИНН, заменено на raw_name: %s", raw_name)
 
-        if input_type == INPUT_TYPE_PERSON_TEXT:
+        if input_type == INPUT_TYPE_PERSON_TEXT and profile_type != "company":
             merged_person, merged_sources = self._merge_person_hits(source_hits)
             for key, value in merged_person.items():
                 if not value:
@@ -2679,7 +2746,7 @@ class CompanyWebApp:
                     field_sources["ru_org"] = item.get("source", "unknown")
                     break
 
-        if not profile["ru_org"] and input_type != INPUT_TYPE_INN:
+        if not profile["ru_org"] and input_type != INPUT_TYPE_INN and profile_type != "person":
             candidate_raw_name = raw_name.strip()
             if not re.fullmatch(r"\d{10,12}", candidate_raw_name):
                 profile["ru_org"] = raw_name
@@ -2711,7 +2778,7 @@ class CompanyWebApp:
             if profile.get("middle_name_en"):
                 field_sources.setdefault("middle_name_en", "Транслитерация из Отчество")
 
-        if input_type == INPUT_TYPE_PERSON_TEXT and not profile.get("surname_ru") and not profile.get("name_ru"):
+        if input_type == INPUT_TYPE_PERSON_TEXT and profile_type != "company" and not profile.get("surname_ru") and not profile.get("name_ru"):
             sur, nam, patr = self._split_fio_ru(raw_name)
             profile["surname_ru"] = sur
             profile["name_ru"] = nam
@@ -2747,6 +2814,12 @@ class CompanyWebApp:
         profile["salutation"] = profile.get("appeal", "")
         if not profile.get("en_position"):
             profile["en_position"] = profile.get("position", "")
+
+        if profile_type == "company":
+            for field in ["surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en", "gender", "appeal", "salutation"]:
+                profile[field] = ""
+                field_sources.pop(field, None)
+
         profile = self._normalize_card_data(profile, field_sources)
 
         for field, _ in CARD_FIELDS:
@@ -2903,7 +2976,9 @@ class CompanyWebApp:
                 "org_ru": self._clean_ru_org_name(str(normalized_data.get("ru_org", ""))),
                 "position_ru": self._normalize_spaces(str(normalized_data.get("ru_position", ""))),
                 "inn": self._normalize_spaces(str(normalized_data.get("inn", ""))),
-                "query_for_autofill": self._normalize_spaces(str(normalized_data.get("inn", ""))) or fio_ru,
+                "query_for_autofill": self._normalize_spaces(str(normalized_data.get("inn", "")))
+                or (fio_ru if hit_type == "person" else self._clean_ru_org_name(str(normalized_data.get("ru_org", ""))))
+                or fio_ru,
                 "revenue": str(int(normalized_data.get("revenue", 0) or 0)),
             })
 
@@ -2971,6 +3046,8 @@ class CompanyWebApp:
                 (
                     "<form method='post' action='/autofill/review' style='margin: 10px 0;'>"
                     f"<input type='hidden' name='company_name' value='{escape(c['query_for_autofill'])}' />"
+                    f"<input type='hidden' name='hit_type' value='{escape(c.get('type', ''))}' />"
+                    f"<input type='hidden' name='search_type' value='{escape(search_type)}' />"
                     "<button type='submit' style='width: 100%; text-align: left; border: 1px solid #ddd; padding: 15px; border-radius: 8px; cursor: pointer; background: white;'>"
                     f"<h4 style='margin: 0 0 8px;'>{escape(c['fio_ru'] or c['org_ru'] or 'Вариант')}</h4>"
                     f"<p style='margin: 4px 0;'><b>Организация:</b> {escape(c['org_ru'] or '—')}</p>"
@@ -2987,7 +3064,7 @@ class CompanyWebApp:
         elif q:
             not_found = (
                 f"<p>Нет данных. Создать вручную?</p>"
-                f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(q)}' /><button>Автозаполнить из открытых источников</button></form>"
+                f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(q)}' /><input type='hidden' name='search_type' value='{escape(search_type)}' /><button>Автозаполнить из открытых источников</button></form>"
                 f"<a href='/create/manual?q={escape(q)}'>Создать вручную</a>"
             )
         else:
@@ -3295,10 +3372,16 @@ class CompanyWebApp:
 
     def autofill_review(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         raw = self._get_one(form, "company_name")
+        hit_type = self._normalize_spaces(self._get_one(form, "hit_type")).lower()
+        forced_search_type = self._normalize_spaces(self._get_one(form, "search_type")).lower()
         no_cache = self._get_one(form, "no_cache") == "1"
         input_type = self.detect_input_type(raw)
+        if hit_type in {"company", "person"}:
+            input_type = INPUT_TYPE_ORG_TEXT if hit_type == "company" else INPUT_TYPE_PERSON_TEXT
+        elif forced_search_type in {"company", "person"}:
+            input_type = INPUT_TYPE_ORG_TEXT if forced_search_type == "company" else INPUT_TYPE_PERSON_TEXT
         normalized_raw = self._normalize_spaces(raw).lower()
-        cache_key = f"search:{input_type}:{normalized_raw}"
+        cache_key = f"search:{input_type}:{hit_type}:{forced_search_type}:{normalized_raw}"
 
         cached_result = self._autofill_result_cache.get(cache_key)
         if cached_result and time.time() < float(cached_result.get("expires_at", 0)):
@@ -3321,7 +3404,12 @@ class CompanyWebApp:
             else:
                 reset_note = []
 
-            source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache)
+            source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
+            effective_hit_type = hit_type if hit_type in {"company", "person"} else ""
+            if not effective_hit_type and source_hits:
+                first_hit_type = self._normalize_spaces(str(source_hits[0].get("type", ""))).lower()
+                if first_hit_type in {"company", "person"}:
+                    effective_hit_type = first_hit_type
             search_trace = reset_note + search_trace
             extracted_data: dict[str, str] = {}
             for hit in source_hits:
@@ -3342,7 +3430,9 @@ class CompanyWebApp:
                     value = self._normalize_spaces(str(data.get(field, "")))
                     if value and not extracted_data.get(field):
                         extracted_data[field] = value
-            profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type)
+            profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type, forced_type=effective_hit_type)
+            if effective_hit_type in {"company", "person"}:
+                profile["type"] = effective_hit_type
             for key, value in extracted_data.items():
                 if value and not profile.get(key):
                     profile[key] = value
