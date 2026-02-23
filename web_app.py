@@ -197,6 +197,7 @@ class CompanyWebApp:
         self._autofill_result_cache: dict[str, dict[str, Any]] = {}
         self._last_search_time: dict[str, float] = {}
         self._endpoint_rate_limit: dict[str, list[float]] = defaultdict(list)
+        self._ddg_query_cache: dict[str, tuple[float, list[str]]] = {}
         self._thread_state = threading.local()
         self._strict_scraping_mode = True
         self._init_db()
@@ -628,7 +629,8 @@ class CompanyWebApp:
     def _status(self, notes: list[str], required_ok: bool) -> str:
         if not required_ok:
             return "Черновик / Нужно дополнить"
-        if any("должна" in n.lower() or "forbidden" in n.lower() for n in notes):
+        fatal_markers = ("пол должен", "forbidden", "only english")
+        if any(any(marker in n.lower() for marker in fatal_markers) for n in notes):
             return "Ошибка формата"
         if any("автотранслит" in n.lower() for n in notes):
             return "Нужно проверить"
@@ -775,13 +777,19 @@ class CompanyWebApp:
 
         try:
             hits = self._fetch_from_provider(provider, normalized, input_type, inn, search_type=search_type)
-            if hits:
+            normalized_hits = hits if isinstance(hits, list) else ([hits] if isinstance(hits, dict) else [])
+            valid_hits = [
+                item for item in normalized_hits
+                if self._is_valid_provider_payload(item if isinstance(item, dict) else {}, str((item or {}).get("type", "") if isinstance(item, dict) else ""))
+            ]
+            if valid_hits:
                 self._mark_provider_success(provider.get("name", ""))
-                normalized_hits = hits if isinstance(hits, list) else [hits]
                 if not no_cache:
-                    self._set_cache(cache_key, normalized_hits, ttl=self._positive_cache_ttl)
+                    self._set_cache(cache_key, valid_hits, ttl=self._positive_cache_ttl)
                     logger.info("Кэш сохранен для %s", cache_key)
-                return hits
+                if isinstance(hits, list):
+                    return valid_hits
+                return valid_hits[0]
         except Exception as exc:  # noqa: BLE001
             logger.warning("Provider %s failed for %s: %s", provider.get("name"), raw, str(exc))
             self._mark_provider_failure(provider.get("name", ""))
@@ -838,6 +846,9 @@ class CompanyWebApp:
                     url = f"https://duckduckgo.com/html/?q={quote(raw)}"
             else:
                 url = url.format(inn=inn or "", query=quote(raw))
+            if not self._normalize_spaces(url):
+                logger.error("Provider %s generated empty URL", provider.get("name", kind))
+                return []
             return self._parse_generic_osint(url, provider.get("name", kind))
         if kind == "zachestnyibiznes_scrape":
             return self._parse_from_ddg_site(raw, ["zachestnyibiznes.ru"], provider.get("name", kind))
@@ -859,6 +870,9 @@ class CompanyWebApp:
             return self._parse_generic_osint(url, provider.get("name", kind))
         if kind in {"google_search", "yandex_search", "linkedin_search", "facebook_search", "offshoreleaks", "checko", "zachestnyibiznes", "sherlock", "maigret", "holehe", "theharvester"}:
             url = provider.get("url_template", "").format(inn=inn or "", query=quote(raw))
+            if not self._normalize_spaces(url):
+                logger.error("Provider %s generated empty URL", provider.get("name", kind))
+                return []
             return self._parse_generic_osint(url, provider.get("name", kind))
         if kind == "open_corporates" and inn:
             url = provider.get("url_template", "").format(inn=inn)
@@ -1045,15 +1059,46 @@ class CompanyWebApp:
             data = hit.get("data", {})
             if not isinstance(data, dict):
                 continue
-            for field in ("ru_org", "surname_ru", "name_ru", "ru_position"):
+            for field in ("ru_org", "inn", "surname_ru", "name_ru"):
                 if not merged.get(field):
                     merged[field] = self._normalize_spaces(str(data.get(field, "")))
-        if not merged.get("en_org") and merged.get("ru_org"):
-            merged["en_org"], _ = self.normalize_en_org("", merged["ru_org"])
-        if not merged.get("en_position") and merged.get("ru_position"):
-            merged["en_position"] = self._generate_en_position(merged["ru_position"])
-        required = ("ru_org", "surname_ru", "name_ru", "ru_position", "en_org", "en_position")
-        return all(merged.get(field) for field in required)
+        return bool(merged.get("ru_org") and merged.get("inn"))
+
+    def _is_mojibake_text(self, value: str) -> bool:
+        text = self._normalize_spaces(value)
+        return "Ð" in text or "Ñ" in text
+
+    def _is_valid_provider_payload(self, payload: dict[str, Any], hit_type: str) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        normalized_type = (hit_type or payload.get("type") or "").strip().lower()
+        ru_org = self._normalize_spaces(str(payload.get("ru_org", "")))
+        surname_ru = self._normalize_spaces(str(payload.get("surname_ru", "")))
+        name_ru = self._normalize_spaces(str(payload.get("name_ru", "")))
+        if self._is_mojibake_text(ru_org):
+            return False
+        if normalized_type == "person":
+            return bool(surname_ru and name_ru)
+        if normalized_type == "company":
+            return bool(ru_org)
+        if surname_ru and name_ru:
+            return True
+        return bool(ru_org)
+
+    def _can_stop_provider_search(self, hits: list[dict[str, Any]], search_type: str, input_type: str) -> bool:
+        merged: dict[str, str] = {}
+        for hit in hits:
+            data = hit.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            for field in ("inn", "ru_org", "surname_ru", "name_ru"):
+                if not merged.get(field):
+                    merged[field] = self._normalize_spaces(str(data.get(field, "")))
+        if search_type == "person":
+            return bool(merged.get("surname_ru") and merged.get("name_ru"))
+        if search_type == "company" or input_type == INPUT_TYPE_INN:
+            return bool(merged.get("inn") and merged.get("ru_org"))
+        return False
 
     def _extract_revenue_from_soup(self, soup: BeautifulSoup) -> int:
         rev_tag = soup.find("td", string=re.compile(r"Выручка|Доход|Revenue", re.IGNORECASE))
@@ -1136,7 +1181,7 @@ class CompanyWebApp:
                         "source": provider["name"],
                         "url": item.get("url", ""),
                         "data": item,
-                        "type": item.get("type", "company"),
+                        "type": item.get("type", "unknown"),
                     }
                     for item in data
                     if item
@@ -1146,8 +1191,14 @@ class CompanyWebApp:
                     "source": provider["name"],
                     "url": data.get("url", ""),
                     "data": data,
-                    "type": data.get("type", "company"),
+                    "type": data.get("type", "unknown"),
                 }]
+
+            provider_hits = [
+                hit
+                for hit in provider_hits
+                if self._is_valid_provider_payload(hit.get("data", {}), str(hit.get("type", "")))
+            ]
 
             for hit in provider_hits:
                 hit_data = hit.get("data", {})
@@ -1167,7 +1218,7 @@ class CompanyWebApp:
 
         try:
             active_providers = [provider for provider in providers if self._should_call_provider(provider, input_type)]
-            if active_providers and input_type == INPUT_TYPE_INN:
+            if active_providers:
                 for provider in active_providers:
                     provider_name, provider_hits, state = load_provider(provider)
                     if provider_hits:
@@ -1175,32 +1226,9 @@ class CompanyWebApp:
                     hits_by_provider[provider_name] = len(provider_hits)
                     icon = "✅" if provider_hits else "❌"
                     trace.append(f"{icon} Источник: {provider_name} — {state}")
-                    if self._is_inn_profile_complete(hits):
-                        trace.append("⏹️ Источники: ранняя остановка (профиль по ИНН заполнен)")
+                    if self._can_stop_provider_search(hits, search_type=search_type, input_type=input_type):
+                        trace.append("⏹️ Источники: ранняя остановка (достаточно данных)")
                         break
-            elif active_providers:
-                with ThreadPoolExecutor(max_workers=min(5, len(active_providers))) as executor:
-                    futures = {executor.submit(load_provider, provider): provider for provider in active_providers}
-                    try:
-                        for future in as_completed(futures, timeout=60):
-                            provider = futures[future]
-                            try:
-                                provider_name, provider_hits, state = future.result()
-                                if provider_hits:
-                                    hits.extend(provider_hits)
-                                hits_by_provider[provider_name] = len(provider_hits)
-                                icon = "✅" if provider_hits else "❌"
-                                trace.append(f"{icon} Источник: {provider_name} — {state}")
-                            except Exception as exc:  # noqa: BLE001
-                                reason = self._handle_provider_error(provider.get("name", "unknown"), exc)
-                                trace.append(f"⚠️ Источник: {provider['name']} — {reason}")
-                                hits_by_provider[provider["name"]] = 0
-                    except FuturesTimeoutError:
-                        trace.append("Источники: global_timeout (60s)")
-                        for future, provider in futures.items():
-                            if not future.done():
-                                trace.append(f"⚠️ Источник: {provider['name']} — global_timeout")
-                                hits_by_provider[provider["name"]] = 0
             for provider in providers:
                 if not self._should_call_provider(provider, input_type):
                     continue
@@ -1264,6 +1292,9 @@ class CompanyWebApp:
         return False
 
     def _fetch_page(self, url: str, timeout: int = 15, max_retries: int = 5) -> str | None:
+        if not self._normalize_spaces(url):
+            logger.error("Provider generated empty URL, fetch skipped")
+            return None
         self._domain_throttle(url)
         timeout = max(15, timeout)
         if not self._is_localhost(url):
@@ -1298,6 +1329,11 @@ class CompanyWebApp:
                     return None
                 if status_code == 200:
                     return response_text
+                if status_code == 202 and attempt < attempts - 1:
+                    wait_time = random.uniform(2.0, 4.0)
+                    logger.warning("Received 202 from %s, waiting %.1f seconds before retry", url, wait_time)
+                    time.sleep(wait_time)
+                    continue
                 if status_code in {403, 429, 503} and attempt < attempts - 1:
                     wait_time = (2 ** (attempt + 1)) + random.uniform(0.2, 1.5)
                     logger.warning("Received %d from %s, waiting %.1f seconds before retry", status_code, url, wait_time)
@@ -2113,6 +2149,10 @@ class CompanyWebApp:
         query_text = self._normalize_spaces(raw_query)
         if not query_text:
             return []
+        cache_key = f"{query_text.lower()}|{'|'.join(sorted(domains))}|{max_urls}"
+        cached = self._ddg_query_cache.get(cache_key)
+        if cached and time.time() < cached[0]:
+            return list(cached[1])
         site_query = " OR ".join(f"site:{domain}" for domain in domains)
         search_url = f"https://duckduckgo.com/html/?q={quote(f'{site_query} {query_text}') }"
         html = self._fetch_page(search_url, timeout=20, max_retries=2)
@@ -2134,6 +2174,7 @@ class CompanyWebApp:
                     urls.append(cleaned)
             if len(urls) >= max_urls:
                 break
+        self._ddg_query_cache[cache_key] = (time.time() + 120, list(urls))
         return urls
 
     def _build_osint_profile(self, url: str, source: str, org_name: str, director: str, position: str, page_text: str) -> dict[str, Any]:
@@ -3149,7 +3190,7 @@ class CompanyWebApp:
                         "source": provider["name"],
                         "url": item.get("url", ""),
                         "data": item,
-                        "type": item.get("type", "company"),
+                        "type": item.get("type", "unknown"),
                     }
                     logger.debug(
                         "Хит от %s: data keys=%s, ru_org=%s",
@@ -3177,7 +3218,7 @@ class CompanyWebApp:
                                 "source": provider["name"],
                                 "url": item.get("url", ""),
                                 "data": item,
-                                "type": item.get("type", "company"),
+                                "type": item.get("type", "unknown"),
                             }
                             logger.debug(
                                 "Хит от %s: data keys=%s, ru_org=%s",
@@ -3261,7 +3302,7 @@ class CompanyWebApp:
         if queried_providers:
             trace.append("Провайдеры в поиске: " + ", ".join(sorted(p for p in queried_providers if p)))
 
-        if not candidates and source_hits:
+        if not candidates and source_hits and search_type != "person":
             primary_query = params.get("inn") or params.get("company") or " ".join(
                 filter(None, [params.get("surname", ""), params.get("name", ""), params.get("middle_name", "")])
             )
@@ -3490,6 +3531,13 @@ class CompanyWebApp:
             }
             for key, value in profile.items():
                 manual_payload[f"profile_{key}"] = value
+
+            if forced_search_type == "person" and not (self._normalize_spaces(profile.get("surname_ru", "")) and self._normalize_spaces(profile.get("name_ru", ""))):
+                logger.info("Person-mode autocreate skipped: missing surname/name")
+                manual_payload["error"] = "Ничего не найдено: укажите минимум имя и фамилию"
+                response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
+                self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+                return response
 
             missing_fields = self._missing_required_fields(profile)
             if missing_fields:

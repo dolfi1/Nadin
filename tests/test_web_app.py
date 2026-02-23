@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import parse_qs, urlparse
 import web_app
 from web_app import CompanyWebApp
 
@@ -857,3 +858,87 @@ def test_required_fields_respect_explicit_profile_type(tmp_path):
 
     assert company_required == web_app.COMPANY_REQUIRED_FIELDS
     assert person_required == web_app.PERSON_REQUIRED_FIELDS
+
+def test_autofill_review_person_mode_does_not_autocreate_from_company_only(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(
+        app,
+        "_search_external_sources",
+        lambda *_args, **_kwargs: ([{"source": "Wikipedia", "type": "company", "data": {"ru_org": "Греф"}}], []),
+    )
+    monkeypatch.setattr(
+        app,
+        "_build_profile_from_sources",
+        lambda *_args, **_kwargs: ({field: "" for field, _ in web_app.CARD_FIELDS}, {}),
+    )
+
+    _body, status, headers = app.autofill_review({"company_name": ["Греф"], "search_type": ["person"]})
+
+    assert status == "302 Found"
+    location = dict(headers)["Location"]
+    assert location.startswith("/create/manual?")
+    parsed = urlparse(location)
+    params = parse_qs(parsed.query)
+    assert "Ничего не найдено" in params.get("error", [""])[0]
+
+
+def test_search_external_sources_drops_invalid_provider_hits(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_call_provider(provider, *_args, **_kwargs):
+        if provider["name"] == "ФНС ЕГРЮЛ":
+            return {"type": "company", "ru_org": "ООО Ромашка", "inn": "7707083893"}
+        if provider["name"] == "zachestnyibiznes.ru":
+            return {"type": "company", "ru_org": "ÐÑÐ°Ñ"}
+        if provider["name"] == "checko.ru":
+            return {"type": "person", "surname_ru": "", "name_ru": ""}
+        return None
+
+    monkeypatch.setattr(app, "_call_provider", fake_call_provider)
+
+    hits, trace = app._search_external_sources("7707083893", no_cache=True, search_type="company")
+
+    assert len(hits) == 1
+    assert hits[0]["data"]["ru_org"] == "ООО Ромашка"
+    assert any("hits_by_provider:" in line for line in trace)
+
+
+def test_search_external_sources_stops_early_when_company_profile_is_ready(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    calls = []
+
+    def fake_call_provider(provider, *_args, **_kwargs):
+        calls.append(provider["name"])
+        if provider["name"] == "ФНС ЕГРЮЛ":
+            return {"type": "company", "ru_org": "ПАО Сбербанк", "inn": "7707083893"}
+        return {"type": "company", "ru_org": "Шум"}
+
+    monkeypatch.setattr(app, "_call_provider", fake_call_provider)
+
+    hits, _ = app._search_external_sources("7707083893", no_cache=True, search_type="company")
+
+    assert hits
+    assert calls == ["ФНС ЕГРЮЛ"]
+
+
+def test_fetch_page_retries_on_202_and_returns_none(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    calls = {"count": 0}
+
+    class Resp:
+        ok = True
+        status_code = 202
+        text = ""
+
+    def fake_get(*_args, **_kwargs):
+        calls["count"] += 1
+        return Resp()
+
+    monkeypatch.setattr(web_app.requests, "get", fake_get)
+    monkeypatch.setattr(web_app.time, "sleep", lambda *_args, **_kwargs: None)
+
+    html = app._fetch_page("https://duckduckgo.com/html/?q=test", timeout=15, max_retries=2)
+
+    assert html is None
+    assert calls["count"] == 2
