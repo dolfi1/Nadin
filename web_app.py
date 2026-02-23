@@ -95,6 +95,8 @@ SOURCE_DOMAINS = {
 
 SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "ФНС ЕГРЮЛ", "kind": "egrul", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": True, "priority": 1},
+    {"name": "Wikipedia", "kind": "wikipedia_html", "supports_inn": False, "supports_name": True, "supports_url": True, "is_person_source": False, "priority": 3},
+    {"name": "DuckDuckGo HTML", "kind": "duckduckgo_html", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 4},
     {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True, "priority": 5},
 ]
 
@@ -155,7 +157,8 @@ CARD_FIELDS: list[tuple[str, str]] = [
     ("en_position", "Position"),
 ]
 
-REQUIRED_FIELDS = ["surname_ru", "name_ru", "gender", "ru_org", "en_org", "ru_position", "en_position"]
+PERSON_REQUIRED_FIELDS = ["surname_ru", "name_ru"]
+COMPANY_REQUIRED_FIELDS = ["ru_org", "en_org"]
 PROBLEMATIC_PROVIDERS = {"rusprofile", "rusprofile_enhanced", "zachestnyibiznes"}
 NO_NEGATIVE_CACHE_KINDS = {"rusprofile", "rusprofile_enhanced", "zachestnyibiznes"}
 
@@ -211,6 +214,25 @@ class CompanyWebApp:
         if field == "en_position":
             return str(profile.get("en_position") or profile.get("position") or "")
         return str(profile.get(field, ""))
+
+    def _detect_profile_type(self, profile: dict[str, Any]) -> str:
+        explicit_type = self._normalize_spaces(str(profile.get("type", ""))).lower()
+        if explicit_type in {"person", "company"}:
+            return explicit_type
+        has_person_name = bool(self._normalize_spaces(str(profile.get("surname_ru", ""))) and self._normalize_spaces(str(profile.get("name_ru", ""))))
+        has_org_name = bool(self._normalize_spaces(str(profile.get("ru_org", ""))) or self._normalize_spaces(str(profile.get("en_org", ""))))
+        if has_person_name and not has_org_name:
+            return "person"
+        return "company"
+
+    def _required_fields_for_profile(self, profile: dict[str, Any]) -> list[str]:
+        if self._detect_profile_type(profile) == "person":
+            return PERSON_REQUIRED_FIELDS
+        return COMPANY_REQUIRED_FIELDS
+
+    def _missing_required_fields(self, profile: dict[str, Any]) -> list[str]:
+        required_fields = self._required_fields_for_profile(profile)
+        return [field for field in required_fields if not self._normalize_spaces(str(profile.get(field, "")))]
 
     def _init_db(self) -> None:
         with self._connect() as db:
@@ -608,13 +630,13 @@ class CompanyWebApp:
         if input_type == INPUT_TYPE_PERSON_TEXT:
             names = ["rusprofile.ru", "ФНС ЕГРЮЛ"]
         elif input_type == INPUT_TYPE_INN:
-            names = ["ФНС ЕГРЮЛ", "rusprofile.ru"]
+            names = ["ФНС ЕГРЮЛ", "Wikipedia", "DuckDuckGo HTML", "rusprofile.ru"]
         elif input_type == INPUT_TYPE_ORG_TEXT:
-            names = ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"]
+            names = ["ФНС ЕГРЮЛ", "Wikipedia", "DuckDuckGo HTML", "rusprofile.ru", "focus.kontur.ru"]
         elif self._is_foreign_query(raw):
             names = ["rusprofile.ru"]
         elif input_type == INPUT_TYPE_URL:
-            names = ["ФНС ЕГРЮЛ", "rusprofile.ru"]
+            names = ["ФНС ЕГРЮЛ", "Wikipedia", "DuckDuckGo HTML", "rusprofile.ru"]
         else:
             names = ["rusprofile.ru"]
         provider_map = {provider["name"]: provider for provider in self.SOURCE_PROVIDERS}
@@ -790,6 +812,16 @@ class CompanyWebApp:
             return parsed
         if kind in {"rusprofile", "rusprofile_enhanced"}:
             return self._collect_rusprofile_profiles(raw, input_type, is_person=person_query, search_type=search_type)
+        if kind in {"wikipedia_html", "duckduckgo_html"}:
+            url = provider.get("url_template", "")
+            if not url:
+                if kind == "wikipedia_html":
+                    url = f"https://ru.wikipedia.org/w/index.php?search={quote(raw)}"
+                else:
+                    url = f"https://duckduckgo.com/html/?q={quote(raw)}"
+            else:
+                url = url.format(inn=inn or "", query=quote(raw))
+            return self._parse_generic_osint(url, provider.get("name", kind))
         if kind == "kontur":
             return self._parse_kontur(raw)
         if kind in {"bank_russia", "rbc"}:
@@ -2742,7 +2774,7 @@ class CompanyWebApp:
 
         filled = [key for key, value in profile.items() if value and key not in {"title", "appeal"}]
         logger.info("Заполненные поля: %s", filled)
-        missing_required = [field for field in REQUIRED_FIELDS if not profile.get(field)]
+        missing_required = self._missing_required_fields(profile)
         if missing_required:
             logger.error("❌ НЕ ЗАПОЛНЕНЫ ОБЯЗАТЕЛЬНЫЕ ПОЛЯ: %s", missing_required)
             if not profile.get("ru_org") and raw_name:
@@ -2999,88 +3031,6 @@ class CompanyWebApp:
             similar=f"<h3>Похожие варианты</h3><ul>{items}</ul>" if similar and not candidates else "",
         )
 
-    def _handle_special_cases(self, raw_query: str, hits: list[dict[str, Any]], search_type: str = "") -> list[dict[str, Any]]:
-        normalized = self._normalize_spaces(raw_query).lower()
-
-        if search_type != "person" and ("сбербанк" in normalized or "сбер" in normalized):
-            hits = [self._get_sberbank_case()] + hits
-            logger.info("✅ Special case Сбербанка: все поля заполнены")
-
-        if search_type != "person" and "втб" in normalized and "банк" in normalized:
-            vtb_case = {
-                "source": "special_case",
-                "type": "company",
-                "url": "",
-                "data": {
-                    "ru_org": "ПАО ВТБ",
-                    "en_org": "VTB PJSC",
-                    "inn": "7702070139",
-                    "ogrn": "1027739609391",
-                    "ru_position": "Президент-Председатель правления",
-                    "en_position": "President and Chairman of the Management Board",
-                    "surname_ru": "Костин",
-                    "name_ru": "Андрей",
-                    "middle_name_ru": "Леонидович",
-                    "family_name": "Kostin",
-                    "first_name": "Andrey",
-                    "middle_name_en": "Leonidovich",
-                    "gender": "М",
-                    "appeal": "Г-н",
-                },
-            }
-            hits = [vtb_case] + hits
-            logger.info("✅ Special case ВТБ: все поля заполнены")
-
-        if search_type == "company":
-            return hits
-        if "греф" not in normalized:
-            return hits
-        special_gref = {
-            "source": "special_case",
-            "type": "person",
-            "url": "",
-            "data": {
-                "surname_ru": "Греф",
-                "name_ru": "Герман",
-                "middle_name_ru": "Оскарович",
-                "family_name": "Gref",
-                "first_name": "German",
-                "middle_name_en": "Oskarovich",
-                "ru_org": "ПАО Сбербанк",
-                "en_org": "Sberbank PJSC",
-                "ru_position": "Президент, Председатель правления",
-                "en_position": "President, Chairman of the Board",
-                "inn": "7707083893",
-                "appeal": "Г-н",
-                "gender": "М",
-            },
-        }
-        return [special_gref] + hits
-
-    def _get_sberbank_case(self) -> dict[str, Any]:
-        return {
-            "source": "special_case",
-            "type": "company",
-            "url": "",
-            "data": {
-                "ru_org": "ПАО Сбербанк",
-                "en_org": "Sberbank PJSC",
-                "inn": "7707083893",
-                "ogrn": "1027700132195",
-                "okpo": "00032537",
-                "ru_position": "Президент, Председатель правления",
-                "en_position": "President, Chairman of the Board",
-                "surname_ru": "Греф",
-                "name_ru": "Герман",
-                "middle_name_ru": "Оскарович",
-                "family_name": "Gref",
-                "first_name": "German",
-                "middle_name_en": "Oskarovich",
-                "gender": "М",
-                "appeal": "Г-н",
-            },
-        }
-
     def _search_by_inn(self, inn: str, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
         trace = [f"Поиск по ИНН: {inn}"]
         hits, source_trace = self._search_external_sources(inn, no_cache=False, search_type=search_type)
@@ -3099,7 +3049,6 @@ class CompanyWebApp:
         trace = [f"Поиск по персоне: {full_name}"]
         hits, source_trace = self._search_external_sources(full_name, no_cache=False, search_type=search_type)
         trace.extend(source_trace)
-        hits = self._handle_special_cases(full_name, hits, search_type=search_type)
         return hits, trace
 
     def _search_by_company(self, company_name: str, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
@@ -3162,7 +3111,6 @@ class CompanyWebApp:
                         break
                 if hits:
                     break
-        hits = self._handle_special_cases(company_name, hits, search_type=search_type)
         return hits, trace
 
     def _search_by_criteria(self, params: dict[str, str]) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[str]]:
@@ -3400,26 +3348,6 @@ class CompanyWebApp:
                     profile[key] = value
                     field_sources[key] = "Источник данных"
 
-            if "сбербанк" in normalized_raw or "сбер" in normalized_raw:
-                profile.update({
-                    "ru_org": "ПАО Сбербанк",
-                    "en_org": "Sberbank PJSC",
-                    "surname_ru": "Греф",
-                    "name_ru": "Герман",
-                    "middle_name_ru": "Оскарович",
-                    "family_name": "Gref",
-                    "first_name": "German",
-                    "middle_name_en": "Oskarovich",
-                    "ru_position": "Президент, Председатель правления",
-                    "en_position": "President, Chairman of the Board",
-                    "position": "President, Chairman of the Board",
-                    "gender": "М",
-                    "appeal": "Г-н",
-                    "inn": "7707083893",
-                })
-                for k in ["ru_org", "en_org", "surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en", "ru_position", "en_position", "position", "gender", "appeal", "inn"]:
-                    field_sources[k] = "special_case"
-
             logger.info("=== AUTOFILL REVIEW ===")
             logger.info("source_hits count: %d", len(source_hits))
             for i, hit in enumerate(source_hits):
@@ -3429,7 +3357,7 @@ class CompanyWebApp:
                 logger.info("  surname_ru: %s", hit.get("data", {}).get("surname_ru") if isinstance(hit.get("data"), dict) else "N/A")
 
             logger.info("Profile after build:")
-            for field in REQUIRED_FIELDS:
+            for field in self._required_fields_for_profile(profile):
                 logger.info("  %s: '%s' (from %s)", field, profile.get(field), field_sources.get(field))
 
             if not profile.get("ru_org") and not profile.get("surname_ru") and not profile.get("name_ru"):
@@ -3469,7 +3397,7 @@ class CompanyWebApp:
             for key, value in profile.items():
                 manual_payload[f"profile_{key}"] = value
 
-            missing_fields = [field for field in REQUIRED_FIELDS if not self._normalize_spaces(str(profile.get(field, "")))]
+            missing_fields = self._missing_required_fields(profile)
             if missing_fields:
                 logger.warning("Не заполнены обязательные поля: %s", missing_fields)
                 manual_payload["error"] = f"Заполните обязательные поля: {', '.join(missing_fields)}"
@@ -3534,7 +3462,7 @@ class CompanyWebApp:
                 manual_payload[f"profile_{key}"] = value
             return "", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")]
 
-        missing_fields = [field for field in REQUIRED_FIELDS if not self._normalize_spaces(str(profile_data.get(field, "")))]
+        missing_fields = self._missing_required_fields(profile_data)
         if missing_fields:
             params = {f"profile_{key}": value for key, value in profile_data.items()}
             params["q"] = ru_org or input_value
@@ -3674,7 +3602,7 @@ class CompanyWebApp:
             "ru_position": ru_position,
             "en_position": en_position,
         }
-        missing_required = [field for field in REQUIRED_FIELDS if not self._normalize_spaces(str(profile.get(field, "")))]
+        missing_required = self._missing_required_fields(profile)
         if missing_required:
             errors.append(f"Заполните обязательные поля: {', '.join(missing_required)}")
         notes = ru_notes + en_notes + autofill_notes + errors

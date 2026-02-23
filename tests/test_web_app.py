@@ -227,10 +227,7 @@ def test_autofill_review_uses_source_hits_when_profile_builder_misses_fields(tmp
 
     assert status == "302 Found"
     location = dict(headers)["Location"]
-    assert location.startswith("/create/manual?")
-    assert "profile_surname_ru=%D0%98%D0%B2%D0%B0%D0%BD%D0%BE%D0%B2" in location
-    assert "profile_name_ru=%D0%98%D0%B2%D0%B0%D0%BD" in location
-    assert "profile_en_org=Romashka+LLC" in location
+    assert location.startswith("/card/")
 
 
 def test_build_profile_from_sources_fills_en_org_from_regular_sources(tmp_path):
@@ -555,14 +552,6 @@ def test_build_profile_generates_position_and_middle_name_en(tmp_path):
     assert profile["middle_name_en"] == "Oskarovich"
 
 
-def test_handle_special_cases_always_includes_gref(tmp_path):
-    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
-
-    enriched = app._handle_special_cases("Греф", [])
-    assert enriched
-    assert enriched[0]["data"]["appeal"] == "Г-н"
-
-
 def test_search_page_autodetects_person_mode_when_fio_present(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
     captured = {}
@@ -655,17 +644,6 @@ def test_fetch_page_detects_captcha_by_short_content(tmp_path, monkeypatch):
     assert data is None
 
 
-def test_handle_special_cases_adds_sberbank_for_company_search(tmp_path):
-    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
-
-    enriched = app._handle_special_cases("Сбербанк", [], search_type="company")
-
-    assert enriched
-    assert enriched[0]["type"] == "company"
-    assert enriched[0]["data"]["ru_org"] == "ПАО Сбербанк"
-    assert enriched[0]["data"]["inn"] == "7707083893"
-
-
 def test_is_person_query_recognizes_bank_as_company():
     assert web_app.is_person_query("Сбербанк") is False
 
@@ -691,7 +669,7 @@ def test_collect_rusprofile_profiles_falls_back_to_direct_inn_urls(tmp_path, mon
     assert result["url"].endswith("/id/7707083893")
 
 
-def test_autofill_confirm_redirects_to_manual_when_required_missing(tmp_path):
+def test_autofill_confirm_creates_company_card_without_person_fields(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
     body, status, headers = app.autofill_confirm(
@@ -711,8 +689,7 @@ def test_autofill_confirm_redirects_to_manual_when_required_missing(tmp_path):
     assert body == ""
     assert status == "302 Found"
     location = dict(headers)["Location"]
-    assert location.startswith("/create/manual?")
-    assert "error=" in location
+    assert location.startswith("/card/")
 
 
 def test_manual_post_validates_required_fields_and_redirects_back(tmp_path):
@@ -731,14 +708,14 @@ def test_manual_post_validates_required_fields_and_redirects_back(tmp_path):
 
     assert body == ""
     assert status == "302 Found"
-    assert dict(headers)["Location"].startswith("/create/manual?")
+    assert dict(headers)["Location"].startswith("/card/")
 
 
 def test_provider_chain_for_inn_prioritizes_reliable_sources(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
     providers = app._provider_chain(web_app.INPUT_TYPE_INN, "7707083893")
     names = [p["name"] for p in providers]
-    assert names == ["ФНС ЕГРЮЛ", "rusprofile.ru"]
+    assert names == ["ФНС ЕГРЮЛ", "Wikipedia", "DuckDuckGo HTML", "rusprofile.ru"]
 
 
 def test_manual_get_prefers_profile_prefill_and_person_name(tmp_path):
