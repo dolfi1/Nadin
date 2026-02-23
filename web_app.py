@@ -99,6 +99,8 @@ SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "DuckDuckGo HTML", "kind": "duckduckgo_html", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 4},
     {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True, "priority": 5},
     {"name": "zachestnyibiznes.ru", "kind": "zachestnyibiznes_scrape", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 6},
+    {"name": "checko.ru", "kind": "checko", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 6},
+    {"name": "focus.kontur.ru", "kind": "kontur", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 6},
     {"name": "companies.rbc.ru", "kind": "rbc_companies_scrape", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 7},
     {"name": "tbank/tinkoff", "kind": "tbank_leadership_scrape", "supports_inn": False, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 8},
 ]
@@ -643,15 +645,15 @@ class CompanyWebApp:
 
     def _provider_chain(self, input_type: str, raw: str) -> list[dict[str, Any]]:
         if input_type == INPUT_TYPE_PERSON_TEXT:
-            names = ["rusprofile.ru", "ФНС ЕГРЮЛ"]
+            names = ["rusprofile.ru", "Wikipedia", "companies.rbc.ru", "tbank/tinkoff"]
         elif input_type == INPUT_TYPE_INN:
-            names = ["ФНС ЕГРЮЛ", "Wikipedia", "DuckDuckGo HTML", "rusprofile.ru"]
+            names = ["ФНС ЕГРЮЛ", "zachestnyibiznes.ru", "checko.ru", "rusprofile.ru", "focus.kontur.ru", "companies.rbc.ru"]
         elif input_type == INPUT_TYPE_ORG_TEXT:
-            names = ["ФНС ЕГРЮЛ", "Wikipedia", "DuckDuckGo HTML", "rusprofile.ru", "focus.kontur.ru"]
+            names = ["ФНС ЕГРЮЛ", "zachestnyibiznes.ru", "checko.ru", "rusprofile.ru", "focus.kontur.ru", "companies.rbc.ru", "DuckDuckGo HTML"]
         elif self._is_foreign_query(raw):
             names = ["rusprofile.ru"]
         elif input_type == INPUT_TYPE_URL:
-            names = ["ФНС ЕГРЮЛ", "Wikipedia", "DuckDuckGo HTML", "rusprofile.ru"]
+            names = ["ФНС ЕГРЮЛ", "Wikipedia", "DuckDuckGo HTML", "rusprofile.ru", "zachestnyibiznes.ru", "checko.ru", "companies.rbc.ru"]
         else:
             names = ["rusprofile.ru"]
         provider_map = {provider["name"]: provider for provider in self.SOURCE_PROVIDERS}
@@ -3406,6 +3408,8 @@ class CompanyWebApp:
 
             source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
             effective_hit_type = hit_type if hit_type in {"company", "person"} else ""
+            if not effective_hit_type and forced_search_type in {"company", "person"}:
+                effective_hit_type = forced_search_type
             if not effective_hit_type and source_hits:
                 first_hit_type = self._normalize_spaces(str(source_hits[0].get("type", ""))).lower()
                 if first_hit_type in {"company", "person"}:

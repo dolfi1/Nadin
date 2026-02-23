@@ -142,3 +142,13 @@ def test_from_profile_maps_ru_and_en_fallbacks():
     assert card.name_ru == "German"
     assert card.patronymic_ru == "Оскарович"
     assert card.en_position == "President"
+
+
+def test_company_card_without_gender_is_not_format_error(tmp_path):
+    bot = CardBot(log_path=tmp_path / "log.jsonl")
+
+    card = Card(ru_org="Ромашка ООО", en_org="Romashka LLC", ru_position="Генеральный директор", en_position="CEO")
+    bot.apply_edit(card, ru_org="Ромашка ООО", en_org="Romashka LLC", ru_position="Генеральный директор", en_position="CEO")
+
+    assert not any("Пол должен быть" in n for n in card.quality_notes)
+

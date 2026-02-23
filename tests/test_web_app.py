@@ -715,7 +715,7 @@ def test_provider_chain_for_inn_prioritizes_reliable_sources(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
     providers = app._provider_chain(web_app.INPUT_TYPE_INN, "7707083893")
     names = [p["name"] for p in providers]
-    assert names == ["ФНС ЕГРЮЛ", "Wikipedia", "DuckDuckGo HTML", "rusprofile.ru"]
+    assert names == ["ФНС ЕГРЮЛ", "zachestnyibiznes.ru", "checko.ru", "rusprofile.ru", "focus.kontur.ru", "companies.rbc.ru"]
 
 
 def test_manual_get_prefers_profile_prefill_and_person_name(tmp_path):
@@ -836,3 +836,24 @@ def test_card_edit_post_updates_profile_and_redirects_to_table_view(tmp_path):
     assert view_status == "200 OK"
     assert "<td>First name</td><td>John</td>" in body
     assert "<td>Position</td><td>Chief Executive Officer</td>" in body
+
+
+def test_provider_chain_includes_extended_company_sources(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    providers = app._provider_chain(web_app.INPUT_TYPE_ORG_TEXT, "Сбербанк")
+    names = [item["name"] for item in providers]
+
+    assert "zachestnyibiznes.ru" in names
+    assert "checko.ru" in names
+    assert "companies.rbc.ru" in names
+
+
+def test_required_fields_respect_explicit_profile_type(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    company_required = app._required_fields_for_profile({"type": "company", "ru_org": "ООО Ромашка"})
+    person_required = app._required_fields_for_profile({"type": "person", "surname_ru": "Иванов", "name_ru": "Иван"})
+
+    assert company_required == web_app.COMPANY_REQUIRED_FIELDS
+    assert person_required == web_app.PERSON_REQUIRED_FIELDS
