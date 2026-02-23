@@ -136,7 +136,8 @@ class CardBot:
         notes.extend(ru_pos_notes)
         notes.extend(en_pos_notes)
 
-        if card.gender not in {"М", "Ж"}:
+        is_person = bool(card.ru_fio.strip() or card.en_fio.strip() or card.surname_ru.strip() or card.name_ru.strip())
+        if is_person and card.gender not in {"М", "Ж"}:
             notes.append("Пол должен быть М или Ж")
 
         card.quality_notes = self._unique(notes)
@@ -167,7 +168,8 @@ class CardBot:
         notes.extend(card.quality_notes)
         notes.extend(self._validate_card(card))
         notes.extend(ru_org_notes + en_org_notes + ru_pos_notes + en_pos_notes)
-        if card.gender not in {"М", "Ж"}:
+        is_person = bool(card.ru_fio.strip() or card.en_fio.strip() or card.surname_ru.strip() or card.name_ru.strip())
+        if is_person and card.gender not in {"М", "Ж"}:
             notes.append("Пол должен быть М или Ж")
         card.quality_notes = self._unique(notes)
         card.status = self._calc_status(card.quality_notes)
@@ -438,11 +440,12 @@ class CardBot:
 
     def _validate_card(self, card: Card) -> List[str]:
         notes = []
-        if not card.surname_ru and not card.family_name:
+        is_person = bool(card.ru_fio.strip() or card.en_fio.strip() or card.surname_ru.strip() or card.name_ru.strip() or card.family_name.strip() or card.first_name.strip())
+        if is_person and not card.surname_ru and not card.family_name:
             notes.append("Фамилия RU обязательна")
-        if not card.name_ru and not card.first_name:
+        if is_person and not card.name_ru and not card.first_name:
             notes.append("Имя RU обязательно")
-        if not card.gender or card.gender not in {"М", "Ж"}:
+        if is_person and (not card.gender or card.gender not in {"М", "Ж"}):
             notes.append("Пол должен быть М или Ж")
         if not card.ru_org:
             notes.append("Организация RU обязательна")
