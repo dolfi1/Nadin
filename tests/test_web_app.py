@@ -990,3 +990,44 @@ def test_call_provider_ddg_without_hits_returns_empty_no_fallback(tmp_path, monk
     data = app._call_provider(provider, "query", web_app.INPUT_TYPE_ORG_TEXT)
 
     assert data == []
+
+
+def test_manual_get_prefills_inn_for_numeric_q(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    body, status, _headers = app.manual_get({"q": ["5501287000"]})
+
+    assert status == "200 OK"
+    assert "name='inn' value='5501287000'" in body
+    assert "name='ru_org' required value=''" in body
+
+
+def test_build_person_candidates_skips_company_like_hits_in_person_mode(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    hits = [
+        {
+            "source": "companies.rbc.ru",
+            "type": "unknown",
+            "data": {"ru_org": "ООО ГРЕФ", "inn": "7700000000"},
+        }
+    ]
+
+    candidates = app._build_person_candidates(hits, query="Греф", search_type="person")
+
+    assert candidates == []
+
+
+def test_negative_cache_policy_for_block_and_network(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    provider = {"kind": "rusprofile"}
+
+    app._thread_state.last_fetch_status = web_app.FETCH_STATUS_BLOCKED_403
+    should_cache, ttl = app._negative_cache_policy(provider)
+    assert should_cache is True
+    assert ttl == 5 * 60
+
+    app._thread_state.last_fetch_status = web_app.FETCH_STATUS_NETWORK_ERROR
+    should_cache, ttl = app._negative_cache_policy(provider)
+    assert should_cache is False
+    assert ttl == 0
