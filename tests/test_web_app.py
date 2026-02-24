@@ -228,7 +228,7 @@ def test_autofill_review_uses_source_hits_when_profile_builder_misses_fields(tmp
 
     assert status == "302 Found"
     location = dict(headers)["Location"]
-    assert location.startswith("/card/")
+    assert location.startswith("/create/manual")
 
 
 def test_build_profile_from_sources_fills_en_org_from_regular_sources(tmp_path):
@@ -942,3 +942,40 @@ def test_fetch_page_retries_on_202_and_returns_none(tmp_path, monkeypatch):
 
     assert html is None
     assert calls["count"] == 2
+
+
+def test_autofill_review_rejects_garbage_org_title(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(app, "_search_external_sources", lambda *_args, **_kwargs: ([], []))
+    monkeypatch.setattr(
+        app,
+        "_build_profile_from_sources",
+        lambda *_args, **_kwargs: ({"ru_org": "Результаты поиска", "en_org": "", "type": "company"}, {}),
+    )
+
+    _body, status, headers = app.autofill_review({"company_name": ["ВТБ"]})
+
+    assert status == "302 Found"
+    assert dict(headers)["Location"].startswith("/create/manual")
+
+
+def test_parse_zachestnyibiznes_direct_uses_search_page(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    pages = {
+        "search": "<a href='/company/ul/7702070139_vtb'>ПАО Банк ВТБ</a>",
+        "card": "<html><h1>ПАО Банк ВТБ</h1>ИНН 7702070139</html>",
+    }
+
+    def fake_fetch(url, **_kwargs):
+        if "search?query" in url:
+            return pages["search"]
+        return pages["card"]
+
+    monkeypatch.setattr(app, "_fetch_page", fake_fetch)
+
+    result = app._parse_zachestnyibiznes_direct("ВТБ")
+
+    assert result["inn"] == "7702070139"
+    assert "ВТБ" in result["ru_org"]

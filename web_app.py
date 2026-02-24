@@ -34,6 +34,7 @@ from socketserver import ThreadingMixIn
 from wsgiref.simple_server import WSGIServer, make_server
 
 from card_bot import Card
+from scrape_client import ScrapeClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,6 +110,7 @@ RUSPROFILE_NOISE_RE = re.compile(
     r"(Факторы риска|Дисквалификация|Нахождение под|Общие сведения|Связи|Регион регистрации|Показать)",
     flags=re.IGNORECASE,
 )
+GARBAGE_ORG_TITLES = {"результаты поиска", "поиск", "search results"}
 
 
 def is_person_query(raw: str) -> bool:
@@ -200,6 +202,7 @@ class CompanyWebApp:
         self._ddg_query_cache: dict[str, tuple[float, list[str]]] = {}
         self._thread_state = threading.local()
         self._strict_scraping_mode = True
+        self.scrape_client = ScrapeClient(per_domain_min_delay=self._domain_throttle_seconds)
         self._init_db()
         self._clear_provider_cache_pattern("list-org.com")
         self._clear_provider_cache_pattern("list_org")
@@ -393,6 +396,19 @@ class CompanyWebApp:
 
     def _clean_ru_org_name(self, value: str) -> str:
         return re.sub(r"^Организация\s+", "", self._normalize_spaces(value), flags=re.IGNORECASE).strip()
+
+    def _is_garbage_org_title(self, title: str, raw_query: str = "") -> bool:
+        normalized_title = self._normalize_spaces(title).lower()
+        normalized_query = self._normalize_spaces(raw_query).lower()
+        if not normalized_title:
+            return True
+        if normalized_title in GARBAGE_ORG_TITLES:
+            return True
+        if len(normalized_title) <= 3:
+            return True
+        if normalized_query and normalized_title == normalized_query:
+            return True
+        return False
 
     def _extract_inn(self, raw: str) -> str:
         value = self._normalize_spaces(raw)
@@ -851,9 +867,9 @@ class CompanyWebApp:
                 return []
             return self._parse_generic_osint(url, provider.get("name", kind))
         if kind == "zachestnyibiznes_scrape":
-            return self._parse_from_ddg_site(raw, ["zachestnyibiznes.ru"], provider.get("name", kind))
+            return self._parse_zachestnyibiznes_direct(raw)
         if kind == "rbc_companies_scrape":
-            return self._parse_from_ddg_site(raw, ["companies.rbc.ru"], provider.get("name", kind))
+            return self._parse_rbc_companies_direct(raw)
         if kind == "tbank_leadership_scrape":
             leadership_query = f"{raw} руководство"
             return self._parse_from_ddg_site(leadership_query, ["tbank.ru", "tinkoff.ru"], provider.get("name", kind))
@@ -1295,68 +1311,21 @@ class CompanyWebApp:
         if not self._normalize_spaces(url):
             logger.error("Provider generated empty URL, fetch skipped")
             return None
-        self._domain_throttle(url)
         timeout = max(15, timeout)
-        if not self._is_localhost(url):
-            time.sleep(random.uniform(0.2, 0.6))
-        attempts = max(1, max_retries)
-        blocked_domains = {"rusprofile.ru", "www.rusprofile.ru"}
-        host = urlparse(url).netloc.lower()
-        enforce_strict_mode = self._strict_scraping_mode and host in blocked_domains
-        if enforce_strict_mode:
-            logger.info("Strict scraping mode is enabled for %s: proxy/captcha bypass is disabled", host)
-        for attempt in range(attempts):
-            try:
-                if host in blocked_domains and attempt > 0:
-                    time.sleep(random.uniform(3.0, 7.0))
-                if host in blocked_domains and not enforce_strict_mode:
-                    headers = self._get_stealth_headers()
-                else:
-                    headers = self._get_random_headers(self._get_random_user_agent())
-                proxies = None if enforce_strict_mode else (self._get_random_proxy() if attempt > 0 else None)
-                response = requests.get(url, timeout=timeout, headers=headers, verify=True, allow_redirects=True, proxies=proxies)
-                status_code = getattr(response, "status_code", 200 if getattr(response, "ok", False) else 500)
-                response_text = response.text
-                response_text_lower = response_text.lower()
-                response_length = len(response_text)
-                logger.info("Fetched %s status=%d len=%d", url, status_code, response_length)
-                if self._is_captcha_or_block(response_text, url=url):
-                    self._thread_state.blocked_fetch = True
-                    block_ttl = 12 * 60 * 60
-                    self._save_rate_limited(host or "source", f"blocked:{url}", retry_seconds=block_ttl)
-                    self._provider_disabled_until[host or "source"] = time.time() + block_ttl
-                    logger.warning("%s returned captcha/block page (content check, len=%d)", url, response_length)
-                    return None
-                if status_code == 200:
-                    return response_text
-                if status_code == 202 and attempt < attempts - 1:
-                    wait_time = random.uniform(2.0, 4.0)
-                    logger.warning("Received 202 from %s, waiting %.1f seconds before retry", url, wait_time)
-                    time.sleep(wait_time)
-                    continue
-                if status_code in {403, 429, 503} and attempt < attempts - 1:
-                    wait_time = (2 ** (attempt + 1)) + random.uniform(0.2, 1.5)
-                    logger.warning("Received %d from %s, waiting %.1f seconds before retry", status_code, url, wait_time)
-                    time.sleep(wait_time)
-                    continue
-                if status_code >= 400:
-                    return None
-                logger.error("Failed to fetch %s, status code: %d", url, status_code)
-                return None
-            except requests.exceptions.RequestException as exc:
-                logger.warning("SSL error for %s (attempt %d/%d): %s", url, attempt + 1, attempts, exc)
-                if attempt < attempts - 1:
-                    time.sleep(2 ** (attempt + 1))
-                    continue
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Fetch failed for %s (attempt %d/%d): %s", url, attempt + 1, attempts, exc)
-                if attempt < attempts - 1:
-                    time.sleep(2 ** (attempt + 1))
-                    continue
-
-
-        logger.error("Failed to fetch %s after %d attempts", url, attempts)
-        return None
+        result = self.scrape_client.fetch(url, timeout=timeout, max_retries=max_retries)
+        logger.info("Fetched %s mode=%s status=%d len=%d", url, result.mode, result.status_code, len(result.text))
+        if result.blocked or self._is_captcha_or_block(result.text, url=url):
+            host = urlparse(url).netloc.lower()
+            self._thread_state.blocked_fetch = True
+            block_ttl = 12 * 60 * 60
+            self._save_rate_limited(host or "source", f"blocked:{url}", retry_seconds=block_ttl)
+            self._provider_disabled_until[host or "source"] = time.time() + block_ttl
+            logger.warning("%s returned captcha/block page", url)
+            return None
+        if result.status_code != 200:
+            logger.error("Failed to fetch %s, status code: %d", url, result.status_code)
+            return None
+        return result.text
 
     def _is_localhost(self, url: str) -> bool:
         host = urlparse(url).netloc.lower()
@@ -2144,6 +2113,50 @@ class CompanyWebApp:
                 profile["url"] = target_url
                 return profile
         return {}
+
+    def _parse_zachestnyibiznes_direct(self, raw_query: str) -> dict[str, Any]:
+        query = self._normalize_spaces(raw_query)
+        if not query:
+            return {}
+        search_url = f"https://zachestnyibiznes.ru/search?query={quote(query)}"
+        html = self._fetch_page(search_url, timeout=20, max_retries=2)
+        if not html:
+            return {}
+        soup = BeautifulSoup(html, "lxml")
+        links = [a.get("href") for a in soup.select("a[href*='/company/ul/']") if a.get("href")]
+        if not links and "/company/ul/" in html:
+            raw_match = re.search(r"(/company/ul/[\w\-_/]+)", html)
+            if raw_match:
+                links = [raw_match.group(1)]
+        if not links:
+            return {}
+        card_url = str(links[0])
+        if card_url.startswith("/"):
+            card_url = f"https://zachestnyibiznes.ru{card_url}"
+        profile = self._parse_generic_osint(card_url, "zachestnyibiznes.ru")
+        if self._is_garbage_org_title(str(profile.get("ru_org", "")), query):
+            return {}
+        return profile
+
+    def _parse_rbc_companies_direct(self, raw_query: str) -> dict[str, Any]:
+        query = self._normalize_spaces(raw_query)
+        if not query:
+            return {}
+        search_url = f"https://companies.rbc.ru/search/?query={quote(query)}"
+        html = self._fetch_page(search_url, timeout=20, max_retries=2)
+        if not html:
+            return {}
+        soup = BeautifulSoup(html, "lxml")
+        link = soup.select_one("a[href*='/id/'], a[href*='/company/']")
+        if not isinstance(link, Tag):
+            return {}
+        href = str(link.get("href") or "")
+        if href.startswith("/"):
+            href = f"https://companies.rbc.ru{href}"
+        profile = self._parse_generic_osint(href, "companies.rbc.ru")
+        if self._is_garbage_org_title(str(profile.get("ru_org", "")), query):
+            return {}
+        return profile
 
     def _ddg_site_search(self, raw_query: str, domains: list[str], max_urls: int = 3) -> list[str]:
         query_text = self._normalize_spaces(raw_query)
@@ -3533,15 +3546,29 @@ class CompanyWebApp:
                 manual_payload[f"profile_{key}"] = value
 
             if forced_search_type == "person" and not (self._normalize_spaces(profile.get("surname_ru", "")) and self._normalize_spaces(profile.get("name_ru", ""))):
-                logger.info("Person-mode autocreate skipped: missing surname/name")
+                logger.info("autocreate_skipped: reason=invalid_fields details=person_without_name")
                 manual_payload["error"] = "Ничего не найдено: укажите минимум имя и фамилию"
+                response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
+                self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+                return response
+
+            if self._is_garbage_org_title(profile.get("ru_org", ""), raw):
+                logger.info("autocreate_skipped: reason=garbage_title")
+                manual_payload["error"] = "Нужно уточнить: добавьте ИНН или корректное название организации"
+                response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
+                self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+                return response
+
+            if self._detect_profile_type(profile) == "company" and not self._normalize_spaces(profile.get("inn", "")):
+                logger.info("autocreate_skipped: reason=low_confidence details=company_without_inn")
+                manual_payload["error"] = "Нужно уточнить: добавьте ИНН или ОГРН"
                 response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
                 self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
 
             missing_fields = self._missing_required_fields(profile)
             if missing_fields:
-                logger.warning("Не заполнены обязательные поля: %s", missing_fields)
+                logger.info("autocreate_skipped: reason=invalid_fields missing=%s", ",".join(missing_fields))
                 manual_payload["error"] = f"Заполните обязательные поля: {', '.join(missing_fields)}"
                 response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
             else:
