@@ -228,7 +228,7 @@ def test_autofill_review_uses_source_hits_when_profile_builder_misses_fields(tmp
 
     assert status == "302 Found"
     location = dict(headers)["Location"]
-    assert location.startswith("/card/")
+    assert location.startswith("/create/manual")
 
 
 def test_build_profile_from_sources_fills_en_org_from_regular_sources(tmp_path):
@@ -700,6 +700,7 @@ def test_manual_post_validates_required_fields_and_redirects_back(tmp_path):
         {
             "ru_org": ["ПАО Сбербанк"],
             "en_org": ["Sberbank PJSC"],
+            "inn": ["7707083893"],
             "person_ru": ["Греф Герман"],
             "gender": [""],
             "ru_position": [""],
@@ -942,3 +943,50 @@ def test_fetch_page_retries_on_202_and_returns_none(tmp_path, monkeypatch):
 
     assert html is None
     assert calls["count"] == 2
+
+def test_parse_generic_osint_rejects_wikipedia_search_pages(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(
+        app,
+        "_fetch_page",
+        lambda *_args, **_kwargs: "<html><title>Результаты поиска — Википедия</title><h1>Результаты поиска</h1></html>",
+    )
+
+    data = app._parse_generic_osint("https://ru.wikipedia.org/w/index.php?search=%D0%93%D1%80%D0%B5%D1%84", "Wikipedia")
+
+    assert data == {}
+
+
+def test_missing_required_fields_company_requires_inn_or_ogrn(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    missing = app._missing_required_fields({"type": "company", "ru_org": "ООО Ромашка", "en_org": "Romashka LLC"})
+    assert "inn_or_ogrn" in missing
+
+    missing_with_inn = app._missing_required_fields({"type": "company", "ru_org": "ООО Ромашка", "inn": "7707083893"})
+    assert "inn_or_ogrn" not in missing_with_inn
+
+
+def test_autofill_review_person_mode_single_token_goes_manual(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    _body, status, headers = app.autofill_review({"company_name": ["Греф"], "search_type": ["person"]})
+
+    assert status == "302 Found"
+    location = dict(headers)["Location"]
+    parsed = parse_qs(urlparse(location).query)
+    assert location.startswith("/create/manual?")
+    assert "минимум имя и фамилию" in parsed.get("error", [""])[0]
+
+
+def test_call_provider_ddg_without_hits_returns_empty_no_fallback(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    provider = {"name": "DuckDuckGo HTML", "kind": "duckduckgo_html"}
+
+    monkeypatch.setattr(app, "_fetch_from_provider", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(app, "_try_fallback_providers", lambda *_args, **_kwargs: [{"source": "Wikipedia", "data": {"ru_org": "X"}}])
+
+    data = app._call_provider(provider, "query", web_app.INPUT_TYPE_ORG_TEXT)
+
+    assert data == []
