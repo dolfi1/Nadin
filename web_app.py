@@ -163,7 +163,7 @@ CARD_FIELDS: list[tuple[str, str]] = [
 ]
 
 PERSON_REQUIRED_FIELDS = ["surname_ru", "name_ru"]
-COMPANY_REQUIRED_FIELDS = ["ru_org", "en_org"]
+COMPANY_REQUIRED_FIELDS = ["ru_org", "inn_or_ogrn"]
 PERSON_IN_COMPANY_REQUIRED_FIELDS = ["surname_ru", "name_ru", "ru_org", "en_org"]
 PROBLEMATIC_PROVIDERS = {"rusprofile", "rusprofile_enhanced", "zachestnyibiznes"}
 NO_NEGATIVE_CACHE_KINDS = {"rusprofile", "rusprofile_enhanced", "zachestnyibiznes"}
@@ -199,7 +199,7 @@ class CompanyWebApp:
         self._endpoint_rate_limit: dict[str, list[float]] = defaultdict(list)
         self._ddg_query_cache: dict[str, tuple[float, list[str]]] = {}
         self._thread_state = threading.local()
-        self._strict_scraping_mode = True
+        self._strict_scraping_mode = False
         self._init_db()
         self._clear_provider_cache_pattern("list-org.com")
         self._clear_provider_cache_pattern("list_org")
@@ -243,7 +243,17 @@ class CompanyWebApp:
 
     def _missing_required_fields(self, profile: dict[str, Any]) -> list[str]:
         required_fields = self._required_fields_for_profile(profile)
-        return [field for field in required_fields if not self._normalize_spaces(str(profile.get(field, "")))]
+        missing: list[str] = []
+        for field in required_fields:
+            if field == "inn_or_ogrn":
+                inn = self._normalize_spaces(str(profile.get("inn", "")))
+                ogrn = self._normalize_spaces(str(profile.get("ogrn", "")))
+                if not (inn or ogrn):
+                    missing.append(field)
+                continue
+            if not self._normalize_spaces(str(profile.get(field, ""))):
+                missing.append(field)
+        return missing
 
     def _init_db(self) -> None:
         with self._connect() as db:
@@ -796,6 +806,12 @@ class CompanyWebApp:
             self._handle_provider_error(provider.get("name", "unknown"), exc)
 
         fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn, search_type=search_type)
+        if provider.get("kind") == "duckduckgo_html":
+            if not no_cache:
+                negative_ttl = self._negative_ttl_for_provider(provider)
+                if negative_ttl > 0:
+                    self._set_cache(cache_key, [], ttl=negative_ttl)
+            return []
         if not fallback_hits:
             if getattr(self._thread_state, "blocked_fetch", False):
                 blocked_ttl = 12 * 60 * 60
@@ -841,7 +857,10 @@ class CompanyWebApp:
             url = provider.get("url_template", "")
             if not url:
                 if kind == "wikipedia_html":
-                    url = f"https://ru.wikipedia.org/w/index.php?search={quote(raw)}"
+                    if " " in raw.strip():
+                        url = f"https://ru.wikipedia.org/wiki/{quote(raw.replace(' ', '_'))}"
+                    else:
+                        url = f"https://ru.wikipedia.org/w/index.php?search={quote(raw)}"
                 else:
                     url = f"https://duckduckgo.com/html/?q={quote(raw)}"
             else:
@@ -1431,7 +1450,10 @@ class CompanyWebApp:
         for attempt in range(attempts):
             try:
                 headers = self._get_random_headers(self._get_random_user_agent())
-                return requests.get(url, timeout=timeout, headers=headers, verify=True, allow_redirects=True)
+                response = requests.get(url, timeout=timeout, headers=headers, verify=True, allow_redirects=True)
+                if getattr(response, "apparent_encoding", None):
+                    response.encoding = response.apparent_encoding
+                return response
             except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as exc:
                 last_exc = exc
                 logger.warning("Request retry for %s (attempt %d/%d): %s", url, attempt + 1, attempts, exc)
@@ -2130,6 +2152,17 @@ class CompanyWebApp:
         html = self._fetch_page(url, timeout=20, max_retries=2)
         if not html:
             return {}
+        final_url = url
+        if "wikipedia" in final_url.lower():
+            html_lower = html.lower()
+            if any(marker in html_lower for marker in [
+                "результаты поиска",
+                "страница значений",
+                "в википедии есть статьи о других людях",
+            ]):
+                return {}
+            if "index.php?search=" in final_url.lower():
+                return {}
         soup = BeautifulSoup(html, "lxml")
         org_name = self._select_first_text(soup, ["h1", ".company-name", ".org-name", ".entity-title"])
         director = self._select_first_text(soup, [".director-name", ".company-director", ".manager-name"])
@@ -2822,14 +2855,16 @@ class CompanyWebApp:
                 field_sources.setdefault("middle_name_en", "Транслитерация из Отчество")
 
         if input_type == INPUT_TYPE_PERSON_TEXT and profile_type != "company" and not profile.get("surname_ru") and not profile.get("name_ru"):
-            sur, nam, patr = self._split_fio_ru(raw_name)
-            profile["surname_ru"] = sur
-            profile["name_ru"] = nam
-            profile["middle_name_ru"] = patr
-            if sur:
-                profile["family_name"] = self._translit(sur)
-            if nam:
-                profile["first_name"] = self._translit(nam)
+            raw_tokens = [tok for tok in self._normalize_spaces(raw_name).split() if tok]
+            if len(raw_tokens) >= 2:
+                sur, nam, patr = self._split_fio_ru(raw_name)
+                profile["surname_ru"] = sur
+                profile["name_ru"] = nam
+                profile["middle_name_ru"] = patr
+                if sur:
+                    profile["family_name"] = self._translit(sur)
+                if nam:
+                    profile["first_name"] = self._translit(nam)
 
         input_inn = self._extract_inn(raw_name) if input_type == INPUT_TYPE_INN else ""
         if input_inn and not profile.get("inn"):
@@ -3425,6 +3460,18 @@ class CompanyWebApp:
             input_type = INPUT_TYPE_ORG_TEXT if forced_search_type == "company" else INPUT_TYPE_PERSON_TEXT
         normalized_raw = self._normalize_spaces(raw).lower()
         cache_key = f"search:{input_type}:{hit_type}:{forced_search_type}:{normalized_raw}"
+
+        person_mode = forced_search_type == "person" or hit_type == "person" or input_type == INPUT_TYPE_PERSON_TEXT
+        raw_tokens = [tok for tok in self._normalize_spaces(raw).split() if tok]
+        if person_mode and len(raw_tokens) < 2:
+            logger.info("Person-mode autocreate skipped before build: insufficient name tokens")
+            manual_payload = {
+                "q": raw,
+                "error": "Ничего не найдено: укажите минимум имя и фамилию",
+            }
+            response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
+            self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+            return response
 
         cached_result = self._autofill_result_cache.get(cache_key)
         if cached_result and time.time() < float(cached_result.get("expires_at", 0)):
