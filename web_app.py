@@ -174,6 +174,11 @@ PERSON_IN_COMPANY_REQUIRED_FIELDS = ["surname_ru", "name_ru", "ru_org", "en_org"
 PROBLEMATIC_PROVIDERS = {"rusprofile", "rusprofile_enhanced", "zachestnyibiznes"}
 NO_NEGATIVE_CACHE_KINDS = {"rusprofile", "rusprofile_enhanced", "zachestnyibiznes"}
 
+FETCH_STATUS_EMPTY_OK = "EMPTY_OK"
+FETCH_STATUS_BLOCKED_403 = "BLOCKED_403"
+FETCH_STATUS_RATE_LIMIT_202 = "RATE_LIMIT_202"
+FETCH_STATUS_NETWORK_ERROR = "NETWORK_ERROR"
+
 FIELD_PRIORITIES: dict[str, list[str]] = {
     "surname_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
     "name_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
@@ -189,7 +194,8 @@ FIELD_PRIORITIES: dict[str, list[str]] = {
 class CompanyWebApp:
     def __init__(self, db_path: str = "cards.db") -> None:
         self.db_path = Path(db_path)
-        self.scrape_client = ScrapeClient()
+        self.scrape_client: ScrapeClient | None = None
+        self._ensure_scrape_client()
         self.SOURCE_PROVIDERS = [dict(provider) for provider in SOURCE_PROVIDERS]
         self._source_cache: dict[str, dict[str, Any]] = {}
         self._positive_cache_ttl = 30 * 24 * 60 * 60
@@ -207,9 +213,24 @@ class CompanyWebApp:
         self._ddg_query_cache: dict[str, tuple[float, list[str]]] = {}
         self._thread_state = threading.local()
         self._strict_scraping_mode = False
+        self._thread_state.last_fetch_status = FETCH_STATUS_EMPTY_OK
         self._init_db()
         self._clear_provider_cache_pattern("list-org.com")
         self._clear_provider_cache_pattern("list_org")
+
+    def _ensure_scrape_client(self) -> ScrapeClient | None:
+        client = getattr(self, "scrape_client", None)
+        if client is not None:
+            return client
+        try:
+            client = ScrapeClient()
+            self.scrape_client = client
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to initialize ScrapeClient, fallback to requests: %s", exc)
+            self.scrape_client = None
+            client = None
+        logger.info("ScrapeClient initialized: %s", bool(client))
+        return client
 
     def _clear_provider_cache_pattern(self, pattern: str) -> None:
         dropped = [k for k in self._source_cache if pattern.lower() in k.lower()]
@@ -677,7 +698,7 @@ class CompanyWebApp:
 
     def _provider_chain(self, input_type: str, raw: str) -> list[dict[str, Any]]:
         if input_type == INPUT_TYPE_PERSON_TEXT:
-            names = ["rusprofile.ru", "Wikipedia", "companies.rbc.ru", "tbank/tinkoff"]
+            names = ["rusprofile.ru", "Wikipedia", "tbank/tinkoff"]
         elif input_type == INPUT_TYPE_INN:
             names = ["ФНС ЕГРЮЛ", "zachestnyibiznes.ru", "checko.ru", "rusprofile.ru", "focus.kontur.ru", "companies.rbc.ru"]
         elif input_type == INPUT_TYPE_ORG_TEXT:
@@ -787,6 +808,16 @@ class CompanyWebApp:
             return self._negative_cache_ttl_reliable
         return 10 * 60
 
+    def _negative_cache_policy(self, provider: dict[str, Any]) -> tuple[bool, int]:
+        status = getattr(self._thread_state, "last_fetch_status", FETCH_STATUS_EMPTY_OK)
+        if status == FETCH_STATUS_EMPTY_OK:
+            return True, self._negative_ttl_for_provider(provider)
+        if status in {FETCH_STATUS_BLOCKED_403, FETCH_STATUS_RATE_LIMIT_202}:
+            return True, 5 * 60
+        if status == FETCH_STATUS_NETWORK_ERROR:
+            return False, 0
+        return True, self._negative_ttl_for_provider(provider)
+
     def _call_provider(
         self,
         provider: dict[str, Any],
@@ -796,6 +827,7 @@ class CompanyWebApp:
         search_type: str = "",
     ) -> list[dict[str, Any]] | dict[str, Any] | None:
         self._thread_state.blocked_fetch = False
+        self._thread_state.last_fetch_status = FETCH_STATUS_EMPTY_OK
         normalized = self._normalize_spaces(raw)
         inn = self._extract_inn(raw) if input_type == INPUT_TYPE_INN else None
         cache_key = f"provider:{provider.get('name', '')}:{input_type}:{normalized.lower()}:{search_type}"
@@ -829,8 +861,8 @@ class CompanyWebApp:
         fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn, search_type=search_type)
         if provider.get("kind") == "duckduckgo_html":
             if not no_cache:
-                negative_ttl = self._negative_ttl_for_provider(provider)
-                if negative_ttl > 0:
+                should_cache_negative, negative_ttl = self._negative_cache_policy(provider)
+                if should_cache_negative and negative_ttl > 0:
                     self._set_cache(cache_key, [], ttl=negative_ttl)
             return []
         if not fallback_hits:
@@ -842,10 +874,10 @@ class CompanyWebApp:
                 logger.warning("Provider %s returned captcha/block for '%s'; cached as blocked", provider.get("name", "unknown"), raw)
                 return None
             if not no_cache:
-                negative_ttl = self._negative_ttl_for_provider(provider)
-                if negative_ttl > 0:
+                should_cache_negative, negative_ttl = self._negative_cache_policy(provider)
+                if should_cache_negative and negative_ttl > 0:
                     self._set_cache(cache_key, [], ttl=negative_ttl)
-                logger.info("Кэш сохранен для %s", cache_key)
+                    logger.info("Кэш сохранен для %s", cache_key)
             return []
         if provider.get("kind") == "egrul":
             result = fallback_hits[0].get("data", {})
@@ -987,8 +1019,8 @@ class CompanyWebApp:
                     hits.extend(fallback_hits)
                     logger.info("Successfully retrieved %d results from %s", len(fallback_hits), fallback["name"])
                     break
-                negative_ttl = self._negative_ttl_for_provider(fallback)
-                if negative_ttl > 0:
+                should_cache_negative, negative_ttl = self._negative_cache_policy(fallback)
+                if should_cache_negative and negative_ttl > 0:
                     self._set_cache(fallback_cache_key, [], ttl=negative_ttl)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Fallback provider %s failed: %s", fallback["name"], str(exc))
@@ -1258,10 +1290,22 @@ class CompanyWebApp:
 
             if provider_hits:
                 return provider["name"], provider_hits, "provider_called_ok"
+            fetch_status = getattr(self._thread_state, "last_fetch_status", FETCH_STATUS_EMPTY_OK)
+            if fetch_status == FETCH_STATUS_BLOCKED_403:
+                return provider["name"], [], "provider_blocked_403"
+            if fetch_status == FETCH_STATUS_RATE_LIMIT_202:
+                return provider["name"], [], "provider_rate_limited_202"
+            if fetch_status == FETCH_STATUS_NETWORK_ERROR:
+                return provider["name"], [], "provider_network_error"
             return provider["name"], [], "provider_called_empty"
 
         try:
-            active_providers = [provider for provider in providers if self._should_call_provider(provider, input_type)]
+            active_providers = [
+                provider
+                for provider in providers
+                if self._should_call_provider(provider, input_type)
+                and not (search_type == "person" and not provider.get("is_person_source", False))
+            ]
             if active_providers:
                 for provider in active_providers:
                     provider_name, provider_hits, state = load_provider(provider)
@@ -1340,7 +1384,29 @@ class CompanyWebApp:
             logger.error("Provider generated empty URL, fetch skipped")
             return None
         timeout = max(15, timeout)
-        result = self.scrape_client.fetch(url, timeout=timeout, max_retries=max_retries)
+        self._thread_state.last_fetch_status = FETCH_STATUS_EMPTY_OK
+        scrape_client = self._ensure_scrape_client()
+        if scrape_client is None:
+            try:
+                response = requests.get(url, timeout=timeout, allow_redirects=True)
+                result_text = str(getattr(response, "text", ""))
+                status_code = int(getattr(response, "status_code", 500))
+                if status_code == 200 and not self._is_captcha_or_block(result_text, url=url):
+                    return result_text
+                if status_code == 403:
+                    self._thread_state.last_fetch_status = FETCH_STATUS_BLOCKED_403
+                elif status_code == 202:
+                    self._thread_state.last_fetch_status = FETCH_STATUS_RATE_LIMIT_202
+                else:
+                    self._thread_state.last_fetch_status = FETCH_STATUS_NETWORK_ERROR
+                logger.warning("Fallback fetch failed for %s: status=%d", url, status_code)
+                return None
+            except requests.RequestException as exc:
+                self._thread_state.last_fetch_status = FETCH_STATUS_NETWORK_ERROR
+                logger.warning("Fallback fetch request error for %s: %s", url, exc)
+                return None
+
+        result = scrape_client.fetch(url, timeout=timeout, max_retries=max(2, max_retries))
         logger.info(
             "Fetched %s mode=%s ok=%s status=%d error=%s len=%d",
             url,
@@ -1350,9 +1416,17 @@ class CompanyWebApp:
             result.error_code or "-",
             len(result.text),
         )
+        if result.status_code == 403:
+            self._thread_state.last_fetch_status = FETCH_STATUS_BLOCKED_403
+        elif result.status_code == 202:
+            self._thread_state.last_fetch_status = FETCH_STATUS_RATE_LIMIT_202
+        elif result.status_code >= 500 or result.error_code in {"network_error", "timeout", "request_error"}:
+            self._thread_state.last_fetch_status = FETCH_STATUS_NETWORK_ERROR
+
         if result.blocked or self._is_captcha_or_block(result.text, url=url):
             host = urlparse(url).netloc.lower()
             self._thread_state.blocked_fetch = True
+            self._thread_state.last_fetch_status = FETCH_STATUS_BLOCKED_403
             block_ttl = 12 * 60 * 60
             self._save_rate_limited(host or "source", f"blocked:{url}", retry_seconds=block_ttl)
             self._provider_disabled_until[host or "source"] = time.time() + block_ttl
@@ -2913,6 +2987,14 @@ class CompanyWebApp:
         if profile.get("inn"):
             field_sources["inn"] = "Ввод пользователя/ФНС" if input_inn else field_sources.get("inn", "ФНС")
 
+        has_fns_hit = any(str(hit.get("source", "")).strip() == "ФНС ЕГРЮЛ" for hit in source_hits)
+        has_fio = bool(profile.get("surname_ru") and profile.get("name_ru"))
+        if has_fns_hit and profile.get("ru_org") and not has_fio:
+            profile_type = "company"
+            for field in ["surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en", "gender", "appeal", "salutation"]:
+                profile[field] = ""
+                field_sources.pop(field, None)
+
         if not profile.get("gender"):
             inferred_gender = self._infer_gender(profile.get("middle_name_ru", ""), profile.get("ru_position", ""))
             if inferred_gender:
@@ -3042,6 +3124,11 @@ class CompanyWebApp:
                 or hit_type == "person"
             )
             source_is_company = hit_type == "company"
+            if not source_is_company:
+                has_person_names = bool(normalized_data.get("surname_ru") and normalized_data.get("name_ru"))
+                has_company_markers = bool(normalized_data.get("ru_org") or normalized_data.get("inn") or normalized_data.get("ogrn"))
+                if not has_person_names and has_company_markers:
+                    source_is_company = True
 
             if search_type == "person" and source_is_company:
                 continue
@@ -3731,7 +3818,9 @@ class CompanyWebApp:
         en_position = (query.get("en_position") or [""])[0]
         error = (query.get("error") or [""])[0]
         profile_prefill = {key.removeprefix("profile_"): (values[0] if values else "") for key, values in query.items() if key.startswith("profile_")}
-        ru_org, _ = self.normalize_ru_org(q) if q else ("", [])
+        q_digits = re.sub(r"\D", "", q)
+        q_looks_like_registry_id = bool(re.fullmatch(r"\d{10}|\d{12}|\d{13}|\d{15}", q_digits))
+        ru_org, _ = self.normalize_ru_org(q) if q and not q_looks_like_registry_id else ("", [])
 
         ru_org = profile_prefill.get("ru_org", ru_org)
         en_org = profile_prefill.get("en_org", en_org_param)
@@ -3755,6 +3844,8 @@ class CompanyWebApp:
             middle_name_en = person_en_parts[2] if len(person_en_parts) > 2 else ""
         appeal = profile_prefill.get("appeal", self._derive_salutation(gender))
         inn = profile_prefill.get("inn", (query.get("inn") or [""])[0])
+        if not profile_prefill and q_looks_like_registry_id and not inn:
+            inn = q_digits
         if profile_prefill:
             ru_position = profile_prefill.get("ru_position", ru_position)
             en_position = profile_prefill.get("en_position", profile_prefill.get("position", en_position))

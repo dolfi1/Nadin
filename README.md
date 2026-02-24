@@ -30,6 +30,16 @@ python web_app.py
 
 Приложение стартует на `http://localhost:8000`.
 
+## Запуск в Windows (единый Python/pip)
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+py -3.12 -m pip install -r requirements.txt
+py -3.12 web_app.py
+```
+
+Если не используете `venv`, всё равно запускайте и `pip`, и приложение через один и тот же интерпретатор `py -3.12`.
+
 ## Тесты
 ```bash
 pytest -q
