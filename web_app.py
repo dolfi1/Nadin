@@ -5,6 +5,7 @@ import hashlib
 import logging
 import io
 import json
+import os
 import random
 import re
 import sqlite3
@@ -23,6 +24,9 @@ from datetime import datetime, timezone
 from html import escape, unescape
 from pathlib import Path
 from typing import Any, Callable
+import shutil
+import subprocess
+import sys
 import requests
 from bs4 import BeautifulSoup
 from bs4 import Tag
@@ -100,7 +104,7 @@ SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "DuckDuckGo HTML", "kind": "duckduckgo_html", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 4},
     {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True, "priority": 5},
     {"name": "zachestnyibiznes.ru", "kind": "zachestnyibiznes_scrape", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 6},
-    {"name": "checko.ru", "kind": "checko", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 6},
+    {"name": "checko.ru", "kind": "checko", "url_template": "https://checko.ru/search/quick?query={query}", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": False, "priority": 6},
     {"name": "focus.kontur.ru", "kind": "kontur", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 6},
     {"name": "companies.rbc.ru", "kind": "rbc_companies_scrape", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 7},
     {"name": "tbank/tinkoff", "kind": "tbank_leadership_scrape", "supports_inn": False, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 8},
@@ -185,6 +189,7 @@ FIELD_PRIORITIES: dict[str, list[str]] = {
 class CompanyWebApp:
     def __init__(self, db_path: str = "cards.db") -> None:
         self.db_path = Path(db_path)
+        self.scrape_client = ScrapeClient()
         self.SOURCE_PROVIDERS = [dict(provider) for provider in SOURCE_PROVIDERS]
         self._source_cache: dict[str, dict[str, Any]] = {}
         self._positive_cache_ttl = 30 * 24 * 60 * 60
@@ -816,7 +821,8 @@ class CompanyWebApp:
                     return valid_hits
                 return valid_hits[0]
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Provider %s failed for %s: %s", provider.get("name"), raw, str(exc))
+            reason = "provider_unavailable" if self._is_blocking_error(exc) else "code_error"
+            logger.warning("Provider %s failed for %s [%s]: %s", provider.get("name"), raw, reason, str(exc))
             self._mark_provider_failure(provider.get("name", ""))
             self._handle_provider_error(provider.get("name", "unknown"), exc)
 
@@ -903,7 +909,11 @@ class CompanyWebApp:
                 return None
             return self._parse_generic_osint(url, provider.get("name", kind))
         if kind in {"google_search", "yandex_search", "linkedin_search", "facebook_search", "offshoreleaks", "checko", "zachestnyibiznes", "sherlock", "maigret", "holehe", "theharvester"}:
-            url = provider.get("url_template", "").format(inn=inn or "", query=quote(raw))
+            if kind == "checko":
+                template = provider.get("url_template", "") or "https://checko.ru/search/quick?query={query}"
+                url = template.format(inn=inn or "", query=quote(raw))
+            else:
+                url = provider.get("url_template", "").format(inn=inn or "", query=quote(raw))
             if not self._normalize_spaces(url):
                 logger.error("Provider %s generated empty URL", provider.get("name", kind))
                 return []
@@ -1331,7 +1341,15 @@ class CompanyWebApp:
             return None
         timeout = max(15, timeout)
         result = self.scrape_client.fetch(url, timeout=timeout, max_retries=max_retries)
-        logger.info("Fetched %s mode=%s status=%d len=%d", url, result.mode, result.status_code, len(result.text))
+        logger.info(
+            "Fetched %s mode=%s ok=%s status=%d error=%s len=%d",
+            url,
+            result.mode,
+            result.ok,
+            result.status_code,
+            result.error_code or "-",
+            len(result.text),
+        )
         if result.blocked or self._is_captcha_or_block(result.text, url=url):
             host = urlparse(url).netloc.lower()
             self._thread_state.blocked_fetch = True
@@ -1340,10 +1358,21 @@ class CompanyWebApp:
             self._provider_disabled_until[host or "source"] = time.time() + block_ttl
             logger.warning("%s returned captcha/block page", url)
             return None
+        if not result.ok:
+            logger.warning(
+                "Failed to fetch %s: status=%d error_code=%s error=%s",
+                url,
+                result.status_code,
+                result.error_code or "unknown",
+                result.error or "",
+            )
+            return None
         if result.status_code != 200:
             logger.error("Failed to fetch %s, status code: %d", url, result.status_code)
             return None
         return result.text
+
+
 
     def _is_localhost(self, url: str) -> bool:
         host = urlparse(url).netloc.lower()
@@ -4001,8 +4030,27 @@ class CompanyWebApp:
         return buffer.getvalue(), "200 OK", [("Content-Type", "text/csv; charset=utf-8")]
 
 
+def _startup_diagnostics(app: CompanyWebApp) -> None:
+    playwright_cli = shutil.which("playwright")
+    browsers_info = "playwright CLI not found"
+    if playwright_cli:
+        try:
+            proc = subprocess.run([playwright_cli, "install", "--list"], capture_output=True, text=True, timeout=10, check=False)
+            details = (proc.stdout or proc.stderr or "").strip().splitlines()
+            browsers_info = details[0] if details else f"playwright CLI found (exit={proc.returncode})"
+        except Exception as exc:  # noqa: BLE001
+            browsers_info = f"playwright CLI found, browser list failed: {exc}"
+
+    logger.info("=== Startup diagnostics ===")
+    logger.info("Python: %s", sys.version.split()[0])
+    logger.info("Interpreter: %s", sys.executable)
+    logger.info("Playwright browsers: %s", browsers_info)
+    logger.info("ScrapeClient initialized: %s", bool(getattr(app, "scrape_client", None)))
+
+
 def run_server(db_path: str = "cards.db", host: str = "0.0.0.0", port: int = 8000) -> None:
     app = CompanyWebApp(db_path=db_path)
+    _startup_diagnostics(app)
     with make_server(host, port, app, server_class=ThreadingWSGIServer) as httpd:
         browser_host = "localhost" if host == "0.0.0.0" else host
         print(f"Running on http://{browser_host}:{port} (bound to {host}:{port})")
