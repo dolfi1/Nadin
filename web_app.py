@@ -65,6 +65,34 @@ RU_TO_EN_OPF = {
     "ЧУ": "PI",
 }
 EN_TO_RU_OPF = {v: k for k, v in RU_TO_EN_OPF.items()}
+COMPANY_SEARCH_REQUIRED_FIELDS = [
+    "surname_ru",
+    "name_ru",
+    "middle_name_ru",
+    "family_name",
+    "first_name",
+    "ru_org",
+    "en_org",
+    "inn",
+    "ru_position",
+    "en_position",
+]
+LEADER_LABEL_RE = re.compile(
+    r"(руководитель(?:\s+организации)?|генеральный\s+директор|президент)",
+    flags=re.IGNORECASE,
+)
+FIO_STOP_TOKENS = {
+    "юридического",
+    "лица",
+    "организации",
+    "руководитель",
+    "директор",
+    "генеральный",
+    "президент",
+    "председатель",
+    "правления",
+    "лицо",
+}
 SPECIAL_EN_ORG_NAMES = {"газпром": "Gazprom PJSC", "лукойл": "Lukoil PJSC"}
 FULL_RU_OPF = {
     "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ": "ООО",
@@ -192,11 +220,11 @@ FETCH_STATUS_RATE_LIMIT_202 = "RATE_LIMIT_202"
 FETCH_STATUS_NETWORK_ERROR = "NETWORK_ERROR"
 
 FIELD_PRIORITIES: dict[str, list[str]] = {
-    "surname_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
-    "name_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
-    "middle_name_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
-    "gender": ["ФНС ЕГРЮЛ", "rusprofile.ru"],
-    "ru_position": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
+    "surname_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru"],
+    "name_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru"],
+    "middle_name_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru"],
+    "gender": ["rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru"],
+    "ru_position": ["rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru", "ФНС ЕГРЮЛ"],
     "position": ["ФНС ЕГРЮЛ"],
     "ru_org": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
     "en_org": ["ФНС ЕГРЮЛ"],
@@ -274,7 +302,10 @@ class CompanyWebApp:
 
     def _required_fields_for_profile(self, profile: dict[str, Any]) -> list[str]:
         profile_type = self._detect_profile_type(profile)
+        forced_search_type = self._normalize_spaces(str(profile.get("search_type", ""))).lower()
         has_org = bool(self._normalize_spaces(str(profile.get("ru_org", ""))) or self._normalize_spaces(str(profile.get("en_org", ""))))
+        if forced_search_type == "company":
+            return COMPANY_SEARCH_REQUIRED_FIELDS
         if profile_type == "person" and has_org:
             return PERSON_IN_COMPANY_REQUIRED_FIELDS
         if profile_type == "person":
@@ -485,6 +516,48 @@ class CompanyWebApp:
         if len(parts) == 1:
             return parts[0].capitalize(), "", ""
         return "", "", ""
+
+    def _valid_fio_part(self, value: str, *, min_len: int = 2) -> bool:
+        token = self._normalize_spaces(value).lower()
+        if not token or len(token) < min_len:
+            return False
+        if token in FIO_STOP_TOKENS:
+            return False
+        if not re.fullmatch(r"[А-Яа-яЁё\-]+", token):
+            return False
+        letters_count = len(re.findall(r"[А-Яа-яЁё]", token))
+        return letters_count >= min_len
+
+    def _is_valid_leader_fio(self, surname_ru: str, name_ru: str, middle_name_ru: str = "") -> bool:
+        if not (self._valid_fio_part(surname_ru, min_len=3) and self._valid_fio_part(name_ru, min_len=2)):
+            return False
+        if middle_name_ru and not self._valid_fio_part(middle_name_ru, min_len=3):
+            return False
+        joined = " ".join(x for x in [surname_ru, name_ru, middle_name_ru] if x).lower()
+        return not any(re.search(rf"\b{re.escape(stop)}\b", joined) for stop in FIO_STOP_TOKENS)
+
+    def _extract_leader_from_labeled_text(self, text: str) -> tuple[str, str]:
+        normalized = self._normalize_spaces(text)
+        if not normalized:
+            return "", ""
+        for sentence in re.split(r"[\n\r;]+", normalized):
+            candidate = self._normalize_spaces(sentence)
+            if not LEADER_LABEL_RE.search(candidate):
+                continue
+            fio_match = re.search(r"([А-ЯЁ][а-яё\-]+\s+[А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+)?)", candidate)
+            if not fio_match:
+                continue
+            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
+            if self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
+                before_fio = candidate.split(fio_match.group(1))[0]
+                position_match = re.search(
+                    r"(генеральный\s+директор|президент|председатель\s+правления|председатель|директор|руководитель)",
+                    before_fio,
+                    flags=re.IGNORECASE,
+                )
+                ru_position = self._normalize_position_ru(position_match.group(1)) if position_match else ""
+                return fio_match.group(1), ru_position
+        return "", ""
 
     def _extract_ru_org_from_keywords(self, keywords_text: str) -> str:
         text = self._normalize_spaces(unescape(keywords_text))
@@ -1187,9 +1260,16 @@ class CompanyWebApp:
             data = hit.get("data", {})
             if not isinstance(data, dict):
                 continue
-            for field in ("inn", "ru_org", "surname_ru", "name_ru", "ru_position"):
+            for field in ("inn", "ru_org", "surname_ru", "name_ru", "middle_name_ru", "ru_position", "family_name", "first_name"):
                 if not merged.get(field):
                     merged[field] = self._normalize_spaces(str(data.get(field, "")))
+
+        if merged.get("surname_ru") and merged.get("name_ru") and not self._is_valid_leader_fio(
+            merged.get("surname_ru", ""), merged.get("name_ru", ""), merged.get("middle_name_ru", "")
+        ):
+            merged["surname_ru"] = ""
+            merged["name_ru"] = ""
+
         if search_type == "person":
             return bool(merged.get("surname_ru") and merged.get("name_ru"))
         if search_type == "company" or input_type == INPUT_TYPE_INN:
@@ -1199,6 +1279,8 @@ class CompanyWebApp:
                 and merged.get("surname_ru")
                 and merged.get("name_ru")
                 and merged.get("ru_position")
+                and (merged.get("family_name") or merged.get("surname_ru"))
+                and (merged.get("first_name") or merged.get("name_ru"))
             )
         return False
 
@@ -1673,13 +1755,7 @@ class CompanyWebApp:
                 or (sv_yul.get("ФинПоказ") or {}).get("Выручка")
                 or 0
             )
-            gender_raw = str(data.get("gender") or director.get("gender") or "").strip().lower()
-            if gender_raw in {"1", "м", "m", "male", "мужской"} or "муж" in gender_raw:
-                gender = "М"
-            elif gender_raw in {"2", "ж", "f", "female", "женский"} or "жен" in gender_raw:
-                gender = "Ж"
-            else:
-                gender = self._infer_gender(middle_name_ru, position)
+            gender = self._infer_gender(middle_name_ru, position)
 
             return {
                 "url": url,
@@ -2376,6 +2452,14 @@ class CompanyWebApp:
             surname_ru, name_ru, middle_name_ru = self._split_fio_ru(director)
 
         text = self._normalize_spaces(page_text)
+        if not self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
+            surname_ru = name_ru = middle_name_ru = ""
+        if not surname_ru:
+            leader_fio, leader_position = self._extract_leader_from_labeled_text(text)
+            if leader_fio:
+                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(leader_fio)
+                if leader_position and not position:
+                    position = leader_position
         if not surname_ru:
             leader_match = re.search(
                 r"(?:Руководитель|Генеральный директор|Президент|Председатель правления)[:\s-]*([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)",
@@ -2383,6 +2467,8 @@ class CompanyWebApp:
             )
             if leader_match:
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(leader_match.group(1))
+                if not self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
+                    surname_ru = name_ru = middle_name_ru = ""
         if not position:
             pos_match = re.search(
                 r"(?:Руководитель|Должность)[:\s-]*([А-ЯЁа-яё\s,\-]{5,120})",
@@ -2778,6 +2864,18 @@ class CompanyWebApp:
             value = self._normalize_spaces(str(data.get(field, "")))
             if not value:
                 continue
+            if field in {"surname_ru", "name_ru", "middle_name_ru"}:
+                min_len = 3 if field != "name_ru" else 2
+                if not self._valid_fio_part(value, min_len=min_len):
+                    continue
+                if field in {"surname_ru", "name_ru"}:
+                    other = self._normalize_spaces(str(data.get("name_ru" if field == "surname_ru" else "surname_ru", "")))
+                    if other and not self._is_valid_leader_fio(
+                        value if field == "surname_ru" else other,
+                        value if field == "name_ru" else other,
+                        self._normalize_spaces(str(data.get("middle_name_ru", ""))),
+                    ):
+                        continue
             if skip_person_noise and not self._source_is_person_eligible(source_name, data):
                 continue
             return value, source_name
@@ -3034,6 +3132,13 @@ class CompanyWebApp:
                 if nam:
                     profile["first_name"] = self._translit(nam)
 
+        if profile.get("surname_ru") or profile.get("name_ru"):
+            if not self._is_valid_leader_fio(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")):
+                logger.warning("invalid_fio_rejected: surname=%s name=%s source=%s", profile.get("surname_ru", ""), profile.get("name_ru", ""), field_sources.get("surname_ru", ""))
+                for field in ("surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name"):
+                    profile[field] = ""
+                    field_sources.pop(field, None)
+
         input_inn = self._extract_inn(raw_name) if input_type == INPUT_TYPE_INN else ""
         if input_inn and not profile.get("inn"):
             profile["inn"] = input_inn
@@ -3059,9 +3164,7 @@ class CompanyWebApp:
             profile["en_position"] = profile.get("position", "")
 
         if profile_type == "company":
-            for field in ["surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en", "gender", "appeal", "salutation"]:
-                profile[field] = ""
-                field_sources.pop(field, None)
+            profile_type = "person"
 
         profile = self._normalize_card_data(profile, field_sources)
 
@@ -3694,10 +3797,24 @@ class CompanyWebApp:
             profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type, forced_type=effective_hit_type)
             if effective_hit_type in {"company", "person"}:
                 profile["type"] = "person" if forced_search_type == "company" else effective_hit_type
+            if forced_search_type in {"company", "person"}:
+                profile["search_type"] = forced_search_type
             for key, value in extracted_data.items():
-                if value and not profile.get(key):
-                    profile[key] = value
-                    field_sources[key] = "Источник данных"
+                if not value or profile.get(key):
+                    continue
+                if key in {"surname_ru", "name_ru", "middle_name_ru"}:
+                    min_len = 3 if key != "name_ru" else 2
+                    if not self._valid_fio_part(value, min_len=min_len):
+                        continue
+                profile[key] = value
+                field_sources[key] = "Источник данных"
+
+            if (profile.get("surname_ru") or profile.get("name_ru")) and not self._is_valid_leader_fio(
+                profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")
+            ):
+                for field in ("surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name"):
+                    profile[field] = ""
+                    field_sources.pop(field, None)
 
             logger.info("=== AUTOFILL REVIEW ===")
             logger.info("source_hits count: %d", len(source_hits))
@@ -3775,7 +3892,10 @@ class CompanyWebApp:
             logger.info("autofill.missing_fields=%s", ", ".join(missing_fields) if missing_fields else "none")
             if missing_fields:
                 logger.info("autocreate_skipped: reason=invalid_fields missing=%s", ",".join(missing_fields))
-                manual_payload["error"] = f"Заполните обязательные поля: {', '.join(missing_fields)}"
+                if forced_search_type == "company" and ({"surname_ru", "name_ru"} & set(missing_fields)):
+                    manual_payload["error"] = "Не найден руководитель"
+                else:
+                    manual_payload["error"] = f"Заполните обязательные поля: {', '.join(missing_fields)}"
                 response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
             else:
                 logger.info("Все обязательные поля заполнены! Создаем карточку автоматически.")
