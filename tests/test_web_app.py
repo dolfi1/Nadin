@@ -1114,7 +1114,7 @@ def test_build_profile_from_company_search_requires_valid_fio_and_no_autocreate_
     location = dict(headers)["Location"]
     assert location.startswith("/create/manual")
     parsed = parse_qs(urlparse(location).query)
-    assert parsed.get("error", [""])[0] == "Не найден руководитель"
+    assert parsed.get("error", [""])[0] == "Не найден руководитель компании, уточните/выберите из списка"
 
 
 def test_parse_egrul_does_not_trust_company_gender_field(tmp_path, monkeypatch):
@@ -1140,3 +1140,62 @@ def test_parse_egrul_does_not_trust_company_gender_field(tmp_path, monkeypatch):
     data = app._parse_egrul("7707083893")
     assert data is not None
     assert data["gender"] == "М"
+
+
+def test_extract_director_from_html_requires_label_separator_and_filters_noise(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    html = """
+    <html><body>
+      <div>Руководитель юридического лица история: Юридического Лица</div>
+      <div>Руководитель: Греф Герман Оскарович</div>
+    </body></html>
+    """
+
+    surname_ru, name_ru, middle_name_ru = app._extract_director_from_html(html)
+
+    assert surname_ru == "Греф"
+    assert name_ru == "Герман"
+    assert middle_name_ru == "Оскарович"
+
+
+def test_build_profile_keeps_higher_quality_valid_leader_fio(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    source_hits = [
+        {
+            "source": "focus.kontur.ru",
+            "data": {
+                "surname_ru": "Юридического",
+                "name_ru": "Лица",
+                "ru_org": "ПАО СБЕРБАНК",
+                "inn": "7707083893",
+            },
+        },
+        {
+            "source": "zachestnyibiznes.ru",
+            "data": {
+                "surname_ru": "Греф",
+                "name_ru": "Герман",
+                "middle_name_ru": "Оскарович",
+                "ru_org": "ПАО СБЕРБАНК",
+                "inn": "7707083893",
+                "ru_position": "Президент",
+            },
+        },
+        {
+            "source": "companies.rbc.ru",
+            "data": {
+                "surname_ru": "Юридического",
+                "name_ru": "Лица",
+            },
+        },
+    ]
+
+    profile, _sources = app._build_profile_from_sources(
+        source_hits, "Сбербанк", web_app.INPUT_TYPE_ORG_TEXT, forced_type="person"
+    )
+
+    assert profile["surname_ru"] == "Греф"
+    assert profile["name_ru"] == "Герман"
+    assert profile["middle_name_ru"] == "Оскарович"

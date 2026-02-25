@@ -68,9 +68,10 @@ EN_TO_RU_OPF = {v: k for k, v in RU_TO_EN_OPF.items()}
 COMPANY_SEARCH_REQUIRED_FIELDS = [
     "surname_ru",
     "name_ru",
-    "middle_name_ru",
     "family_name",
     "first_name",
+    "gender",
+    "appeal",
     "ru_org",
     "en_org",
     "inn",
@@ -92,6 +93,16 @@ FIO_STOP_TOKENS = {
     "председатель",
     "правления",
     "лицо",
+    "история",
+    "физлиц",
+    "проверка",
+}
+LEADER_FIO_SOURCE_PRIORITY = {
+    "zachestnyibiznes.ru": 1,
+    "companies.rbc.ru": 2,
+    "ФНС ЕГРЮЛ": 3,
+    "rusprofile.ru": 4,
+    "focus.kontur.ru": 5,
 }
 SPECIAL_EN_ORG_NAMES = {"газпром": "Gazprom PJSC", "лукойл": "Lukoil PJSC"}
 FULL_RU_OPF = {
@@ -220,9 +231,9 @@ FETCH_STATUS_RATE_LIMIT_202 = "RATE_LIMIT_202"
 FETCH_STATUS_NETWORK_ERROR = "NETWORK_ERROR"
 
 FIELD_PRIORITIES: dict[str, list[str]] = {
-    "surname_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru"],
-    "name_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru"],
-    "middle_name_ru": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru"],
+    "surname_ru": ["zachestnyibiznes.ru", "companies.rbc.ru", "ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
+    "name_ru": ["zachestnyibiznes.ru", "companies.rbc.ru", "ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
+    "middle_name_ru": ["zachestnyibiznes.ru", "companies.rbc.ru", "ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
     "gender": ["rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru"],
     "ru_position": ["rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru", "ФНС ЕГРЮЛ"],
     "position": ["ФНС ЕГРЮЛ"],
@@ -535,6 +546,24 @@ class CompanyWebApp:
             return False
         joined = " ".join(x for x in [surname_ru, name_ru, middle_name_ru] if x).lower()
         return not any(re.search(rf"\b{re.escape(stop)}\b", joined) for stop in FIO_STOP_TOKENS)
+
+    def _leader_source_rank(self, source_name: str) -> int:
+        return LEADER_FIO_SOURCE_PRIORITY.get(source_name, 100)
+
+    def _pick_best_leader_fio(self, source_hits: list[dict[str, Any]]) -> tuple[str, str, str, str]:
+        ranked_hits = sorted(source_hits, key=lambda item: self._leader_source_rank(str(item.get("source", ""))))
+        for hit in ranked_hits:
+            source_name = str(hit.get("source", ""))
+            raw_data = hit.get("data", {})
+            if not isinstance(raw_data, dict):
+                continue
+            data = self._enrich_alternative_person_fields(dict(raw_data))
+            surname_ru = self._normalize_spaces(str(data.get("surname_ru", "")))
+            name_ru = self._normalize_spaces(str(data.get("name_ru", "")))
+            middle_name_ru = self._normalize_spaces(str(data.get("middle_name_ru", "")))
+            if self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
+                return surname_ru, name_ru, middle_name_ru, source_name
+        return "", "", "", ""
 
     def _extract_leader_from_labeled_text(self, text: str) -> tuple[str, str]:
         normalized = self._normalize_spaces(text)
@@ -2462,8 +2491,9 @@ class CompanyWebApp:
                     position = leader_position
         if not surname_ru:
             leader_match = re.search(
-                r"(?:Руководитель|Генеральный директор|Президент|Председатель правления)[:\s-]*([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)",
+                r"(?:Руководитель|Генеральный директор|Президент|Председатель правления)\s*[:—\-]\s*(?!юридического\s+лица|история)([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)",
                 text,
+                flags=re.IGNORECASE,
             )
             if leader_match:
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(leader_match.group(1))
@@ -2603,19 +2633,32 @@ class CompanyWebApp:
             return None, "error", reason
 
     def _extract_director_from_html(self, html: str) -> tuple[str, str, str]:
-        text = re.sub(r"<[^>]+>", " ", html)
-        text = re.sub(r"\s+", " ", text)
-        patterns = [
-            r"Генеральн(?:ый|ого) директор[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
-            r"Руководитель[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if not match:
+        soup = BeautifulSoup(html, "lxml")
+        labeled_chunks: list[str] = []
+        for node in soup.find_all(["tr", "li", "p", "div", "section", "dt", "dd"]):
+            text = self._normalize_spaces(node.get_text(" ", strip=True))
+            if not text or not LEADER_LABEL_RE.search(text):
                 continue
-            tokens = match.group(1).split()
-            if len(tokens) >= 3:
-                return tokens[0], tokens[1], " ".join(tokens[2:])
+            lowered = text.lower()
+            if any(marker in lowered for marker in ("история", "проверка физлиц", "юридического лица")):
+                continue
+            labeled_chunks.append(text)
+
+        if not labeled_chunks:
+            full_text = self._normalize_spaces(soup.get_text(" ", strip=True))
+            labeled_chunks = [line for line in re.split(r"[\n\r;]", full_text) if LEADER_LABEL_RE.search(line)]
+
+        patterns = [
+            r"(?:генеральный\s+директор|президент|председатель\s+правления|руководитель(?:\s+организации)?)\s*[:—\-]\s*(?!юридического\s+лица|история)([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)",
+        ]
+        for chunk in labeled_chunks:
+            for pattern in patterns:
+                match = re.search(pattern, chunk, flags=re.IGNORECASE)
+                if not match:
+                    continue
+                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(match.group(1))
+                if self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
+                    return surname_ru, name_ru, middle_name_ru
         return "", "", ""
 
     def _extract_org_from_html(self, html: str) -> str:
@@ -3809,6 +3852,24 @@ class CompanyWebApp:
                 profile[key] = value
                 field_sources[key] = "Источник данных"
 
+            candidate_sur, candidate_nam, candidate_pat, candidate_source = self._pick_best_leader_fio(source_hits)
+            current_sur = self._normalize_spaces(profile.get("surname_ru", ""))
+            current_nam = self._normalize_spaces(profile.get("name_ru", ""))
+            current_pat = self._normalize_spaces(profile.get("middle_name_ru", ""))
+            current_source = field_sources.get("surname_ru", "")
+            has_valid_current = self._is_valid_leader_fio(current_sur, current_nam, current_pat)
+            if candidate_sur and candidate_nam:
+                if (
+                    not has_valid_current
+                    or self._leader_source_rank(candidate_source) < self._leader_source_rank(current_source)
+                ):
+                    profile["surname_ru"] = candidate_sur
+                    profile["name_ru"] = candidate_nam
+                    profile["middle_name_ru"] = candidate_pat
+                    field_sources["surname_ru"] = candidate_source
+                    field_sources["name_ru"] = candidate_source
+                    if candidate_pat:
+                        field_sources["middle_name_ru"] = candidate_source
             if (profile.get("surname_ru") or profile.get("name_ru")) and not self._is_valid_leader_fio(
                 profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")
             ):
@@ -3893,7 +3954,7 @@ class CompanyWebApp:
             if missing_fields:
                 logger.info("autocreate_skipped: reason=invalid_fields missing=%s", ",".join(missing_fields))
                 if forced_search_type == "company" and ({"surname_ru", "name_ru"} & set(missing_fields)):
-                    manual_payload["error"] = "Не найден руководитель"
+                    manual_payload["error"] = "Не найден руководитель компании, уточните/выберите из списка"
                 else:
                     manual_payload["error"] = f"Заполните обязательные поля: {', '.join(missing_fields)}"
                 response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
