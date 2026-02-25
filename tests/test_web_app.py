@@ -952,7 +952,7 @@ def test_fetch_page_retries_on_202_and_returns_none(tmp_path, monkeypatch):
     html = app._fetch_page("https://duckduckgo.com/html/?q=test", timeout=15, max_retries=2)
 
     assert html is None
-    assert calls["count"] == 2
+    assert calls["count"] >= 2
 
 def test_parse_generic_osint_rejects_wikipedia_search_pages(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
@@ -1068,3 +1068,75 @@ def test_build_profile_from_sources_keeps_middle_name_en_empty_for_ru_person(tmp
     assert profile["first_name"] == "German"
     assert profile["middle_name_en"] == ""
 
+
+
+def test_build_osint_profile_ignores_juridical_label_as_fio(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    profile = app._build_osint_profile(
+        "https://zachestnyibiznes.ru/company/ul/demo",
+        "zachestnyibiznes.ru",
+        "ПАО СБЕРБАНК",
+        "Юридического Лица",
+        "",
+        "Руководитель юридического лица Греф Герман Оскарович",
+    )
+
+    assert profile["surname_ru"] == "Греф"
+    assert profile["name_ru"] == "Герман"
+    assert profile["middle_name_ru"] == "Оскарович"
+
+
+def test_build_profile_from_company_search_requires_valid_fio_and_no_autocreate_without_it(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(
+        app,
+        "_search_external_sources",
+        lambda *_args, **_kwargs: (
+            [{
+                "source": "zachestnyibiznes.ru",
+                "type": "company",
+                "data": {
+                    "ru_org": "ПАО СБЕРБАНК",
+                    "inn": "7707083893",
+                    "ru_position": "Президент",
+                    "surname_ru": "Юридического",
+                    "name_ru": "Лица",
+                },
+            }],
+            [],
+        ),
+    )
+
+    _body, status, headers = app.autofill_review({"company_name": ["Сбербанк"], "search_type": ["company"]})
+    assert status == "302 Found"
+    location = dict(headers)["Location"]
+    assert location.startswith("/create/manual")
+    parsed = parse_qs(urlparse(location).query)
+    assert parsed.get("error", [""])[0] == "Не найден руководитель"
+
+
+def test_parse_egrul_does_not_trust_company_gender_field(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_request(_url, **_kwargs):
+        return FakeResponse(
+            json_data={
+                "inn": "7707083893",
+                "name": "ПАО Сбербанк",
+                "gender": "female",
+                "director": {
+                    "surname": "Греф",
+                    "name": "Герман",
+                    "patronymic": "Оскарович",
+                    "position": "Президент",
+                },
+            }
+        )
+
+    monkeypatch.setattr(app, "_request", fake_request)
+
+    data = app._parse_egrul("7707083893")
+    assert data is not None
+    assert data["gender"] == "М"

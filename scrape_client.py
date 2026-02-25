@@ -74,7 +74,7 @@ class ScrapeClient:
         for attempt in range(max(1, max_retries)):
             status_code, text, error_code, error = self._perform_request(url, timeout=timeout, mode=mode)
             decoded = self._normalize_encoding(text)
-            blocked = status_code in {403, 429} or self._is_block_page(decoded)
+            blocked = status_code in {202, 403, 429} or self._is_block_page(decoded)
             last_result = FetchResult(
                 url=url,
                 status_code=status_code,
@@ -104,10 +104,14 @@ class ScrapeClient:
                 with DynamicSession(headless=True) as session:  # pragma: no cover
                     response = session.get(url, timeout=timeout)
                     return int(getattr(response, "status_code", 200)), str(getattr(response, "text", "")), "", ""
+            if mode == "dynamic" and not DynamicSession:
+                logger.warning("dynamic mode requested but playwright/scrapling dynamic session is unavailable; falling back to requests")
             if mode == "stealth" and StealthySession:
                 with StealthySession(headless=True, solve_cloudflare=True) as session:  # pragma: no cover
                     response = session.get(url, timeout=timeout)
                     return int(getattr(response, "status_code", 200)), str(getattr(response, "text", "")), "", ""
+            if mode == "stealth" and not StealthySession:
+                logger.warning("stealth mode requested but stealth session is unavailable; falling back to requests")
             if mode == "fast" and FetcherSession:
                 with FetcherSession(impersonate="chrome") as session:  # pragma: no cover
                     response = session.get(url, timeout=timeout)
