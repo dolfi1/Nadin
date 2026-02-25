@@ -169,8 +169,20 @@ CARD_FIELDS: list[tuple[str, str]] = [
 ]
 
 PERSON_REQUIRED_FIELDS = ["surname_ru", "name_ru"]
-COMPANY_REQUIRED_FIELDS = ["ru_org", "inn_or_ogrn"]
-PERSON_IN_COMPANY_REQUIRED_FIELDS = ["surname_ru", "name_ru", "ru_org", "en_org"]
+COMPANY_REQUIRED_FIELDS = ["ru_org", "inn"]
+PERSON_IN_COMPANY_REQUIRED_FIELDS = [
+    "surname_ru",
+    "name_ru",
+    "family_name",
+    "first_name",
+    "ru_org",
+    "en_org",
+    "inn",
+    "ru_position",
+    "en_position",
+    "gender",
+    "appeal",
+]
 PROBLEMATIC_PROVIDERS = {"rusprofile", "rusprofile_enhanced", "zachestnyibiznes"}
 NO_NEGATIVE_CACHE_KINDS = {"rusprofile", "rusprofile_enhanced", "zachestnyibiznes"}
 
@@ -274,11 +286,7 @@ class CompanyWebApp:
         missing: list[str] = []
         for field in required_fields:
             if field == "inn_or_ogrn":
-                inn = self._normalize_spaces(str(profile.get("inn", "")))
-                ogrn = self._normalize_spaces(str(profile.get("ogrn", "")))
-                if not (inn or ogrn):
-                    missing.append(field)
-                continue
+                field = "inn"
             if not self._normalize_spaces(str(profile.get(field, ""))):
                 missing.append(field)
         return missing
@@ -508,20 +516,32 @@ class CompanyWebApp:
 
     def _normalize_positions_ru(self, raw: str) -> tuple[str, list[str]]:
         notes: list[str] = []
-        items = [self._normalize_spaces(x) for x in raw.split(",") if self._normalize_spaces(x)]
+        items = [self._normalize_spaces(x.replace(" и ", ", ")) for x in raw.split(",") if self._normalize_spaces(x)]
         normalized: list[str] = []
         for item in items:
             cleaned = item.replace("ИО", "Исполняющий обязанности")
             if cleaned != item:
                 notes.append("Должность RU: сокращения раскрыты")
-            normalized.append(cleaned[:1].upper() + cleaned[1:] if cleaned else "")
+            normalized.append(cleaned[:1].upper() + cleaned[1:].lower() if cleaned else "")
         return ", ".join(normalized), notes
 
     def _normalize_positions_en(self, raw: str) -> tuple[str, list[str]]:
         notes: list[str] = []
         raw = raw.replace(" and ", ", ").replace(" & ", ", ")
         items = [self._normalize_spaces(x) for x in raw.split(",") if self._normalize_spaces(x)]
-        normalized = [" ".join(w.capitalize() for w in item.split()) for item in items]
+        normalized: list[str] = []
+        abbreviations = {"CEO", "CFO", "COO", "CTO", "CIO", "CMO", "CPO", "CSO", "CISO", "CHRO", "CCO", "CLO", "CDO", "EVP", "SVP", "VP", "GM"}
+        small_words = {"and", "of", "the", "a", "an", "to", "for", "in", "on", "at", "by", "or"}
+        for item in items:
+            words: list[str] = []
+            for idx, word in enumerate(item.split()):
+                if word.upper() in abbreviations:
+                    words.append(word.upper())
+                elif idx > 0 and word.lower() in small_words:
+                    words.append(word.lower())
+                else:
+                    words.append(word[:1].upper() + word[1:].lower())
+            normalized.append(" ".join(words))
         if " and " in raw.lower() or " & " in raw:
             notes.append("Position EN: разделители приведены к запятым")
         return ", ".join(normalized), notes
@@ -1167,13 +1187,19 @@ class CompanyWebApp:
             data = hit.get("data", {})
             if not isinstance(data, dict):
                 continue
-            for field in ("inn", "ru_org", "surname_ru", "name_ru"):
+            for field in ("inn", "ru_org", "surname_ru", "name_ru", "ru_position"):
                 if not merged.get(field):
                     merged[field] = self._normalize_spaces(str(data.get(field, "")))
         if search_type == "person":
             return bool(merged.get("surname_ru") and merged.get("name_ru"))
         if search_type == "company" or input_type == INPUT_TYPE_INN:
-            return bool(merged.get("inn") and merged.get("ru_org"))
+            return bool(
+                merged.get("inn")
+                and merged.get("ru_org")
+                and merged.get("surname_ru")
+                and merged.get("name_ru")
+                and merged.get("ru_position")
+            )
         return False
 
     def _extract_revenue_from_soup(self, soup: BeautifulSoup) -> int:
@@ -1665,7 +1691,7 @@ class CompanyWebApp:
                 "name_ru": name_ru or "",
                 "middle_name_ru": middle_name_ru or "",
                 "gender": gender,
-                "ru_position": (position or "Генеральный директор"),
+                "ru_position": (position or ""),
                 "en_position": "",
                 "revenue": self._extract_revenue(str(rev_raw)),
             }
@@ -2236,8 +2262,27 @@ class CompanyWebApp:
                 return {}
         soup = BeautifulSoup(html, "lxml")
         org_name = self._select_first_text(soup, ["h1", ".company-name", ".org-name", ".entity-title"])
-        director = self._select_first_text(soup, [".director-name", ".company-director", ".manager-name"])
-        position = self._select_first_text(soup, [".director-position", ".manager-position", ".position"])
+        director = self._select_first_text(
+            soup,
+            [
+                ".director-name",
+                ".company-director",
+                ".manager-name",
+                ".company-info__director",
+                ".company-card__manager-name",
+                "[itemprop='employee']",
+            ],
+        )
+        position = self._select_first_text(
+            soup,
+            [
+                ".director-position",
+                ".manager-position",
+                ".position",
+                ".company-card__manager-position",
+                "[itemprop='jobTitle']",
+            ],
+        )
         return self._build_osint_profile(url, source, org_name, director, position, soup.get_text(" ", strip=True))
 
     def _parse_from_ddg_site(self, raw_query: str, domains: list[str], source: str) -> dict[str, Any]:
@@ -2328,12 +2373,26 @@ class CompanyWebApp:
     def _build_osint_profile(self, url: str, source: str, org_name: str, director: str, position: str, page_text: str) -> dict[str, Any]:
         surname_ru, name_ru, middle_name_ru = "", "", ""
         if director:
-            parts = director.split()
-            surname_ru = parts[0] if parts else ""
-            name_ru = parts[1] if len(parts) > 1 else ""
-            middle_name_ru = parts[2] if len(parts) > 2 else ""
+            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(director)
+
+        text = self._normalize_spaces(page_text)
+        if not surname_ru:
+            leader_match = re.search(
+                r"(?:Руководитель|Генеральный директор|Президент|Председатель правления)[:\s-]*([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)",
+                text,
+            )
+            if leader_match:
+                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(leader_match.group(1))
+        if not position:
+            pos_match = re.search(
+                r"(?:Руководитель|Должность)[:\s-]*([А-ЯЁа-яё\s,\-]{5,120})",
+                text,
+            )
+            if pos_match:
+                position = self._normalize_spaces(pos_match.group(1).split("ИНН")[0])
+
         inn = ""
-        inn_match = re.search(r"ИНН[:\s]*(\d{10,12})", page_text)
+        inn_match = re.search(r"ИНН[:\s]*(\d{10,12})", text)
         if inn_match:
             inn = inn_match.group(1)
         return {
@@ -2343,7 +2402,7 @@ class CompanyWebApp:
             "surname_ru": surname_ru,
             "name_ru": name_ru,
             "middle_name_ru": middle_name_ru,
-            "ru_position": position,
+            "ru_position": self._normalize_positions_ru(position)[0] if position else "",
             "inn": inn,
         }
 
@@ -2797,10 +2856,7 @@ class CompanyWebApp:
             profile["en_position"], _ = self._normalize_positions_en(profile["ru_position"])
             if profile.get("en_position"):
                 field_sources.setdefault("en_position", "Автогенерация из RU")
-        if profile.get("middle_name_ru") and not profile.get("middle_name_en"):
-            profile["middle_name_en"] = self._translit(profile["middle_name_ru"])
-            if profile.get("middle_name_en"):
-                field_sources.setdefault("middle_name_en", "Транслитерация из RU")
+        profile["middle_name_en"] = ""
         if not profile.get("appeal") and profile.get("gender"):
             profile["appeal"] = "Г-н" if profile["gender"] == "М" else "Г-жа"
             field_sources.setdefault("appeal", "Автоопределение")
@@ -2961,13 +3017,10 @@ class CompanyWebApp:
         if profile.get("surname_ru") or profile.get("name_ru"):
             profile["family_name"] = profile.get("family_name") or self._translit(profile.get("surname_ru", ""))
             profile["first_name"] = profile.get("first_name") or self._translit(profile.get("name_ru", ""))
-            profile["middle_name_en"] = profile.get("middle_name_en") or self._translit(profile.get("middle_name_ru", ""))
             if profile.get("family_name"):
                 field_sources.setdefault("family_name", "Транслитерация из Фамилия")
             if profile.get("first_name"):
                 field_sources.setdefault("first_name", "Транслитерация из Имя")
-            if profile.get("middle_name_en"):
-                field_sources.setdefault("middle_name_en", "Транслитерация из Отчество")
 
         if input_type == INPUT_TYPE_PERSON_TEXT and profile_type != "company" and not profile.get("surname_ru") and not profile.get("name_ru"):
             raw_tokens = [tok for tok in self._normalize_spaces(raw_name).split() if tok]
@@ -2987,14 +3040,6 @@ class CompanyWebApp:
         if profile.get("inn"):
             field_sources["inn"] = "Ввод пользователя/ФНС" if input_inn else field_sources.get("inn", "ФНС")
 
-        has_fns_hit = any(str(hit.get("source", "")).strip() == "ФНС ЕГРЮЛ" for hit in source_hits)
-        has_fio = bool(profile.get("surname_ru") and profile.get("name_ru"))
-        if has_fns_hit and profile.get("ru_org") and not has_fio:
-            profile_type = "company"
-            for field in ["surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en", "gender", "appeal", "salutation"]:
-                profile[field] = ""
-                field_sources.pop(field, None)
-
         if not profile.get("gender"):
             inferred_gender = self._infer_gender(profile.get("middle_name_ru", ""), profile.get("ru_position", ""))
             if inferred_gender:
@@ -3008,10 +3053,7 @@ class CompanyWebApp:
             profile["position"] = self._generate_en_position(profile["ru_position"])
             field_sources["position"] = field_sources.get("position", "Автоперевод из Должность")
         profile["position"], _ = self._normalize_positions_en(profile.get("position", profile.get("en_position", "")))
-        if not profile.get("middle_name_en") and profile.get("middle_name_ru"):
-            profile["middle_name_en"] = self._generate_middle_name_en(profile.get("middle_name_ru", ""))
-            if profile["middle_name_en"]:
-                field_sources["middle_name_en"] = field_sources.get("middle_name_en", "Транслитерация из Отчество")
+        profile["middle_name_en"] = ""
         profile["salutation"] = profile.get("appeal", "")
         if not profile.get("en_position"):
             profile["en_position"] = profile.get("position", "")
@@ -3042,9 +3084,8 @@ class CompanyWebApp:
         if not profile.get("first_name") and profile.get("name_ru"):
             profile["first_name"] = self._translit(profile["name_ru"])
             field_sources.setdefault("first_name", "Транслитерация из Имя")
-        if not profile.get("middle_name_en") and profile.get("middle_name_ru"):
-            profile["middle_name_en"] = self._translit(profile["middle_name_ru"])
-            field_sources.setdefault("middle_name_en", "Транслитерация из Отчество")
+        profile["middle_name_en"] = ""
+        profile["inn_or_ogrn"] = profile.get("inn") or profile.get("ogrn") or ""
 
         filled = [key for key, value in profile.items() if value and key not in {"title", "appeal"}]
         logger.info("Заполненные поля: %s", filled)
@@ -3625,7 +3666,7 @@ class CompanyWebApp:
             source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
             effective_hit_type = hit_type if hit_type in {"company", "person"} else ""
             if not effective_hit_type and forced_search_type in {"company", "person"}:
-                effective_hit_type = forced_search_type
+                effective_hit_type = "person" if forced_search_type == "company" else forced_search_type
             if not effective_hit_type and source_hits:
                 first_hit_type = self._normalize_spaces(str(source_hits[0].get("type", ""))).lower()
                 if first_hit_type in {"company", "person"}:
@@ -3652,7 +3693,7 @@ class CompanyWebApp:
                         extracted_data[field] = value
             profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type, forced_type=effective_hit_type)
             if effective_hit_type in {"company", "person"}:
-                profile["type"] = effective_hit_type
+                profile["type"] = "person" if forced_search_type == "company" else effective_hit_type
             for key, value in extracted_data.items():
                 if value and not profile.get(key):
                     profile[key] = value
@@ -3668,7 +3709,7 @@ class CompanyWebApp:
 
             logger.info("Profile after build:")
             for field in self._required_fields_for_profile(profile):
-                logger.info("  %s: '%s' (from %s)", field, profile.get(field), field_sources.get(field))
+                logger.info("  required.%s: '%s' (from %s)", field, profile.get(field), field_sources.get(field))
 
             if not profile.get("ru_org") and not profile.get("surname_ru") and not profile.get("name_ru"):
                 logger.error("Профиль пустой после построения из %d хитов!", len(source_hits))
@@ -3729,6 +3770,9 @@ class CompanyWebApp:
                 return response
 
             missing_fields = self._missing_required_fields(profile)
+            logger.info("autofill.card_type=%s", self._detect_profile_type(profile))
+            logger.info("autofill.required_fields=%s", ", ".join(self._required_fields_for_profile(profile)))
+            logger.info("autofill.missing_fields=%s", ", ".join(missing_fields) if missing_fields else "none")
             if missing_fields:
                 logger.info("autocreate_skipped: reason=invalid_fields missing=%s", ",".join(missing_fields))
                 manual_payload["error"] = f"Заполните обязательные поля: {', '.join(missing_fields)}"
@@ -3738,7 +3782,7 @@ class CompanyWebApp:
                 card_obj = Card.from_profile(profile)
                 profile["family_name"] = card_obj.family_name or profile.get("family_name", "")
                 profile["first_name"] = card_obj.first_name or profile.get("first_name", "")
-                profile["middle_name_en"] = card_obj.middle_name_en or profile.get("middle_name_en", profile.get("middle_name", ""))
+                profile["middle_name_en"] = ""
                 card_id = self._create_autofill_card(profile, notes, source_hits, search_trace, field_sources)
                 logger.info("Карточка #%d создана автоматически", card_id)
                 response = ("", "302 Found", [("Location", f"/card/{card_id}")])

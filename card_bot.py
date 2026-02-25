@@ -332,8 +332,7 @@ class CardBot:
     def _enrich_card(self, card: Card) -> None:
         if card.ru_position and not card.en_position:
             card.en_position = self._generate_en_position(card.ru_position)
-        if card.patronymic_ru and not card.middle_name_en:
-            card.middle_name_en = self._generate_middle_name_en(card.patronymic_ru)
+        card.middle_name_en = ""
         if card.gender and not card.appeal:
             card.appeal = APPEAL_MAP.get(card.gender, "")
 
