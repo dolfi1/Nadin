@@ -294,9 +294,9 @@ def test_parse_rusprofile_company_page_extracts_from_meta_keywords_and_chief_tit
     data = app._parse_rusprofile("https://www.rusprofile.ru/id/1027700132195")
 
     assert data["ru_org"] == "ПАО Сбербанк"
-    assert data["surname_ru"] == "Греф"
-    assert data["name_ru"] == "Герман"
-    assert data["middle_name_ru"] == "Оскарович"
+    assert data.get("surname_ru", "") == ""
+    assert data.get("name_ru", "") == ""
+    assert data.get("middle_name_ru", "") == ""
     assert data["inn"] == "7707083893"
     assert data["ru_position"] == "Президент, Председатель Правления"
 
@@ -1082,9 +1082,9 @@ def test_build_osint_profile_ignores_juridical_label_as_fio(tmp_path):
         "Руководитель юридического лица Греф Герман Оскарович",
     )
 
-    assert profile["surname_ru"] == "Греф"
-    assert profile["name_ru"] == "Герман"
-    assert profile["middle_name_ru"] == "Оскарович"
+    assert profile["surname_ru"] == ""
+    assert profile["name_ru"] == ""
+    assert profile["middle_name_ru"] == ""
 
 
 def test_build_profile_from_company_search_requires_valid_fio_and_no_autocreate_without_it(tmp_path, monkeypatch):
@@ -1199,3 +1199,81 @@ def test_build_profile_keeps_higher_quality_valid_leader_fio(tmp_path):
     assert profile["surname_ru"] == "Греф"
     assert profile["name_ru"] == "Герман"
     assert profile["middle_name_ru"] == "Оскарович"
+
+def test_company_flow_does_not_use_keywords_for_fio(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_get(_url, **_kwargs):
+        return FakeResponse(
+            json_data={
+                "inn": "7707083893",
+                "name": "ПАО Сбербанк",
+                "keywords": "Инвестиции Мероприятия Юридического лица",
+            }
+        )
+
+    monkeypatch.setattr(web_app.requests, "get", fake_get)
+    data = app._parse_egrul("7707083893")
+
+    assert data is not None
+    assert data["surname_ru"] == ""
+    assert data["name_ru"] == ""
+
+
+def test_rbc_parser_extracts_ceo_not_sections(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(
+        app,
+        "_fetch_page",
+        lambda *_args, **_kwargs: (
+            "<html><body>"
+            "<h1>ПАО Сбербанк</h1>"
+            "<div>Инвестиции Мероприятия Отрасли</div>"
+            "<div><b>Руководитель:</b> Греф Герман Оскарович</div>"
+            "<div><b>Должность:</b> Президент</div>"
+            "ИНН 7707083893"
+            "</body></html>"
+        ),
+    )
+
+    data = app._parse_generic_osint("https://companies.rbc.ru/company/123", "companies.rbc.ru")
+
+    assert data["surname_ru"] == "Греф"
+    assert data["name_ru"] == "Герман"
+
+
+def test_zachestny_parser_rejects_yuridicheskogo_litsa_as_fio(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(
+        app,
+        "_fetch_page",
+        lambda *_args, **_kwargs: (
+            "<html><body>"
+            "<h1>ООО Ромашка</h1>"
+            "<div>Руководитель: Юридического лица</div>"
+            "ИНН 7707083893"
+            "</body></html>"
+        ),
+    )
+
+    data = app._parse_generic_osint("https://zachestnyibiznes.ru/company/ul/x", "zachestnyibiznes.ru")
+
+    assert data["surname_ru"] == ""
+    assert data["name_ru"] == ""
+
+
+def test_blocked_provider_does_not_fill_profile(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+    provider = {"name": "companies.rbc.ru", "kind": "rbc_companies_scrape", "supports_name": True, "supports_inn": True}
+
+    def fake_fetch(*_args, **_kwargs):
+        app._thread_state.blocked_fetch = True
+        return {"ru_org": "ПАО Сбербанк", "surname_ru": "Греф", "name_ru": "Герман"}
+
+    monkeypatch.setattr(app, "_fetch_from_provider", fake_fetch)
+
+    result = app._call_provider(provider, "Сбербанк", web_app.INPUT_TYPE_ORG_TEXT, no_cache=True, search_type="company")
+
+    assert result is None

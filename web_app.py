@@ -96,7 +96,23 @@ FIO_STOP_TOKENS = {
     "история",
     "физлиц",
     "проверка",
+    "инвестиции",
+    "мероприятия",
+    "отрасли",
+    "проверить",
+    "организации",
 }
+FIO_BLACKLIST_PHRASES = {
+    "юридического лица",
+    "проверка физлиц",
+    "инвестиции",
+    "мероприятия",
+    "отрасли",
+    "история",
+    "проверить",
+    "организации",
+}
+PATRONYMIC_SUFFIXES_RU = ("вич", "вна", "ич", "кызы", "оглы")
 LEADER_FIO_SOURCE_PRIORITY = {
     "zachestnyibiznes.ru": 1,
     "companies.rbc.ru": 2,
@@ -314,8 +330,9 @@ class CompanyWebApp:
     def _required_fields_for_profile(self, profile: dict[str, Any]) -> list[str]:
         profile_type = self._detect_profile_type(profile)
         forced_search_type = self._normalize_spaces(str(profile.get("search_type", ""))).lower()
+        flow_mode = self._normalize_spaces(str(profile.get("flow_mode", ""))).lower()
         has_org = bool(self._normalize_spaces(str(profile.get("ru_org", ""))) or self._normalize_spaces(str(profile.get("en_org", ""))))
-        if forced_search_type == "company":
+        if forced_search_type == "company" or flow_mode == "company_person":
             return COMPANY_SEARCH_REQUIRED_FIELDS
         if profile_type == "person" and has_org:
             return PERSON_IN_COMPANY_REQUIRED_FIELDS
@@ -331,6 +348,17 @@ class CompanyWebApp:
                 field = "inn"
             if not self._normalize_spaces(str(profile.get(field, ""))):
                 missing.append(field)
+        flow_mode = self._normalize_spaces(str(profile.get("flow_mode", ""))).lower()
+        forced_search_type = self._normalize_spaces(str(profile.get("search_type", ""))).lower()
+        if flow_mode == "company_person" or forced_search_type == "company":
+            if not self.is_plausible_fio_ru(
+                str(profile.get("surname_ru", "")),
+                str(profile.get("name_ru", "")),
+                str(profile.get("middle_name_ru", "")),
+            ):
+                for fio_field in ("surname_ru", "name_ru"):
+                    if fio_field not in missing:
+                        missing.append(fio_field)
         return missing
 
     def _init_db(self) -> None:
@@ -529,23 +557,38 @@ class CompanyWebApp:
         return "", "", ""
 
     def _valid_fio_part(self, value: str, *, min_len: int = 2) -> bool:
-        token = self._normalize_spaces(value).lower()
+        token = self._normalize_spaces(value)
+        token_lower = token.lower()
         if not token or len(token) < min_len:
             return False
-        if token in FIO_STOP_TOKENS:
+        if token_lower in FIO_STOP_TOKENS:
             return False
-        if not re.fullmatch(r"[А-Яа-яЁё\-]+", token):
+        if not re.fullmatch(r"[А-ЯЁ][а-яё\-]+", token):
             return False
         letters_count = len(re.findall(r"[А-Яа-яЁё]", token))
         return letters_count >= min_len
 
+    def is_plausible_fio_ru(self, surname_ru: str, name_ru: str, middle_name_ru: str = "") -> bool:
+        surname = self._normalize_spaces(surname_ru)
+        name = self._normalize_spaces(name_ru)
+        middle = self._normalize_spaces(middle_name_ru)
+        if not (self._valid_fio_part(surname, min_len=2) and self._valid_fio_part(name, min_len=2)):
+            return False
+        joined = " ".join(part.lower() for part in [surname, name, middle] if part)
+        if any(re.search(rf"\b{re.escape(stop)}\b", joined) for stop in FIO_STOP_TOKENS):
+            return False
+        if any(phrase in joined for phrase in FIO_BLACKLIST_PHRASES):
+            return False
+        if middle:
+            middle_lower = middle.lower()
+            if not self._valid_fio_part(middle, min_len=2):
+                return False
+            if not middle_lower.endswith(PATRONYMIC_SUFFIXES_RU):
+                return False
+        return True
+
     def _is_valid_leader_fio(self, surname_ru: str, name_ru: str, middle_name_ru: str = "") -> bool:
-        if not (self._valid_fio_part(surname_ru, min_len=3) and self._valid_fio_part(name_ru, min_len=2)):
-            return False
-        if middle_name_ru and not self._valid_fio_part(middle_name_ru, min_len=3):
-            return False
-        joined = " ".join(x for x in [surname_ru, name_ru, middle_name_ru] if x).lower()
-        return not any(re.search(rf"\b{re.escape(stop)}\b", joined) for stop in FIO_STOP_TOKENS)
+        return self.is_plausible_fio_ru(surname_ru, name_ru, middle_name_ru)
 
     def _leader_source_rank(self, source_name: str) -> int:
         return LEADER_FIO_SOURCE_PRIORITY.get(source_name, 100)
@@ -744,7 +787,8 @@ class CompanyWebApp:
                 if ru_title.lower() in pos.lower():
                     en_pos = en_title
                     break
-            en_positions.append(en_pos or self._transliterate_ru_to_en(pos))
+            if en_pos:
+                en_positions.append(en_pos)
         return ", ".join(en_positions)
 
     def _generate_middle_name_en(self, middle_name_ru: str) -> str:
@@ -961,6 +1005,9 @@ class CompanyWebApp:
 
         try:
             hits = self._fetch_from_provider(provider, normalized, input_type, inn, search_type=search_type)
+            if getattr(self._thread_state, "blocked_fetch", False):
+                logger.warning("Provider %s returned blocked/captcha; payload ignored", provider.get("name", "unknown"))
+                return None
             normalized_hits = hits if isinstance(hits, list) else ([hits] if isinstance(hits, dict) else [])
             valid_hits = [
                 item for item in normalized_hits
@@ -1766,10 +1813,6 @@ class CompanyWebApp:
                 if deep_fio:
                     surname_ru, name_ru, middle_name_ru = self._split_fio_ru(deep_fio)
 
-            if not surname_ru:
-                keywords = str(data.get("keywords") or data.get("meta_keywords") or "")
-                if keywords:
-                    surname_ru, name_ru, middle_name_ru = self._extract_fio_from_text(keywords)
 
             inn = str(
                 data.get("inn")
@@ -2080,10 +2123,6 @@ class CompanyWebApp:
                     if not profile.get("ru_position"):
                         before_fio = director_text.split(fio_match.group(1))[0] if fio_match else ""
                         profile["ru_position"] = self._normalize_position_ru(before_fio)
-            if not fio_match and keywords_text:
-                surname_ru, name_ru, middle_name_ru = self._extract_fio_from_text(keywords_text)
-                if surname_ru and name_ru:
-                    profile.update({"surname_ru": surname_ru, "name_ru": name_ru, "middle_name_ru": middle_name_ru})
 
             chief_title = self._select_first_text(soup, [".chief-title", ".company-info__item .chief-title"])
             if chief_title:
@@ -2388,7 +2427,7 @@ class CompanyWebApp:
                 "[itemprop='jobTitle']",
             ],
         )
-        return self._build_osint_profile(url, source, org_name, director, position, soup.get_text(" ", strip=True))
+        return self._build_osint_profile(url, source, org_name, director, position, soup.get_text(" ", strip=True), soup=soup)
 
     def _parse_from_ddg_site(self, raw_query: str, domains: list[str], source: str) -> dict[str, Any]:
         target_urls = self._ddg_site_search(raw_query, domains, max_urls=3)
@@ -2475,21 +2514,63 @@ class CompanyWebApp:
         self._ddg_query_cache[cache_key] = (time.time() + 120, list(urls))
         return urls
 
-    def _build_osint_profile(self, url: str, source: str, org_name: str, director: str, position: str, page_text: str) -> dict[str, Any]:
+    def _extract_labeled_leader_from_soup(self, soup: BeautifulSoup, labels: tuple[str, ...]) -> tuple[str, str]:
+        for node in soup.find_all(["tr", "li", "p", "div", "section", "dt", "dd", "th", "td", "span"]):
+            text = self._normalize_spaces(node.get_text(" ", strip=True))
+            if not text:
+                continue
+            lower_text = text.lower()
+            if not any(label in lower_text for label in labels):
+                continue
+            if any(marker in lower_text for marker in FIO_BLACKLIST_PHRASES):
+                continue
+            fio_match = re.search(r"([А-ЯЁ][а-яё\-]+\s+[А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+)?)", text)
+            if not fio_match:
+                continue
+            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
+            if not self.is_plausible_fio_ru(surname_ru, name_ru, middle_name_ru):
+                continue
+            before_fio = text.split(fio_match.group(1))[0]
+            ru_position = self._normalize_position_ru(before_fio)
+            return fio_match.group(1), ru_position
+        return "", ""
+
+    def _build_osint_profile(self, url: str, source: str, org_name: str, director: str, position: str, page_text: str, soup: BeautifulSoup | None = None) -> dict[str, Any]:
         surname_ru, name_ru, middle_name_ru = "", "", ""
         if director:
             surname_ru, name_ru, middle_name_ru = self._split_fio_ru(director)
 
         text = self._normalize_spaces(page_text)
-        if not self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
+        if source == "companies.rbc.ru" and soup is not None:
+            leader_fio, leader_position = self._extract_labeled_leader_from_soup(
+                soup,
+                ("руководитель", "генеральный директор", "президент"),
+            )
+            if leader_fio:
+                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(leader_fio)
+                if leader_position:
+                    position = leader_position
+            else:
+                surname_ru = name_ru = middle_name_ru = ""
+        elif source == "zachestnyibiznes.ru" and soup is not None:
+            leader_fio, leader_position = self._extract_labeled_leader_from_soup(
+                soup,
+                ("руководитель", "генеральный директор", "президент"),
+            )
+            if leader_fio:
+                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(leader_fio)
+                if leader_position:
+                    position = leader_position
+
+        if not self.is_plausible_fio_ru(surname_ru, name_ru, middle_name_ru):
             surname_ru = name_ru = middle_name_ru = ""
-        if not surname_ru:
+        if not surname_ru and source not in {"companies.rbc.ru", "zachestnyibiznes.ru"}:
             leader_fio, leader_position = self._extract_leader_from_labeled_text(text)
             if leader_fio:
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(leader_fio)
                 if leader_position and not position:
                     position = leader_position
-        if not surname_ru:
+        if not surname_ru and source not in {"companies.rbc.ru", "zachestnyibiznes.ru"}:
             leader_match = re.search(
                 r"(?:Руководитель|Генеральный директор|Президент|Председатель правления)\s*[:—\-]\s*(?!юридического\s+лица|история)([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)",
                 text,
@@ -2497,7 +2578,7 @@ class CompanyWebApp:
             )
             if leader_match:
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(leader_match.group(1))
-                if not self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
+                if not self.is_plausible_fio_ru(surname_ru, name_ru, middle_name_ru):
                     surname_ru = name_ru = middle_name_ru = ""
         if not position:
             pos_match = re.search(
@@ -3015,6 +3096,7 @@ class CompanyWebApp:
         field_sources: dict[str, str] = {}
         logger.info("Построение профиля из %d хитов", len(source_hits))
         profile_type = forced_type if forced_type in {"person", "company"} else ""
+        company_person_flow = input_type in {INPUT_TYPE_INN, INPUT_TYPE_ORG_TEXT}
 
         for hit in source_hits:
             if hit.get("source") != "special_case":
@@ -3176,7 +3258,7 @@ class CompanyWebApp:
                     profile["first_name"] = self._translit(nam)
 
         if profile.get("surname_ru") or profile.get("name_ru"):
-            if not self._is_valid_leader_fio(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")):
+            if not self.is_plausible_fio_ru(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")):
                 logger.warning("invalid_fio_rejected: surname=%s name=%s source=%s", profile.get("surname_ru", ""), profile.get("name_ru", ""), field_sources.get("surname_ru", ""))
                 for field in ("surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name"):
                     profile[field] = ""
@@ -3206,6 +3288,8 @@ class CompanyWebApp:
         if not profile.get("en_position"):
             profile["en_position"] = profile.get("position", "")
 
+        if company_person_flow:
+            profile["flow_mode"] = "company_person"
         if profile_type == "company":
             profile_type = "person"
 
@@ -3842,6 +3926,8 @@ class CompanyWebApp:
                 profile["type"] = "person" if forced_search_type == "company" else effective_hit_type
             if forced_search_type in {"company", "person"}:
                 profile["search_type"] = forced_search_type
+            if input_type in {INPUT_TYPE_INN, INPUT_TYPE_ORG_TEXT} and forced_search_type != "person":
+                profile["flow_mode"] = "company_person"
             for key, value in extracted_data.items():
                 if not value or profile.get(key):
                     continue
@@ -3870,7 +3956,7 @@ class CompanyWebApp:
                     field_sources["name_ru"] = candidate_source
                     if candidate_pat:
                         field_sources["middle_name_ru"] = candidate_source
-            if (profile.get("surname_ru") or profile.get("name_ru")) and not self._is_valid_leader_fio(
+            if (profile.get("surname_ru") or profile.get("name_ru")) and not self.is_plausible_fio_ru(
                 profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")
             ):
                 for field in ("surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name"):
