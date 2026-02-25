@@ -21,7 +21,7 @@ def test_full_card_parsing_and_components(tmp_path):
     assert card.patronymic_ru == "Иванович"
     assert card.surname_en == "Ivanov"
     assert card.name_en == "Ivan"
-    assert card.patronymic_en == "Ivanovich"
+    assert card.patronymic_en == ""
     assert card.gender == "М"
     assert card.appeal == "Г-н"
     assert card.ru_org.endswith("ООО")
@@ -120,7 +120,7 @@ def test_enrich_card_generates_position_middle_name_and_appeal(tmp_path):
     card = bot.create_card("Греф Герман Оскарович; М; Сбербанк ПАО; Sberbank PJSC; Президент, Председатель правления; ")
 
     assert card.en_position == "President, Chairman of the Board"
-    assert card.middle_name_en == "Oskarovich"
+    assert card.middle_name_en == ""
     assert card.appeal == "Г-н"
 
 

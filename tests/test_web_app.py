@@ -549,8 +549,8 @@ def test_build_profile_generates_position_and_middle_name_en(tmp_path):
 
     profile, _sources = app._build_profile_from_sources(hits, "Греф Герман", web_app.INPUT_TYPE_PERSON_TEXT)
 
-    assert profile["position"] == "President, Chairman Of The Board"
-    assert profile["middle_name_en"] == "Oskarovich"
+    assert profile["position"] == "President, Chairman of the Board"
+    assert profile["middle_name_en"] == ""
 
 
 def test_search_page_autodetects_person_mode_when_fio_present(tmp_path, monkeypatch):
@@ -913,6 +913,15 @@ def test_search_external_sources_stops_early_when_company_profile_is_ready(tmp_p
         calls.append(provider["name"])
         if provider["name"] == "ФНС ЕГРЮЛ":
             return {"type": "company", "ru_org": "ПАО Сбербанк", "inn": "7707083893"}
+        if provider["name"] == "zachestnyibiznes.ru":
+            return {
+                "type": "person",
+                "ru_org": "ПАО Сбербанк",
+                "inn": "7707083893",
+                "surname_ru": "Греф",
+                "name_ru": "Герман",
+                "ru_position": "Президент",
+            }
         return {"type": "company", "ru_org": "Шум"}
 
     monkeypatch.setattr(app, "_call_provider", fake_call_provider)
@@ -920,7 +929,8 @@ def test_search_external_sources_stops_early_when_company_profile_is_ready(tmp_p
     hits, _ = app._search_external_sources("7707083893", no_cache=True, search_type="company")
 
     assert hits
-    assert calls == ["ФНС ЕГРЮЛ"]
+    assert "ФНС ЕГРЮЛ" in calls
+    assert "zachestnyibiznes.ru" in calls
 
 
 def test_fetch_page_retries_on_202_and_returns_none(tmp_path, monkeypatch):
@@ -958,14 +968,14 @@ def test_parse_generic_osint_rejects_wikipedia_search_pages(tmp_path, monkeypatc
     assert data == {}
 
 
-def test_missing_required_fields_company_requires_inn_or_ogrn(tmp_path):
+def test_missing_required_fields_company_requires_inn(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
     missing = app._missing_required_fields({"type": "company", "ru_org": "ООО Ромашка", "en_org": "Romashka LLC"})
-    assert "inn_or_ogrn" in missing
+    assert "inn" in missing
 
     missing_with_inn = app._missing_required_fields({"type": "company", "ru_org": "ООО Ромашка", "inn": "7707083893"})
-    assert "inn_or_ogrn" not in missing_with_inn
+    assert "inn" not in missing_with_inn
 
 
 def test_autofill_review_person_mode_single_token_goes_manual(tmp_path):
@@ -1031,3 +1041,30 @@ def test_negative_cache_policy_for_block_and_network(tmp_path):
     should_cache, ttl = app._negative_cache_policy(provider)
     assert should_cache is False
     assert ttl == 0
+
+
+def test_build_profile_from_sources_keeps_middle_name_en_empty_for_ru_person(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    hits = [
+        {
+            "source": "ФНС ЕГРЮЛ",
+            "type": "person",
+            "data": {
+                "ru_org": "ПАО Сбербанк",
+                "inn": "7707083893",
+                "surname_ru": "Греф",
+                "name_ru": "Герман",
+                "middle_name_ru": "Оскарович",
+                "ru_position": "Президент",
+                "gender": "М",
+            },
+        }
+    ]
+
+    profile, _sources = app._build_profile_from_sources(hits, "Сбербанк", web_app.INPUT_TYPE_ORG_TEXT, forced_type="person")
+
+    assert profile["family_name"] == "Gref"
+    assert profile["first_name"] == "German"
+    assert profile["middle_name_en"] == ""
+

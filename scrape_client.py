@@ -74,7 +74,7 @@ class ScrapeClient:
         for attempt in range(max(1, max_retries)):
             status_code, text, error_code, error = self._perform_request(url, timeout=timeout, mode=mode)
             decoded = self._normalize_encoding(text)
-            blocked = self._is_block_page(decoded)
+            blocked = status_code in {403, 429} or self._is_block_page(decoded)
             last_result = FetchResult(
                 url=url,
                 status_code=status_code,
@@ -113,7 +113,14 @@ class ScrapeClient:
                     response = session.get(url, timeout=timeout)
                     return int(getattr(response, "status_code", 200)), str(getattr(response, "text", "")), "", ""
 
-            response = requests.get(url, timeout=timeout, allow_redirects=True)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Referer": "https://www.google.com/",
+                "Connection": "keep-alive",
+            }
+            response = requests.get(url, timeout=timeout, allow_redirects=True, headers=headers)
             status_code = int(getattr(response, "status_code", 200 if getattr(response, "ok", False) else 500))
             return status_code, str(getattr(response, "text", "")), "", ""
         except requests.Timeout as exc:
