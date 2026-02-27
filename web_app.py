@@ -38,6 +38,7 @@ from socketserver import ThreadingMixIn
 from wsgiref.simple_server import WSGIServer, make_server
 
 from card_bot import Card
+from constants import PASSPORT_MAP, RU_TO_EN_OPF
 from scrape_client import ScrapeClient
 
 logging.basicConfig(
@@ -52,18 +53,6 @@ logger = logging.getLogger(__name__)
 class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
     daemon_threads = True
 
-RU_TO_EN_OPF = {
-    "ООО": "LLC",
-    "АО": "JSC",
-    "ФГБУ": "FSBI",
-    "ПАО": "PJSC",
-    "ОАО": "OJSC",
-    "АНО": "ANO",
-    "ИП": "IE",
-    "МУП": "MUE",
-    "МАУ": "MAI",
-    "ЧУ": "PI",
-}
 EN_TO_RU_OPF = {v: k for k, v in RU_TO_EN_OPF.items()}
 COMPANY_SEARCH_REQUIRED_FIELDS = [
     "surname_ru",
@@ -111,13 +100,6 @@ FULL_RU_OPF = {
     "АКЦИОНЕРНОЕ ОБЩЕСТВО": "АО",
     "ОТКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО": "ОАО",
 }
-PASSPORT_MAP = {
-    "А": "A", "Б": "B", "В": "V", "Г": "G", "Д": "D", "Е": "E", "Ё": "YO", "Ж": "ZH",
-    "З": "Z", "И": "I", "Й": "Y", "К": "K", "Л": "L", "М": "M", "Н": "N", "О": "O",
-    "П": "P", "Р": "R", "С": "S", "Т": "T", "У": "U", "Ф": "F", "Х": "KH", "Ц": "TS",
-    "Ч": "CH", "Ш": "SH", "Щ": "SHCH", "Ъ": "", "Ы": "Y", "Ь": "", "Э": "E", "Ю": "YU", "Я": "YA",
-}
-
 SOURCE_DOMAINS = {
     "egrul.nalog.ru": "ЕГРЮЛ",
     "www.rusprofile.ru": "rusprofile.ru",
@@ -263,8 +245,11 @@ class CompanyWebApp:
         self._endpoint_rate_limit: dict[str, list[float]] = defaultdict(list)
         self._ddg_query_cache: dict[str, tuple[float, list[str]]] = {}
         self._thread_state = threading.local()
+        self._source_cache_lock = threading.Lock()
+        self._provider_state_lock = threading.Lock()
+        self._active_searches_lock = threading.Lock()
         self._strict_scraping_mode = False
-        self._thread_state.last_fetch_status = FETCH_STATUS_EMPTY_OK
+        self._init_thread_state()
         self._init_db()
         self._clear_provider_cache_pattern("list-org.com")
         self._clear_provider_cache_pattern("list_org")
@@ -284,9 +269,10 @@ class CompanyWebApp:
         return client
 
     def _clear_provider_cache_pattern(self, pattern: str) -> None:
-        dropped = [k for k in self._source_cache if pattern.lower() in k.lower()]
-        for key in dropped:
-            self._source_cache.pop(key, None)
+        with self._source_cache_lock:
+            dropped = [k for k in self._source_cache if pattern.lower() in k.lower()]
+            for key in dropped:
+                self._source_cache.pop(key, None)
         with self._connect() as db:
             db.execute("DELETE FROM source_cache WHERE lower(cache_key) LIKE ?", (f"%{pattern.lower()}%",))
             db.commit()
@@ -295,6 +281,12 @@ class CompanyWebApp:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _init_thread_state(self) -> None:
+        if not hasattr(self._thread_state, "last_fetch_status"):
+            self._thread_state.last_fetch_status = FETCH_STATUS_EMPTY_OK
+        if not hasattr(self._thread_state, "blocked_fetch"):
+            self._thread_state.blocked_fetch = False
 
     def _profile_value(self, profile: dict[str, Any], field: str) -> str:
         if field == "en_position":
@@ -848,7 +840,8 @@ class CompanyWebApp:
         return False
 
     def _get_cache(self, cache_key: str) -> list[dict[str, Any]] | None:
-        cached = self._source_cache.get(cache_key)
+        with self._source_cache_lock:
+            cached = self._source_cache.get(cache_key)
         now = time.time()
         if cached and now < float(cached.get("expires_at", 0)):
             return list(cached.get("hits", []))
@@ -863,13 +856,15 @@ class CompanyWebApp:
                 return None
             hits = json.loads(row["payload_json"])
 
-        self._source_cache[cache_key] = {"hits": hits, "expires_at": float(row["expires_at"])}
+        with self._source_cache_lock:
+            self._source_cache[cache_key] = {"hits": hits, "expires_at": float(row["expires_at"])}
         return hits
 
     def _set_cache(self, cache_key: str, hits: list[dict[str, Any]], ttl: int = 3600) -> None:
         expires_at = time.time() + ttl
         payload = json.dumps(hits, ensure_ascii=False)
-        self._source_cache[cache_key] = {"hits": hits, "expires_at": expires_at}
+        with self._source_cache_lock:
+            self._source_cache[cache_key] = {"hits": hits, "expires_at": expires_at}
         with self._connect() as db:
             db.execute(
                 "INSERT OR REPLACE INTO source_cache(cache_key, payload_json, expires_at) VALUES (?, ?, ?)",
@@ -879,9 +874,10 @@ class CompanyWebApp:
 
     def _clear_cache_for_inn(self, inn: str) -> int:
         key_fragment = f":{inn}"
-        dropped = [k for k in self._source_cache if key_fragment in k]
-        for key in dropped:
-            self._source_cache.pop(key, None)
+        with self._source_cache_lock:
+            dropped = [k for k in self._source_cache if key_fragment in k]
+            for key in dropped:
+                self._source_cache.pop(key, None)
         with self._connect() as db:
             cur = db.execute("DELETE FROM source_cache WHERE cache_key LIKE ?", (f"%:{inn}%",))
             db.commit()
@@ -892,9 +888,10 @@ class CompanyWebApp:
         if not normalized:
             return 0
         key_fragment = f"person:{normalized}"
-        dropped = [k for k in self._source_cache if key_fragment in k.lower()]
-        for key in dropped:
-            self._source_cache.pop(key, None)
+        with self._source_cache_lock:
+            dropped = [k for k in self._source_cache if key_fragment in k.lower()]
+            for key in dropped:
+                self._source_cache.pop(key, None)
         with self._connect() as db:
             cur = db.execute("DELETE FROM source_cache WHERE lower(cache_key) LIKE ?", (f"%{key_fragment}%",))
             db.commit()
@@ -910,18 +907,21 @@ class CompanyWebApp:
         return bool(provider.get("supports_name"))
 
     def _is_provider_temporarily_disabled(self, provider: dict[str, Any]) -> bool:
-        disabled_until = self._provider_disabled_until.get(provider.get("name", ""), 0)
+        with self._provider_state_lock:
+            disabled_until = self._provider_disabled_until.get(provider.get("name", ""), 0)
         return time.time() < disabled_until
 
     def _mark_provider_success(self, provider_name: str) -> None:
-        self._provider_error_streak[provider_name] = 0
-        self._provider_disabled_until.pop(provider_name, None)
+        with self._provider_state_lock:
+            self._provider_error_streak[provider_name] = 0
+            self._provider_disabled_until.pop(provider_name, None)
 
     def _mark_provider_failure(self, provider_name: str) -> None:
-        streak = self._provider_error_streak.get(provider_name, 0) + 1
-        self._provider_error_streak[provider_name] = streak
-        if streak > 3:
-            self._provider_disabled_until[provider_name] = time.time() + random.randint(10 * 60, 15 * 60)
+        with self._provider_state_lock:
+            streak = self._provider_error_streak.get(provider_name, 0) + 1
+            self._provider_error_streak[provider_name] = streak
+            if streak > 3:
+                self._provider_disabled_until[provider_name] = time.time() + random.randint(10 * 60, 15 * 60)
 
     def _negative_ttl_for_provider(self, provider: dict[str, Any]) -> int:
         if provider.get("kind") in NO_NEGATIVE_CACHE_KINDS:
@@ -931,6 +931,7 @@ class CompanyWebApp:
         return 10 * 60
 
     def _negative_cache_policy(self, provider: dict[str, Any]) -> tuple[bool, int]:
+        self._init_thread_state()
         status = getattr(self._thread_state, "last_fetch_status", FETCH_STATUS_EMPTY_OK)
         if status == FETCH_STATUS_EMPTY_OK:
             return True, self._negative_ttl_for_provider(provider)
@@ -948,6 +949,7 @@ class CompanyWebApp:
         no_cache: bool = False,
         search_type: str = "",
     ) -> list[dict[str, Any]] | dict[str, Any] | None:
+        self._init_thread_state()
         self._thread_state.blocked_fetch = False
         self._thread_state.last_fetch_status = FETCH_STATUS_EMPTY_OK
         normalized = self._normalize_spaces(raw)
@@ -992,7 +994,8 @@ class CompanyWebApp:
                 blocked_ttl = 12 * 60 * 60
                 if not no_cache:
                     self._set_cache(cache_key, [], ttl=blocked_ttl)
-                self._provider_disabled_until[provider.get("name", "")] = time.time() + blocked_ttl
+                with self._provider_state_lock:
+                    self._provider_disabled_until[provider.get("name", "")] = time.time() + blocked_ttl
                 logger.warning("Provider %s returned captcha/block for '%s'; cached as blocked", provider.get("name", "unknown"), raw)
                 return None
             if not no_cache:
@@ -1360,13 +1363,15 @@ class CompanyWebApp:
         return score
 
     def _search_external_sources(self, raw: str, no_cache: bool = False, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
+        self._init_thread_state()
         input_type = self.detect_input_type(raw)
         request_fingerprint = hashlib.sha1(f"{input_type}|{self._normalize_spaces(raw).lower()}|{search_type}|{int(no_cache)}".encode("utf-8")).hexdigest()
         active_key = f"external:{request_fingerprint}"
-        if active_key in self._active_searches:
-            logger.warning("Пропущен дублирующийся активный запрос external:%s", request_fingerprint[:8])
-            return [], ["Источник: дублирующийся активный запрос пропущен"]
-        self._active_searches[active_key] = time.time()
+        with self._active_searches_lock:
+            if active_key in self._active_searches:
+                logger.warning("Пропущен дублирующийся активный запрос external:%s", request_fingerprint[:8])
+                return [], ["Источник: дублирующийся активный запрос пропущен"]
+            self._active_searches[active_key] = time.time()
         request_key = f"{input_type}:{raw.lower()}"
         last_started = self._last_search_time.get(request_key)
         if last_started is not None:
@@ -1466,7 +1471,8 @@ class CompanyWebApp:
             logger.info("🏁 ПОИСК ЗАВЕРШЕН: Всего найдено %d записей (режим: %s)", len(hits), search_type or "auto")
             return hits, trace
         finally:
-            self._active_searches.pop(active_key, None)
+            with self._active_searches_lock:
+                self._active_searches.pop(active_key, None)
 
     def _domain_throttle(self, url: str) -> None:
         host = urlparse(url).netloc.lower()
@@ -1517,6 +1523,7 @@ class CompanyWebApp:
         return False
 
     def _fetch_page(self, url: str, timeout: int = 15, max_retries: int = 5) -> str | None:
+        self._init_thread_state()
         if not self._normalize_spaces(url):
             logger.error("Provider generated empty URL, fetch skipped")
             return None
@@ -1566,7 +1573,8 @@ class CompanyWebApp:
             self._thread_state.last_fetch_status = FETCH_STATUS_BLOCKED_403
             block_ttl = 12 * 60 * 60
             self._save_rate_limited(host or "source", f"blocked:{url}", retry_seconds=block_ttl)
-            self._provider_disabled_until[host or "source"] = time.time() + block_ttl
+            with self._provider_state_lock:
+                self._provider_disabled_until[host or "source"] = time.time() + block_ttl
             logger.warning("%s returned captcha/block page", url)
             return None
         if not result.ok:
@@ -2599,12 +2607,13 @@ class CompanyWebApp:
 
     def _save_rate_limited(self, provider_name: str, key: str, retry_seconds: int = 300) -> None:
         cache_key = f"{provider_name}:{key}"
-        self._source_cache[cache_key] = {
-            "ts": time.time(),
-            "state": "rate_limited",
-            "retry_at": time.time() + retry_seconds,
-            "reason": f"429 → retry after {retry_seconds}s",
-        }
+        with self._source_cache_lock:
+            self._source_cache[cache_key] = {
+                "ts": time.time(),
+                "state": "rate_limited",
+                "retry_at": time.time() + retry_seconds,
+                "reason": f"429 → retry after {retry_seconds}s",
+            }
 
     def _fetch_from_egrul(self, inn: str) -> tuple[dict[str, Any] | None, str, str]:
         # deprecated: kept for backward compatibility; use _parse_egrul in provider flow.
@@ -3785,20 +3794,23 @@ class CompanyWebApp:
                 "error": "Ничего не найдено: укажите минимум имя и фамилию",
             }
             response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
-            self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+            with self._active_searches_lock:
+                    self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
             return response
 
-        cached_result = self._autofill_result_cache.get(cache_key)
+        with self._active_searches_lock:
+            cached_result = self._autofill_result_cache.get(cache_key)
         if cached_result and time.time() < float(cached_result.get("expires_at", 0)):
             logger.info("Используем кэш результата autofill для %s", raw)
             return cached_result["response"]
 
-        if cache_key in self._active_searches:
-            logger.info("Поиск уже выполняется для %s, используем последний кэш", raw)
-            if cached_result:
-                return cached_result["response"]
+        with self._active_searches_lock:
+            if cache_key in self._active_searches:
+                logger.info("Поиск уже выполняется для %s, используем последний кэш", raw)
+                if cached_result:
+                    return cached_result["response"]
 
-        self._active_searches[cache_key] = time.time()
+            self._active_searches[cache_key] = time.time()
         try:
             if self._get_one(form, "reset_cache") == "1" and input_type == INPUT_TYPE_INN:
                 dropped = self._clear_cache_for_inn(self._extract_inn(raw))
@@ -3930,21 +3942,24 @@ class CompanyWebApp:
                 logger.info("autocreate_skipped: reason=invalid_fields details=person_without_name")
                 manual_payload["error"] = "Ничего не найдено: укажите минимум имя и фамилию"
                 response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
-                self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+                with self._active_searches_lock:
+                    self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
 
             if self._is_garbage_org_title(profile.get("ru_org", ""), raw):
                 logger.info("autocreate_skipped: reason=garbage_title")
                 manual_payload["error"] = "Нужно уточнить: добавьте ИНН или корректное название организации"
                 response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
-                self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+                with self._active_searches_lock:
+                    self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
 
             if self._detect_profile_type(profile) == "company" and not self._normalize_spaces(profile.get("inn", "")):
                 logger.info("autocreate_skipped: reason=low_confidence details=company_without_inn")
                 manual_payload["error"] = "Нужно уточнить: добавьте ИНН или ОГРН"
                 response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
-                self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+                with self._active_searches_lock:
+                    self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
 
             missing_fields = self._missing_required_fields(profile)
@@ -3967,10 +3982,13 @@ class CompanyWebApp:
                 card_id = self._create_autofill_card(profile, notes, source_hits, search_trace, field_sources)
                 logger.info("Карточка #%d создана автоматически", card_id)
                 response = ("", "302 Found", [("Location", f"/card/{card_id}")])
-            self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+            with self._active_searches_lock:
+                with self._active_searches_lock:
+                    self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
             return response
         finally:
-            self._active_searches.pop(cache_key, None)
+            with self._active_searches_lock:
+                self._active_searches.pop(cache_key, None)
 
     def autofill_confirm(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         action = self._get_one(form, "action") or "edit"

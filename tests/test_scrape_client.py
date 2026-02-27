@@ -36,3 +36,18 @@ def test_fetch_falls_back_when_403(monkeypatch):
     assert result.ok is True
     assert calls[0] == client.mode_default
     assert client.mode_fallback in calls
+
+
+def test_fetch_marks_domain_block_cache(monkeypatch):
+    client = ScrapeClient(per_domain_min_delay=0)
+
+    def fake_perform(_url, timeout, mode):
+        return 403, "blocked", "", ""
+
+    monkeypatch.setattr(client, "_perform_request", fake_perform)
+
+    first = client._fetch_once("https://example.com", timeout=1, max_retries=1, mode="fast")
+    second = client._fetch_once("https://example.com", timeout=1, max_retries=1, mode="fast")
+
+    assert first.blocked is True
+    assert second.error_code == "blocked_cache"
