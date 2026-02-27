@@ -21,7 +21,7 @@ def test_full_card_parsing_and_components(tmp_path):
     assert card.patronymic_ru == "Иванович"
     assert card.surname_en == "Ivanov"
     assert card.name_en == "Ivan"
-    assert card.patronymic_en == ""
+    assert card.patronymic_en == "Ivanovich"
     assert card.gender == "М"
     assert card.appeal == "Г-н"
     assert card.ru_org.endswith("ООО")
@@ -120,7 +120,7 @@ def test_enrich_card_generates_position_middle_name_and_appeal(tmp_path):
     card = bot.create_card("Греф Герман Оскарович; М; Сбербанк ПАО; Sberbank PJSC; Президент, Председатель правления; ")
 
     assert card.en_position == "President, Chairman of the Board"
-    assert card.middle_name_en == ""
+    assert card.middle_name_en == "Oskarovich"
     assert card.appeal == "Г-н"
 
 
@@ -138,8 +138,8 @@ def test_from_profile_maps_ru_and_en_fallbacks():
         }
     )
 
-    assert card.surname_ru == "Gref"
-    assert card.name_ru == "German"
+    assert card.surname_ru == ""
+    assert card.name_ru == ""
     assert card.patronymic_ru == "Оскарович"
     assert card.en_position == "President"
 
@@ -152,3 +152,20 @@ def test_company_card_without_gender_is_not_format_error(tmp_path):
 
     assert not any("Пол должен быть" in n for n in card.quality_notes)
 
+
+
+def test_enrich_card_keeps_existing_middle_name(tmp_path):
+    bot = CardBot(log_path=tmp_path / "log.jsonl")
+    card = Card(ru_position="Директор", middle_name_en="Ivanovich", gender="М")
+
+    bot._enrich_card(card)
+
+    assert card.middle_name_en == "Ivanovich"
+    assert card.en_position == "Director"
+
+
+def test_strip_punct_respects_language_flag(tmp_path):
+    bot = CardBot(log_path=tmp_path / "log.jsonl")
+
+    assert bot._strip_punct("ООО Acme!", russian=True) == "ООО "
+    assert bot._strip_punct("ООО Acme!", russian=False) == " Acme"

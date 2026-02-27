@@ -9,27 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
+from constants import PASSPORT_MAP, RU_TO_EN_OPF
 
-RU_TO_EN_OPF: Dict[str, str] = {
-    "ООО": "LLC",
-    "АО": "JSC",
-    "ФГБУ": "FSBI",
-    "ПАО": "PJSC",
-    "ОАО": "OJSC",
-    "АНО": "ANO",
-    "ИП": "IE",
-    "МУП": "MUE",
-    "МАУ": "MAI",
-    "ЧУ": "PI",
-}
 EN_TO_RU_OPF: Dict[str, str] = {v: k for k, v in RU_TO_EN_OPF.items()}
-
-PASSPORT_MAP = {
-    "А": "A", "Б": "B", "В": "V", "Г": "G", "Д": "D", "Е": "E", "Ё": "YO", "Ж": "ZH", "З": "Z",
-    "И": "I", "Й": "Y", "К": "K", "Л": "L", "М": "M", "Н": "N", "О": "O", "П": "P", "Р": "R",
-    "С": "S", "Т": "T", "У": "U", "Ф": "F", "Х": "KH", "Ц": "TS", "Ч": "CH", "Ш": "SH", "Щ": "SHCH",
-    "Ъ": "", "Ы": "Y", "Ь": "", "Э": "E", "Ю": "YU", "Я": "YA",
-}
 EN_SMALL_WORDS = {"a", "an", "the", "and", "or", "of", "for", "to", "in", "on", "at", "by"}
 SURNAME_PARTICLES = {"von", "van", "de", "du", "der", "den", "la", "le", "di", "da", "dos", "des"}
 EN_POSITION_ABBREVIATIONS = {
@@ -83,8 +65,8 @@ class Card:
     @classmethod
     def from_profile(cls, profile: dict) -> "Card":
         payload = {field: profile.get(field, "") for field in cls.__dataclass_fields__}
-        payload["surname_ru"] = profile.get("surname_ru") or profile.get("family_name", "")
-        payload["name_ru"] = profile.get("name_ru") or profile.get("first_name", "")
+        payload["surname_ru"] = profile.get("surname_ru", "")
+        payload["name_ru"] = profile.get("name_ru", "")
         payload["patronymic_ru"] = profile.get("patronymic_ru") or profile.get("middle_name_ru", "")
         payload["surname_en"] = profile.get("surname_en") or profile.get("family_name", "")
         payload["name_en"] = profile.get("name_en") or profile.get("first_name", "")
@@ -332,7 +314,8 @@ class CardBot:
     def _enrich_card(self, card: Card) -> None:
         if card.ru_position and not card.en_position:
             card.en_position = self._generate_en_position(card.ru_position)
-        card.middle_name_en = ""
+        if card.patronymic_ru and not card.middle_name_en:
+            card.middle_name_en = self._generate_middle_name_en(card.patronymic_ru)
         if card.gender and not card.appeal:
             card.appeal = APPEAL_MAP.get(card.gender, "")
 
@@ -494,7 +477,7 @@ class CardBot:
         return "", text
 
     def _strip_punct(self, text: str, russian: bool) -> str:
-        allowed = "A-Za-z0-9А-Яа-яЁё -"
+        allowed = "А-Яа-яЁё0-9 -" if russian else "A-Za-z0-9 -"
         return re.sub(rf"[^{allowed}]", "", text)
 
     def _strip_position(self, text: str) -> str:

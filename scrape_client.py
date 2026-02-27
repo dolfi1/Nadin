@@ -71,7 +71,8 @@ class ScrapeClient:
             return FetchResult(url=url, status_code=429, text="", ok=False, blocked=True, error_code="blocked_cache", error="domain temporarily blocked", mode=mode)
 
         last_result = FetchResult(url=url, status_code=599, text="", ok=False, blocked=False, error_code="empty_response", mode=mode)
-        for attempt in range(max(1, max_retries)):
+        attempts = max(1, max_retries)
+        for attempt in range(attempts):
             status_code, text, error_code, error = self._perform_request(url, timeout=timeout, mode=mode)
             decoded = self._normalize_encoding(text)
             blocked = status_code in {202, 403, 429} or self._is_block_page(decoded)
@@ -86,6 +87,7 @@ class ScrapeClient:
                 mode=mode,
             )
             if blocked:
+                self._mark_blocked(url, ttl_seconds=15 * 60)
                 last_result.error_code = last_result.error_code or "blocked"
                 if not last_result.error:
                     last_result.error = "captcha_or_block_page"
@@ -93,8 +95,10 @@ class ScrapeClient:
             if status_code == 200:
                 return last_result
             if status_code in {202, 403, 429, 503}:
-                time.sleep((2 ** attempt) + random.uniform(0.1, 0.6))
-                continue
+                if attempt < attempts - 1:
+                    time.sleep((2 ** attempt) + random.uniform(0.1, 0.6))
+                    continue
+                return last_result
             return last_result
         return last_result
 
