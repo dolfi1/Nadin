@@ -1504,3 +1504,42 @@ def test_build_profile_position_prefers_fns_when_current_position_is_noise(tmp_p
 
     assert profile["ru_position"] == "Ректор"
     assert sources["ru_position"] == "ФНС ЕГРЮЛ"
+
+def test_apply_card_rules_preserves_ru_position_from_source_for_school(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    normalized, _notes = app.apply_card_rules(
+        {
+            "ru_org": "МАОУ СОШ №7",
+            "ru_position": "Директор",
+            "en_position": "Rector",
+            "position": "Rector",
+        }
+    )
+
+    assert normalized["ru_position"] == "Директор"
+    assert normalized["en_position"] == "Rector"
+
+
+def test_apply_card_rules_infers_ru_position_from_en_with_org_type(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    school_profile, _ = app.apply_card_rules(
+        {
+            "ru_org": "МАОУ СОШ №7",
+            "ru_position": "",
+            "en_position": "Director",
+        }
+    )
+    company_profile, _ = app.apply_card_rules(
+        {
+            "ru_org": "АО Уралтрансмаш",
+            "ru_position": "",
+            "en_position": "CEO",
+        }
+    )
+
+    assert school_profile["ru_position"] == "Директор"
+    assert school_profile["en_position"] == "Director"
+    assert company_profile["ru_position"] == "Генеральный директор"
+    assert company_profile["en_position"] == "CEO"
