@@ -100,6 +100,22 @@ LEADER_FIO_SOURCE_PRIORITY = {
     "focus.kontur.ru": 5,
 }
 SPECIAL_EN_ORG_NAMES = {"газпром": "Gazprom PJSC", "лукойл": "Lukoil PJSC"}
+BLOCK_PAGE_MARKERS = (
+    "браузер не подходит",
+    "captcha",
+    "доступ ограничен",
+    "подтвердите",
+    "робот",
+    "429",
+    "access denied",
+)
+KNOWN_RU_TO_EN_ORG = {
+    "тюменский государственный университет": "Tyumen State University",
+}
+RU_TO_EN_OPF_EXTENDED = {
+    **RU_TO_EN_OPF,
+    "ФГАОУ ВО": "FSAEI HE",
+}
 FULL_RU_OPF = {
     "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ": "ООО",
     "ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО": "ПАО",
@@ -704,29 +720,51 @@ class CompanyWebApp:
 
     def normalize_ru_org(self, raw: str) -> tuple[str, list[str]]:
         notes: list[str] = []
-        cleaned = self._strip_punct(raw, russian=True)
+        cleaned = self._normalize_spaces(str(raw))
+        cleaned = re.sub(r"[«»\"'()]", " ", cleaned)
+        cleaned = re.sub(r"\bИНН\s*\d+\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b\d{6,}\b", " ", cleaned)
+        if "," in cleaned:
+            parts = [self._normalize_spaces(part) for part in cleaned.split(",")]
+            cleaned = next((part for part in parts if re.search(r"[А-Яа-яЁёA-Za-z]", part)), cleaned)
+            notes.append("RU организация: оставлена первая часть до запятой")
+        cleaned = self._strip_punct(cleaned, russian=True)
         cleaned = re.sub(r"\b(НЕ|НЕТ)\s+(ООО|АО|ПАО|ИП|ЗАО|ОАО)\b", r"\2", cleaned, flags=re.IGNORECASE)
         cleaned = self._normalize_spaces(self._strip_noise(cleaned.upper()))
+        if "ТЮМЕНСКИЙ ГОСУДАРСТВЕННЫЙ УНИВЕРСИТЕТ" in cleaned:
+            cleaned = re.sub(r"\bТЮМГУ\b", "", cleaned)
+            notes.append("RU организация: удалена хвостовая аббревиатура")
         for full, short in FULL_RU_OPF.items():
             if full in cleaned:
                 cleaned = cleaned.replace(full, short)
                 notes.append("RU организация: полная ОПФ сокращена")
+        cleaned = re.sub(r"\b(УНИВЕРСИТЕТ)(\s+\1)+\b", r"\1", cleaned)
         tokens = cleaned.split()
         opf = ""
-        if tokens and tokens[0] in RU_TO_EN_OPF:
+        if len(tokens) >= 2 and tokens[0] == "ФГАОУ" and tokens[1] == "ВО":
+            opf, tokens = "ФГАОУ ВО", tokens[2:]
+            notes.append("RU организация: ОПФ перенесена в конец")
+        elif tokens and tokens[0] in RU_TO_EN_OPF:
             opf, tokens = tokens[0], tokens[1:]
+        elif len(tokens) >= 2 and tokens[-2] == "ФГАОУ" and tokens[-1] == "ВО":
+            opf, tokens = "ФГАОУ ВО", tokens[:-2]
         elif tokens and tokens[-1] in RU_TO_EN_OPF:
             opf, tokens = tokens[-1], tokens[:-1]
         else:
             notes.append("RU организация: ОПФ должна быть в конце")
 
         def _normalize_token(tok: str) -> str:
+            if tok in {"ФГАОУ", "ВО"}:
+                return tok
             if tok.isupper() and (len(tok) <= 3 or not re.search(r"[АЕЁИОУЫЭЮЯ]", tok)):
                 return tok
             return tok.capitalize()
 
         name = " ".join(_normalize_token(tok) for tok in tokens)
         result = self._normalize_spaces(f"{name} {opf}" if opf else name)
+        if re.search(r"тюменский\s+государственный\s+университет", result, flags=re.IGNORECASE):
+            suffix = " ФГАОУ ВО" if "ФГАОУ ВО" in result.upper() else ""
+            result = f"Тюменский государственный университет{suffix}"
         if "Сбербанк" in result and "ПАО" not in result:
             result = self._normalize_spaces(f"{result} ПАО")
             notes.append("RU организация: добавлено ПАО для Сбербанка")
@@ -779,21 +817,32 @@ class CompanyWebApp:
     def normalize_en_org(self, raw: str, fallback_ru: str, is_media: bool = False, is_ru_registered: bool = False) -> tuple[str, list[str]]:
         notes: list[str] = []
         cleaned = self._normalize_spaces(self._strip_noise(raw))
+        ru_key = self._normalize_spaces(fallback_ru.lower())
+        opf_ru = "ФГАОУ ВО" if fallback_ru.upper().endswith("ФГАОУ ВО") else ""
+        opf_en = RU_TO_EN_OPF_EXTENDED.get(opf_ru, "")
+
+        for key, value in KNOWN_RU_TO_EN_ORG.items():
+            if key in ru_key:
+                return self._normalize_spaces(f"{value} {opf_en}"), notes
+
         if not cleaned and re.search(r"[A-Za-zА-Яа-яЁё]", fallback_ru):
             ru_parts = fallback_ru.split()
-            opf_ru = ru_parts[-1] if ru_parts and ru_parts[-1] in RU_TO_EN_OPF else ""
-            name_tokens = ru_parts[:-1] if opf_ru else ru_parts
+            if len(ru_parts) >= 2 and ru_parts[-2:] == ["ФГАОУ", "ВО"]:
+                opf_ru = "ФГАОУ ВО"
+                name_tokens = ru_parts[:-2]
+            else:
+                opf_ru = ru_parts[-1] if ru_parts and ru_parts[-1] in RU_TO_EN_OPF_EXTENDED else ""
+                name_tokens = ru_parts[:-1] if opf_ru else ru_parts
             name = " ".join(self._translit(tok) for tok in name_tokens)
-            cleaned = self._normalize_spaces(f"{name} {RU_TO_EN_OPF.get(opf_ru, '')}")
+            cleaned = self._normalize_spaces(f"{name} {RU_TO_EN_OPF_EXTENDED.get(opf_ru, '')}")
             if cleaned:
                 notes.append("Organization EN: автотранслит — требует перевода или подтверждения" if not is_ru_registered else "Транслит допустим (зарегистрировано в РФ)")
 
         if not cleaned:
             return "", notes
 
-        fallback_key = self._normalize_spaces(fallback_ru.lower())
         for key, value in SPECIAL_EN_ORG_NAMES.items():
-            if key in fallback_key:
+            if key in ru_key:
                 return value, notes
 
         cleaned = unicodedata.normalize("NFKD", cleaned)
@@ -811,7 +860,15 @@ class CompanyWebApp:
         name = " ".join(p.capitalize() for p in parts)
         if name.startswith("The ") and not is_media:
             notes.append("Organization EN: The в начале запрещен")
-        return self._normalize_spaces(f"{name} {opf}" if opf else name), notes
+        result = self._normalize_spaces(f"{name} {opf}" if opf else name)
+        result = re.sub(r"^The\s+", "", result, flags=re.IGNORECASE)
+        return result, notes
+
+    def is_block_page_value(self, text: str) -> bool:
+        value = self._normalize_spaces(str(text)).lower()
+        if not value:
+            return False
+        return any(marker in value for marker in BLOCK_PAGE_MARKERS)
 
     def _status(self, notes: list[str], required_ok: bool) -> str:
         if not required_ok:
@@ -2970,6 +3027,8 @@ class CompanyWebApp:
             source_name = item.get("source", "unknown")
             data = self._enrich_alternative_person_fields(dict(item.get("data", {})))
             value = self._normalize_spaces(str(data.get(field, "")))
+            if field in {"ru_org", "en_org", "ru_position"} and self.is_block_page_value(value):
+                continue
             if not value:
                 continue
             if field in {"surname_ru", "name_ru", "middle_name_ru"}:
@@ -3068,7 +3127,7 @@ class CompanyWebApp:
             field_sources.setdefault("appeal", "Автоопределение")
         return profile
 
-    def apply_card_rules(self, profile: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+    def apply_card_rules(self, profile: dict[str, str], card_type: str = "") -> tuple[dict[str, str], list[str]]:
         """Применяет финальную нормализацию карточки перед сохранением."""
         normalized = dict(profile)
         notes: list[str] = []
@@ -3085,15 +3144,19 @@ class CompanyWebApp:
         normalized["position"] = en_pos
         normalized["en_position"] = en_pos
 
-        profile_type = self._detect_profile_type(normalized)
+        profile_type = card_type or self._detect_profile_type(normalized)
         forced_search_type = self._normalize_spaces(str(normalized.get("search_type", ""))).lower()
-        if profile_type == "company" or forced_search_type == "company":
-            for field in ("surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en", "gender", "appeal", "salutation"):
-                normalized[field] = ""
-
-        if not normalized.get("appeal"):
-            normalized["appeal"] = self._derive_salutation(normalized.get("gender", ""))
-        normalized["salutation"] = normalized.get("appeal", "")
+        is_company = profile_type == "company" or forced_search_type == "company"
+        if is_company:
+            for field in (
+                "surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en",
+                "gender", "salutation", "title", "appeal",
+            ):
+                normalized.pop(field, None)
+        else:
+            if not normalized.get("appeal"):
+                normalized["appeal"] = self._derive_salutation(normalized.get("gender", ""))
+            normalized["salutation"] = normalized.get("appeal", "")
 
         notes.extend(ru_notes)
         notes.extend(en_notes)
@@ -3120,6 +3183,9 @@ class CompanyWebApp:
             data = hit.get("data", {})
             if not isinstance(data, dict):
                 continue
+            for noisy_field in ("ru_org", "en_org", "ru_position"):
+                if self.is_block_page_value(data.get(noisy_field, "")):
+                    data[noisy_field] = None
             for field in [
                 "surname_ru",
                 "name_ru",
@@ -3188,6 +3254,8 @@ class CompanyWebApp:
             for hit in source_hits:
                 data = hit.get("data", {})
                 candidate = str(data.get(field) or "").strip()
+                if field in {"ru_org", "en_org", "ru_position"} and self.is_block_page_value(candidate):
+                    continue
                 if candidate and candidate not in {"", " ", query}:
                     profile[field] = candidate
                     field_sources[field] = f"fallback:{hit.get('source', 'unknown')}"
@@ -3227,6 +3295,8 @@ class CompanyWebApp:
         if not profile["ru_org"] and source_hits:
             for item in source_hits:
                 candidate = self._normalize_spaces(str(item.get("data", {}).get("ru_org", "")))
+                if self.is_block_page_value(candidate):
+                    continue
                 if candidate:
                     profile["ru_org"] = candidate
                     field_sources["ru_org"] = item.get("source", "unknown")
@@ -3934,6 +4004,8 @@ class CompanyWebApp:
                     "inn",
                 ]:
                     value = self._normalize_spaces(str(data.get(field, "")))
+                    if field in {"ru_org", "en_org", "ru_position"} and self.is_block_page_value(value):
+                        value = ""
                     if value and not extracted_data.get(field):
                         extracted_data[field] = value
             profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type, forced_type=effective_hit_type)
@@ -4060,6 +4132,19 @@ class CompanyWebApp:
                 response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
             else:
                 logger.info("Все обязательные поля заполнены! Создаем карточку автоматически.")
+                card_type = self._detect_profile_type(profile)
+                before_ru_org = profile.get("ru_org", "")
+                before_en_org = profile.get("en_org", "")
+                profile, final_notes = self.apply_card_rules(profile, card_type=card_type)
+                notes.extend(final_notes)
+                logger.info(
+                    "apply_card_rules.before_insert card_type=%s ru_org: '%s' -> '%s'; en_org: '%s' -> '%s'",
+                    card_type,
+                    before_ru_org,
+                    profile.get("ru_org", ""),
+                    before_en_org,
+                    profile.get("en_org", ""),
+                )
                 card_obj = Card.from_profile(profile)
                 profile["family_name"] = card_obj.family_name or profile.get("family_name", "")
                 profile["first_name"] = card_obj.first_name or profile.get("first_name", "")

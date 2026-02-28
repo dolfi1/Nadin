@@ -1299,10 +1299,60 @@ def test_apply_card_rules_clears_person_fields_for_company_mode(tmp_path):
 
     assert profile["ru_org"]
     assert profile["en_org"]
-    assert profile["surname_ru"] == ""
-    assert profile["name_ru"] == ""
-    assert profile["gender"] == ""
+    assert "surname_ru" not in profile
+    assert "name_ru" not in profile
+    assert "gender" not in profile
     assert isinstance(notes, list)
+
+
+def test_normalize_ru_org_tyumen_university_egrul_variant(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    ru_org, _notes = app.normalize_ru_org(
+        "Фгаоу ВО Тюменский Государственный Университет Тюменский Государственный Университет Тюмгу"
+    )
+
+    assert ru_org == "Тюменский государственный университет ФГАОУ ВО"
+
+
+def test_normalize_ru_org_tyumen_university_csv_inn_variant(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    ru_org, _notes = app.normalize_ru_org(
+        "ФГАОУ ВО Тюменский государственный университет, ТюмГУ, ИНН 7202010861"
+    )
+
+    assert ru_org == "Тюменский государственный университет ФГАОУ ВО"
+
+
+def test_normalize_en_org_tyumen_university_translation(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    en_org, _notes = app.normalize_en_org("", "Тюменский государственный университет ФГАОУ ВО")
+
+    assert en_org == "Tyumen State University FSAEI HE"
+
+
+def test_block_page_values_ignored_in_profile_merge(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    profile, _sources = app._build_profile_from_sources(
+        source_hits=[
+            {
+                "source": "focus.kontur.ru",
+                "data": {"ru_org": "Браузер не подходит", "inn": "7202010861"},
+            },
+            {
+                "source": "ФНС ЕГРЮЛ",
+                "data": {"ru_org": "ФГАОУ ВО Тюменский государственный университет", "inn": "7202010861"},
+            },
+        ],
+        raw_name="7202010861",
+        input_type=web_app.INPUT_TYPE_INN,
+        forced_type="company",
+    )
+
+    assert profile["ru_org"] == "Тюменский государственный университет ФГАОУ ВО"
 
 
 def test_parse_egrul_extracts_fio_from_nested_leader_block(tmp_path, monkeypatch):
