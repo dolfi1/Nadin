@@ -72,7 +72,7 @@ COMPANY_SEARCH_REQUIRED_FIELDS = [
     "en_position",
 ]
 LEADER_LABEL_RE = re.compile(
-    r"(руководитель(?:\s+организации)?|генеральный\s+директор|президент)",
+    r"(руководитель(?:\s+организации)?|генеральный\s+директор|президент|ректор|rector)",
     flags=re.IGNORECASE,
 )
 FIO_STOP_TOKENS = {
@@ -610,7 +610,7 @@ class CompanyWebApp:
             if self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
                 before_fio = candidate.split(fio_match.group(1))[0]
                 position_match = re.search(
-                    r"(генеральный\s+директор|президент|председатель\s+правления|председатель|директор|руководитель)",
+                    r"(генеральный\s+директор|президент|председатель\s+правления|председатель|директор|руководитель|ректор)",
                     before_fio,
                     flags=re.IGNORECASE,
                 )
@@ -1836,6 +1836,27 @@ class CompanyWebApp:
             if not ru_org:
                 logger.warning("ФНС: ru_org пустой для INN=%s", query)
 
+            logger.info("FNS data keys: %s", sorted(list(data.keys()))[:200])
+            for nested_key in ("СвЮЛ", "СвДолжнФЛ", "СведДолжнФЛ", "СведДолжнФЛЮЛ", "СвРуководитель", "СведРуководитель"):
+                nested_value = data.get(nested_key)
+                if isinstance(nested_value, dict):
+                    logger.info("FNS nested %s: type=dict keys=%s", nested_key, sorted(list(nested_value.keys()))[:50])
+                elif isinstance(nested_value, list):
+                    first_item = nested_value[0] if nested_value else None
+                    if isinstance(first_item, dict):
+                        first_item_keys = sorted(list(first_item.keys()))[:50]
+                    else:
+                        first_item_keys = []
+                    logger.info(
+                        "FNS nested %s: type=list len=%d first_item_type=%s first_item_keys=%s",
+                        nested_key,
+                        len(nested_value),
+                        type(first_item).__name__ if first_item is not None else "None",
+                        first_item_keys,
+                    )
+                elif nested_value is not None:
+                    logger.info("FNS nested %s: type=%s", nested_key, type(nested_value).__name__)
+
             director = data.get("director") or {}
             surname_ru = str(director.get("Фамилия") or director.get("surname") or director.get("surname_ru") or "")
             name_ru = str(director.get("Имя") or director.get("name") or director.get("name_ru") or "")
@@ -1843,7 +1864,7 @@ class CompanyWebApp:
             position = str(director.get("Должность") or director.get("position") or data.get("ru_position") or "")
 
             if not surname_ru or not name_ru or not middle_name_ru or not position:
-                dol_candidates = self._deep_values_for_keys(data, {"СведДолжнФЛ", "СвРукЮЛ", "Руководитель", "РукЮЛ"})
+                dol_candidates = self._deep_values_for_keys(data, {"СведДолжнФЛ", "СвДолжнФЛ", "СведДолжнФЛЮЛ", "СвРуководитель", "СведРуководитель", "СвРукЮЛ", "Руководитель", "РукЮЛ"})
                 dol_list: list[dict[str, Any]] = []
                 for candidate in dol_candidates:
                     if isinstance(candidate, list):
@@ -2113,7 +2134,7 @@ class CompanyWebApp:
                 ],
             )
             pos_match = re.search(
-                r"(Генеральный директор|Президент|Председатель правления|Председатель|Директор|Руководитель|Заместитель)\s*([А-ЯЁа-яё\s,]{0,40}?)",
+                r"(Генеральный директор|Президент|Председатель правления|Председатель|Директор|Руководитель|Ректор|Заместитель)\s*([А-ЯЁа-яё\s,]{0,40}?)",
                 position_text or page_text,
                 flags=re.IGNORECASE,
             )
@@ -2128,7 +2149,7 @@ class CompanyWebApp:
                 if position_element:
                     position_text = self._normalize_spaces(position_element.get_text(" ", strip=True))
                     pos_match = re.search(
-                        r"(Генеральный директор|Президент|Председатель правления|Председатель|Директор|Руководитель|Заместитель)\s*([А-ЯЁа-яё\s,]{0,40}?)",
+                        r"(Генеральный директор|Президент|Председатель правления|Председатель|Директор|Руководитель|Ректор|Заместитель)\s*([А-ЯЁа-яё\s,]{0,40}?)",
                         position_text,
                         flags=re.IGNORECASE,
                     )
@@ -2189,6 +2210,7 @@ class CompanyWebApp:
                     r"Руководитель[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
                     r"Генеральный директор[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
                     r"Директор[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
+                    r"Ректор[^А-ЯЁ]{0,40}([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
                 ]:
                     fio_match = re.search(pattern, page_text)
                     if fio_match:
@@ -2211,7 +2233,7 @@ class CompanyWebApp:
                 profile["ru_position"] = self._normalize_position_ru(chief_title)
             if not profile.get("ru_position"):
                 position_match = re.search(
-                    r"(Президент|Председатель правления|Генеральный директор|Директор|Руководитель)[^\w]{0,30}",
+                    r"(Президент|Председатель правления|Генеральный директор|Директор|Руководитель|Ректор)[^\w]{0,30}",
                     page_text,
                 )
                 if position_match:
@@ -2612,7 +2634,7 @@ class CompanyWebApp:
                     position = leader_position
         if not surname_ru:
             leader_match = re.search(
-                r"(?:Руководитель|Генеральный директор|Президент|Председатель правления)\s*[:—\-]\s*(?!юридического\s+лица|история)([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)",
+                r"(?:Руководитель|Генеральный директор|Президент|Председатель правления|Ректор)\s*[:—\-]\s*(?!юридического\s+лица|история)([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)",
                 text,
                 flags=re.IGNORECASE,
             )
@@ -2622,7 +2644,7 @@ class CompanyWebApp:
                     surname_ru = name_ru = middle_name_ru = ""
         if not position:
             pos_match = re.search(
-                r"(?:Руководитель|Должность)[:\s-]*([А-ЯЁа-яё\s,\-]{5,120})",
+                r"(?:Руководитель|Ректор|Должность)[:\s-]*([А-ЯЁа-яё\s,\-]{5,120})",
                 text,
             )
             if pos_match:
