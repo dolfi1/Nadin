@@ -89,6 +89,8 @@ FIO_STOP_TOKENS = {
     "история",
     "физлиц",
     "проверка",
+    "инвестиции",
+    "мероприятия",
 }
 LEADER_FIO_SOURCE_PRIORITY = {
     "zachestnyibiznes.ru": 1,
@@ -312,7 +314,7 @@ class CompanyWebApp:
         forced_search_type = self._normalize_spaces(str(profile.get("search_type", ""))).lower()
         has_org = bool(self._normalize_spaces(str(profile.get("ru_org", ""))) or self._normalize_spaces(str(profile.get("en_org", ""))))
         if forced_search_type == "company":
-            return COMPANY_SEARCH_REQUIRED_FIELDS
+            return COMPANY_REQUIRED_FIELDS
         if profile_type == "person" and has_org:
             return PERSON_IN_COMPANY_REQUIRED_FIELDS
         if profile_type == "person":
@@ -382,7 +384,8 @@ class CompanyWebApp:
                 if self._rate_limited(environ, "autofill_review", limit=1, window_seconds=10):
                     body, status, headers = "Rate limit exceeded", "429 Too Many Requests", [("Content-Type", "text/plain; charset=utf-8")]
                 else:
-                    body, status, headers = self.autofill_review(form)
+                    wants_json = self._request_wants_json(environ)
+                    body, status, headers = self.autofill_review(form, wants_json=wants_json)
             elif path == "/autofill/confirm" and method == "POST":
                 body, status, headers = self.autofill_confirm(form)
             elif path == "/create/manual" and method == "GET":
@@ -416,6 +419,21 @@ class CompanyWebApp:
         length = int(environ.get("CONTENT_LENGTH") or 0)
         body = environ["wsgi.input"].read(length).decode("utf-8") if length else ""
         return parse_qs(body)
+
+    def _request_wants_json(self, environ: dict[str, Any]) -> bool:
+        accept = (environ.get("HTTP_ACCEPT") or "").lower()
+        requested_with = (environ.get("HTTP_X_REQUESTED_WITH") or "").lower()
+        content_type = (environ.get("CONTENT_TYPE") or "").lower()
+        return "application/json" in accept or requested_with == "xmlhttprequest" or "application/json" in content_type
+
+    def _autofill_redirect_response(self, location: str, *, wants_json: bool) -> tuple[str, str, list[tuple[str, str]]]:
+        if not wants_json:
+            return "", "302 Found", [("Location", location)]
+        card_match = re.fullmatch(r"/card/(\d+)", location)
+        payload: dict[str, Any] = {"ok": bool(card_match), "redirect": location}
+        if card_match:
+            payload["card_id"] = int(card_match.group(1))
+        return json.dumps(payload, ensure_ascii=False), "200 OK", [("Content-Type", "application/json; charset=utf-8")]
 
     def _get_one(self, data: dict[str, list[str]], key: str) -> str:
         return (data.get(key) or [""])[0]
@@ -3803,7 +3821,7 @@ class CompanyWebApp:
         body = self._page("Карточки компаний/участников", content)
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
-    def autofill_review(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
+    def autofill_review(self, form: dict[str, list[str]], *, wants_json: bool = False) -> tuple[str, str, list[tuple[str, str]]]:
         raw = self._get_one(form, "company_name")
         hit_type = self._normalize_spaces(self._get_one(form, "hit_type")).lower()
         forced_search_type = self._normalize_spaces(self._get_one(form, "search_type")).lower()
@@ -3824,7 +3842,7 @@ class CompanyWebApp:
                 "q": raw,
                 "error": "Ничего не найдено: укажите минимум имя и фамилию",
             }
-            response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
+            response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
             with self._active_searches_lock:
                     self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
             return response
@@ -3855,7 +3873,7 @@ class CompanyWebApp:
             source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
             effective_hit_type = hit_type if hit_type in {"company", "person"} else ""
             if not effective_hit_type and forced_search_type in {"company", "person"}:
-                effective_hit_type = "person" if forced_search_type == "company" else forced_search_type
+                effective_hit_type = forced_search_type
             if not effective_hit_type and source_hits:
                 first_hit_type = self._normalize_spaces(str(source_hits[0].get("type", ""))).lower()
                 if first_hit_type in {"company", "person"}:
@@ -3882,7 +3900,7 @@ class CompanyWebApp:
                         extracted_data[field] = value
             profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type, forced_type=effective_hit_type)
             if effective_hit_type in {"company", "person"}:
-                profile["type"] = "person" if forced_search_type == "company" else effective_hit_type
+                profile["type"] = effective_hit_type
             if forced_search_type in {"company", "person"}:
                 profile["search_type"] = forced_search_type
             for key, value in extracted_data.items():
@@ -3972,7 +3990,7 @@ class CompanyWebApp:
             if forced_search_type == "person" and not (self._normalize_spaces(profile.get("surname_ru", "")) and self._normalize_spaces(profile.get("name_ru", ""))):
                 logger.info("autocreate_skipped: reason=invalid_fields details=person_without_name")
                 manual_payload["error"] = "Ничего не найдено: укажите минимум имя и фамилию"
-                response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
+                response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
                 with self._active_searches_lock:
                     self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
@@ -3980,7 +3998,7 @@ class CompanyWebApp:
             if self._is_garbage_org_title(profile.get("ru_org", ""), raw):
                 logger.info("autocreate_skipped: reason=garbage_title")
                 manual_payload["error"] = "Нужно уточнить: добавьте ИНН или корректное название организации"
-                response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
+                response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
                 with self._active_searches_lock:
                     self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
@@ -3988,7 +4006,7 @@ class CompanyWebApp:
             if self._detect_profile_type(profile) == "company" and not self._normalize_spaces(profile.get("inn", "")):
                 logger.info("autocreate_skipped: reason=low_confidence details=company_without_inn")
                 manual_payload["error"] = "Нужно уточнить: добавьте ИНН или ОГРН"
-                response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
+                response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
                 with self._active_searches_lock:
                     self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
@@ -3999,11 +4017,8 @@ class CompanyWebApp:
             logger.info("autofill.missing_fields=%s", ", ".join(missing_fields) if missing_fields else "none")
             if missing_fields:
                 logger.info("autocreate_skipped: reason=invalid_fields missing=%s", ",".join(missing_fields))
-                if forced_search_type == "company" and ({"surname_ru", "name_ru"} & set(missing_fields)):
-                    manual_payload["error"] = "Не найден руководитель компании, уточните/выберите из списка"
-                else:
-                    manual_payload["error"] = f"Заполните обязательные поля: {', '.join(missing_fields)}"
-                response = ("", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")])
+                manual_payload["error"] = f"Заполните обязательные поля: {', '.join(missing_fields)}"
+                response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
             else:
                 logger.info("Все обязательные поля заполнены! Создаем карточку автоматически.")
                 card_obj = Card.from_profile(profile)
@@ -4012,10 +4027,9 @@ class CompanyWebApp:
                 profile["middle_name_en"] = ""
                 card_id = self._create_autofill_card(profile, notes, source_hits, search_trace, field_sources)
                 logger.info("Карточка #%d создана автоматически", card_id)
-                response = ("", "302 Found", [("Location", f"/card/{card_id}")])
+                response = self._autofill_redirect_response(f"/card/{card_id}", wants_json=wants_json)
             with self._active_searches_lock:
-                with self._active_searches_lock:
-                    self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+                self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
             return response
         finally:
             with self._active_searches_lock:

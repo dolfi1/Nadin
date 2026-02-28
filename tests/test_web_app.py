@@ -231,6 +231,81 @@ def test_autofill_review_uses_source_hits_when_profile_builder_misses_fields(tmp
     assert location.startswith("/create/manual")
 
 
+def test_autofill_review_returns_json_redirect_for_xhr(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(app, "_search_external_sources", lambda *_args, **_kwargs: ([], []))
+    monkeypatch.setattr(
+        app,
+        "_build_profile_from_sources",
+        lambda *_args, **_kwargs: (
+            {
+                "title": "",
+                "appeal": "",
+                "family_name": "",
+                "first_name": "",
+                "middle_name_en": "",
+                "surname_ru": "",
+                "name_ru": "",
+                "middle_name_ru": "",
+                "gender": "",
+                "inn": "7707083893",
+                "ru_org": "ПАО Сбербанк",
+                "en_org": "Sberbank PJSC",
+                "ru_position": "",
+                "position": "",
+                "en_position": "",
+                "type": "company",
+            },
+            {},
+        ),
+    )
+
+    body, status, headers = app.autofill_review({"company_name": ["7707083893"]}, wants_json=True)
+
+    assert status == "200 OK"
+    assert dict(headers)["Content-Type"].startswith("application/json")
+    payload = json.loads(body)
+    assert payload["ok"] is True
+    assert payload["redirect"].startswith("/card/")
+    assert isinstance(payload["card_id"], int)
+
+
+def test_autofill_review_company_mode_keeps_company_type(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    monkeypatch.setattr(app, "_search_external_sources", lambda *_args, **_kwargs: ([], []))
+    monkeypatch.setattr(
+        app,
+        "_build_profile_from_sources",
+        lambda *_args, **_kwargs: (
+            {
+                "title": "",
+                "appeal": "",
+                "family_name": "",
+                "first_name": "",
+                "middle_name_en": "",
+                "surname_ru": "",
+                "name_ru": "",
+                "middle_name_ru": "",
+                "gender": "",
+                "inn": "7707083893",
+                "ru_org": "ПАО Сбербанк",
+                "en_org": "Sberbank PJSC",
+                "ru_position": "",
+                "position": "",
+                "en_position": "",
+            },
+            {},
+        ),
+    )
+
+    _body, status, headers = app.autofill_review({"company_name": ["7707083893"], "search_type": ["company"]})
+
+    assert status == "302 Found"
+    assert dict(headers)["Location"].startswith("/card/")
+
+
 def test_build_profile_from_sources_fills_en_org_from_regular_sources(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 

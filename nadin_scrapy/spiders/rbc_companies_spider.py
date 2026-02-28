@@ -19,6 +19,17 @@ class RbcCompaniesSpider(scrapy.Spider):
         yield scrapy.Request(f"https://companies.rbc.ru/search/?query={self.query}", callback=self.parse)
 
     def parse(self, response):
+        card_link = response.css("a[href*='/id/']::attr(href)").get()
+        if card_link:
+            yield response.follow(card_link, callback=self.parse_company_card)
+            return
+
+        yield self._build_item(response)
+
+    def parse_company_card(self, response):
+        yield self._build_item(response)
+
+    def _build_item(self, response):
         card = CompanyLeaderItem()
         card["query_type"] = self.query_type
         card["source_name"] = "companies.rbc.ru"
@@ -51,4 +62,4 @@ class RbcCompaniesSpider(scrapy.Spider):
         ).get("")
         card["confidence"] = 0.7 if card.get("leader_name_ru") else 0.4
         card["review_required"] = not bool(card.get("leader_name_ru"))
-        yield card
+        return card
