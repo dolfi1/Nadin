@@ -647,7 +647,7 @@ def test_build_profile_generates_position_and_middle_name_en(tmp_path):
     profile, _sources = app._build_profile_from_sources(hits, "Греф Герман", web_app.INPUT_TYPE_PERSON_TEXT)
 
     assert profile["position"] == "President, Chairman of the Board"
-    assert profile["middle_name_en"] == ""
+    assert profile["middle_name_en"] == "Oskarovich"
 
 
 def test_search_page_autodetects_person_mode_when_fio_present(tmp_path, monkeypatch):
@@ -1140,7 +1140,7 @@ def test_negative_cache_policy_for_block_and_network(tmp_path):
     assert ttl == 0
 
 
-def test_build_profile_from_sources_keeps_middle_name_en_empty_for_ru_person(tmp_path):
+def test_build_profile_from_sources_generates_middle_name_en_for_ru_person(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
     hits = [
@@ -1163,7 +1163,7 @@ def test_build_profile_from_sources_keeps_middle_name_en_empty_for_ru_person(tmp
 
     assert profile["family_name"] == "Gref"
     assert profile["first_name"] == "German"
-    assert profile["middle_name_en"] == ""
+    assert profile["middle_name_en"] == "Oskarovich"
 
 
 
