@@ -533,6 +533,64 @@ class CompanyWebApp:
     def _clean_ru_org_name(self, value: str) -> str:
         return re.sub(r"^Организация\s+", "", self._normalize_spaces(value), flags=re.IGNORECASE).strip()
 
+    def _dict_get_path(self, payload: Any, *path: str) -> Any:
+        current: Any = payload
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                return None
+            current = current[key]
+        return current
+
+    def _pick_fns_ru_org_full(self, fns_svyl: dict[str, Any], fallback_name: str = "") -> str:
+        if not isinstance(fns_svyl, dict):
+            return self._normalize_spaces(fallback_name)
+
+        naim = fns_svyl.get("СвНаимЮЛ") or {}
+        if not isinstance(naim, dict):
+            naim = {}
+
+        full_name = (
+            self._dict_get_path(naim, "СвНаимЮЛПолн", "@attributes", "НаимПолн")
+            or self._dict_get_path(naim, "СвНаимЮЛПолн", "НаимПолн")
+            or self._dict_get_path(naim, "@attributes", "НаимПолн")
+            or naim.get("НаимПолн")
+            or fns_svyl.get("НаимПолн")
+        )
+        short_name = (
+            self._dict_get_path(naim, "СвНаимЮЛСокр", "@attributes", "НаимСокр")
+            or self._dict_get_path(naim, "СвНаимЮЛСокр", "НаимСокр")
+            or self._dict_get_path(naim, "@attributes", "НаимСокр")
+            or naim.get("НаимСокр")
+            or fns_svyl.get("НаимСокр")
+        )
+
+        name = full_name or short_name or fallback_name
+        if not self._normalize_spaces(str(name)):
+            return ""
+
+        normalized_name = str(name).strip().strip('"').strip("«»").strip()
+
+        opf_container = fns_svyl.get("СвОбрЮЛ") or {}
+        if not isinstance(opf_container, dict):
+            opf_container = {}
+        opf_value = (
+            self._dict_get_path(opf_container, "@attributes", "НаимОПФ")
+            or self._dict_get_path(opf_container, "ОПФ", "@attributes", "НаимОПФ")
+            or opf_container.get("НаимОПФ")
+        )
+        if opf_value:
+            opf_text = str(opf_value).strip()
+            opf_map = {
+                "АКЦИОНЕРНОЕ ОБЩЕСТВО": "АО",
+                "ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО": "ПАО",
+                "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ": "ООО",
+            }
+            opf_short = opf_map.get(opf_text.upper(), opf_text)
+            if not normalized_name.upper().endswith((" ООО", " АО", " ПАО", " ЗАО", " НКО", " ИП")):
+                normalized_name = f"{normalized_name} {opf_short}".strip()
+
+        return self._normalize_spaces(normalized_name)
+
     def _is_garbage_org_title(self, title: str, raw_query: str = "") -> bool:
         normalized_title = self._normalize_spaces(title).lower()
         normalized_query = self._normalize_spaces(raw_query).lower()
@@ -1984,6 +2042,7 @@ class CompanyWebApp:
                     data,
                     {"НаимПолн", "НаимСокр", "ПолнНаим", "КраткНаим", "Name", "name", "ru_org"},
                 )
+            ru_org_raw = self._pick_fns_ru_org_full(sv_yul, str(ru_org_raw or "")) or ru_org_raw
             ru_org = self._clean_ru_org_name(str(ru_org_raw).replace("ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "ПАО"))
             if ru_org:
                 ru_org, _ = self.normalize_ru_org(ru_org)
@@ -3285,7 +3344,7 @@ class CompanyWebApp:
         if data.get("ru_position") and not data.get("position") and not data.get("en_position"):
             data["position"] = self._generate_en_position(str(data["ru_position"]))
         if data.get("middle_name_ru") and not data.get("middle_name_en"):
-            data["middle_name_en"] = self._translit(str(data["middle_name_ru"]))
+            data["middle_name_en"] = self._generate_middle_name_en(str(data["middle_name_ru"]))
         if data.get("gender") and not data.get("appeal"):
             data["appeal"] = "Г-н" if data["gender"] == "М" else "Г-жа"
         if data.get("ru_org") and "Сбербанк" in str(data["ru_org"]) and "ПАО" not in str(data["ru_org"]):
@@ -3299,9 +3358,9 @@ class CompanyWebApp:
                 field_sources.setdefault("en_position", "Автогенерация из RU")
         if not profile.get("middle_name_en"):
             if profile.get("middle_name"):
-                profile["middle_name_en"] = self._translit(profile["middle_name"])
+                profile["middle_name_en"] = self._generate_middle_name_en(profile["middle_name"])
             elif profile.get("middle_name_ru"):
-                profile["middle_name_en"] = self._translit(profile["middle_name_ru"])
+                profile["middle_name_en"] = self._generate_middle_name_en(profile["middle_name_ru"])
         if not profile.get("appeal") and profile.get("gender"):
             profile["appeal"] = "Г-н" if profile["gender"] == "М" else "Г-жа"
             field_sources.setdefault("appeal", "Автоопределение")
@@ -3619,9 +3678,9 @@ class CompanyWebApp:
 
         if not profile.get("middle_name_en"):
             if profile.get("middle_name"):
-                profile["middle_name_en"] = self._translit(profile["middle_name"])
+                profile["middle_name_en"] = self._generate_middle_name_en(profile["middle_name"])
             elif profile.get("middle_name_ru"):
-                profile["middle_name_en"] = self._translit(profile["middle_name_ru"])
+                profile["middle_name_en"] = self._generate_middle_name_en(profile["middle_name_ru"])
 
         if not profile.get("family_name") and profile.get("surname"):
             profile["family_name"] = self._translit(profile["surname"])
