@@ -352,6 +352,28 @@ def test_parse_rusprofile_company_page_extracts_leader_position(tmp_path, monkey
 
 
 
+
+
+def test_parse_rusprofile_company_page_extracts_rector_position_and_fio(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_fetch_page(*_args, **_kwargs):
+        return (
+            "<html><body>"
+            "<h1>ФГАОУ ВО Тюменский государственный университет</h1>"
+            "ИНН 7202010861"
+            "<div>Ректор Иванов Иван Иванович</div>"
+            "</body></html>"
+        )
+
+    monkeypatch.setattr(app, "_fetch_page", fake_fetch_page)
+
+    data = app._parse_rusprofile("https://www.rusprofile.ru/id/7202010861")
+
+    assert data["surname_ru"] == "Иванов"
+    assert data["name_ru"] == "Иван"
+    assert data["middle_name_ru"] == "Иванович"
+    assert data["ru_position"] == "Ректор"
 def test_parse_rusprofile_company_page_extracts_from_meta_keywords_and_chief_title(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
@@ -1355,6 +1377,34 @@ def test_block_page_values_ignored_in_profile_merge(tmp_path):
     assert profile["ru_org"] == "Тюменский государственный университет ФГАОУ ВО"
 
 
+
+
+def test_parse_egrul_extracts_fio_from_sv_dolzhn_fl_variant(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_get(url, **_kwargs):
+        assert url == "https://egrul.itsoft.ru/7202010861.json"
+        return FakeResponse(
+            json_data={
+                "СвЮЛ": {"НаимСокр": "ФГАОУ ВО Тюменский государственный университет", "ИННЮЛ": "7202010861"},
+                "СвДолжнФЛ": [
+                    {
+                        "ФИО": "Иванов Иван Иванович",
+                        "Должность": "Ректор",
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr(web_app.requests, "get", fake_get)
+
+    data = app._parse_egrul("7202010861")
+
+    assert data is not None
+    assert data["surname_ru"] == "Иванов"
+    assert data["name_ru"] == "Иван"
+    assert data["middle_name_ru"] == "Иванович"
+    assert data["ru_position"] == "Ректор"
 def test_parse_egrul_extracts_fio_from_nested_leader_block(tmp_path, monkeypatch):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
