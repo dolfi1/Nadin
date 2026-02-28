@@ -1429,3 +1429,78 @@ def test_parse_egrul_extracts_fio_from_nested_leader_block(tmp_path, monkeypatch
     assert data["name_ru"] == "Петр"
     assert data["middle_name_ru"] == "Петрович"
     assert data["ru_position"] == "Генеральный директор"
+
+
+def test_detect_profile_type_person_in_company_when_person_and_org_present(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    profile_type = app._detect_profile_type({
+        "surname_ru": "Греф",
+        "name_ru": "Герман",
+        "ru_org": "ПАО Сбербанк",
+    })
+
+    assert profile_type == "person_in_company"
+    assert app._required_fields_for_profile({
+        "surname_ru": "Греф",
+        "name_ru": "Герман",
+        "ru_org": "ПАО Сбербанк",
+    }) == web_app.PERSON_IN_COMPANY_REQUIRED_FIELDS
+
+
+def test_build_profile_cleans_noisy_fio_and_keeps_valid_name(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    source_hits = [
+        {
+            "source": "zachestnyibiznes.ru",
+            "type": "company",
+            "data": {
+                "surname_ru": "Романчук",
+                "name_ru": "Иван",
+                "middle_name_ru": "Сергеевич проверить",
+                "ru_org": "ООО Ромашка",
+                "inn": "7707083893",
+            },
+        }
+    ]
+
+    profile, _sources = app._build_profile_from_sources(source_hits, "Ромашка", web_app.INPUT_TYPE_ORG_TEXT, forced_type="person")
+
+    assert profile["surname_ru"] == "Романчук"
+    assert profile["name_ru"] == "Иван"
+    assert profile["middle_name_ru"] == "Сергеевич"
+    assert profile["surname"] == "Романчук"
+    assert profile["name"] == "Иван"
+    assert profile["family_name"]
+    assert profile["first_name"]
+
+
+def test_build_profile_position_prefers_fns_when_current_position_is_noise(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    source_hits = [
+        {
+            "source": "zachestnyibiznes.ru",
+            "type": "company",
+            "data": {
+                "ru_position": "Юридического лица история проверить",
+                "ru_org": "ООО Ромашка",
+                "inn": "7707083893",
+            },
+        },
+        {
+            "source": "ФНС ЕГРЮЛ",
+            "type": "company",
+            "data": {
+                "ru_position": "Ректор",
+                "ru_org": "ООО Ромашка",
+                "inn": "7707083893",
+            },
+        },
+    ]
+
+    profile, sources = app._build_profile_from_sources(source_hits, "7707083893", web_app.INPUT_TYPE_INN, forced_type="company")
+
+    assert profile["ru_position"] == "Ректор"
+    assert sources["ru_position"] == "ФНС ЕГРЮЛ"

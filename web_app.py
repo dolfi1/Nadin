@@ -327,11 +327,13 @@ class CompanyWebApp:
 
     def _detect_profile_type(self, profile: dict[str, Any]) -> str:
         explicit_type = self._normalize_spaces(str(profile.get("type", ""))).lower()
-        if explicit_type in {"person", "company"}:
+        if explicit_type in {"person", "company", "person_in_company"}:
             return explicit_type
         has_person_name = bool(self._normalize_spaces(str(profile.get("surname_ru", ""))) and self._normalize_spaces(str(profile.get("name_ru", ""))))
         has_org_name = bool(self._normalize_spaces(str(profile.get("ru_org", ""))) or self._normalize_spaces(str(profile.get("en_org", ""))))
-        if has_person_name and not has_org_name:
+        if has_person_name and has_org_name:
+            return "person_in_company"
+        if has_person_name:
             return "person"
         return "company"
 
@@ -341,6 +343,8 @@ class CompanyWebApp:
         has_org = bool(self._normalize_spaces(str(profile.get("ru_org", ""))) or self._normalize_spaces(str(profile.get("en_org", ""))))
         if forced_search_type == "company":
             return COMPANY_REQUIRED_FIELDS
+        if profile_type == "person_in_company":
+            return PERSON_IN_COMPANY_REQUIRED_FIELDS
         if profile_type == "person" and has_org:
             return PERSON_IN_COMPANY_REQUIRED_FIELDS
         if profile_type == "person":
@@ -579,6 +583,22 @@ class CompanyWebApp:
         letters_count = len(re.findall(r"[А-Яа-яЁё]", token))
         return letters_count >= min_len
 
+    def _clean_fio_part(self, value: str) -> str:
+        cleaned = self._normalize_spaces(str(value or ""))
+        if not cleaned:
+            return ""
+        tokens = re.findall(r"[А-Яа-яЁё\-]+", cleaned)
+        for token in tokens:
+            normalized = token.lower()
+            if normalized in FIO_STOP_TOKENS:
+                continue
+            return token.capitalize()
+        return ""
+
+    def _sanitize_profile_fio(self, profile: dict[str, Any]) -> None:
+        for field in ("surname_ru", "name_ru", "middle_name_ru"):
+            profile[field] = self._clean_fio_part(str(profile.get(field, "")))
+
     def _is_valid_leader_fio(self, surname_ru: str, name_ru: str, middle_name_ru: str = "") -> bool:
         if not (self._valid_fio_part(surname_ru, min_len=3) and self._valid_fio_part(name_ru, min_len=2)):
             return False
@@ -598,9 +618,9 @@ class CompanyWebApp:
             if not isinstance(raw_data, dict):
                 continue
             data = self._enrich_alternative_person_fields(dict(raw_data))
-            surname_ru = self._normalize_spaces(str(data.get("surname_ru", "")))
-            name_ru = self._normalize_spaces(str(data.get("name_ru", "")))
-            middle_name_ru = self._normalize_spaces(str(data.get("middle_name_ru", "")))
+            surname_ru = self._clean_fio_part(str(data.get("surname_ru", "")))
+            name_ru = self._clean_fio_part(str(data.get("name_ru", "")))
+            middle_name_ru = self._clean_fio_part(str(data.get("middle_name_ru", "")))
             if self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
                 return surname_ru, name_ru, middle_name_ru, source_name
         return "", "", "", ""
@@ -705,6 +725,43 @@ class CompanyWebApp:
         if not re.fullmatch(r"[А-Яа-яЁё\-\s,]+", cleaned):
             return None
         return cleaned
+
+    def _sanitize_profile_position(self, profile: dict[str, str], source_hits: list[dict[str, Any]], field_sources: dict[str, str]) -> None:
+        def _clean_candidate(value: str) -> str:
+            cleaned = self._normalize_spaces(str(value or ""))
+            if not cleaned or len(cleaned) > 100:
+                return ""
+            lowered = cleaned.lower()
+            if any(marker in lowered for marker in POSITION_NOISE_MARKERS):
+                return ""
+            if re.search(r"\b[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\b", cleaned):
+                return ""
+            if re.search(r"\d", cleaned):
+                return ""
+            if not re.fullmatch(r"[А-Яа-яЁё\-\s,]+", cleaned):
+                return ""
+            return cleaned
+
+        current_position = _clean_candidate(profile.get("ru_position", ""))
+        if current_position:
+            profile["ru_position"] = current_position
+            return
+
+        source_priority = ["ФНС ЕГРЮЛ", "zachestnyibiznes.ru"]
+        for source_name in source_priority:
+            for hit in source_hits:
+                if hit.get("source") != source_name:
+                    continue
+                data = hit.get("data", {})
+                if not isinstance(data, dict):
+                    continue
+                candidate = _clean_candidate(str(data.get("ru_position", "") or data.get("position", "")))
+                if candidate:
+                    profile["ru_position"] = candidate
+                    field_sources["ru_position"] = source_name
+                    return
+
+        profile["ru_position"] = ""
 
     def _normalize_positions_ru(self, raw: str) -> tuple[str, list[str]]:
         notes: list[str] = []
@@ -3421,9 +3478,15 @@ class CompanyWebApp:
             if profile["en_org"] and not field_sources.get("en_org"):
                 field_sources["en_org"] = "Нормализация/источник"
 
-        if profile.get("surname_ru") or profile.get("name_ru"):
-            profile["family_name"] = profile.get("family_name") or self._translit(profile.get("surname_ru", ""))
-            profile["first_name"] = profile.get("first_name") or self._translit(profile.get("name_ru", ""))
+        self._sanitize_profile_fio(profile)
+        if profile.get("surname_ru") and not profile.get("surname"):
+            profile["surname"] = profile["surname_ru"]
+        if profile.get("name_ru") and not profile.get("name"):
+            profile["name"] = profile["name_ru"]
+
+        if profile.get("surname") or profile.get("name"):
+            profile["family_name"] = profile.get("family_name") or self._translit(profile.get("surname", ""))
+            profile["first_name"] = profile.get("first_name") or self._translit(profile.get("name", ""))
             if profile.get("family_name"):
                 field_sources.setdefault("family_name", "Транслитерация из Фамилия")
             if profile.get("first_name"):
@@ -3433,18 +3496,21 @@ class CompanyWebApp:
             raw_tokens = [tok for tok in self._normalize_spaces(raw_name).split() if tok]
             if len(raw_tokens) >= 2:
                 sur, nam, patr = self._split_fio_ru(raw_name)
-                profile["surname_ru"] = sur
-                profile["name_ru"] = nam
-                profile["middle_name_ru"] = patr
-                if sur:
-                    profile["family_name"] = self._translit(sur)
-                if nam:
-                    profile["first_name"] = self._translit(nam)
+                profile["surname_ru"] = self._clean_fio_part(sur)
+                profile["name_ru"] = self._clean_fio_part(nam)
+                profile["middle_name_ru"] = self._clean_fio_part(patr)
+                if profile["surname_ru"]:
+                    profile["surname"] = profile["surname_ru"]
+                    profile["family_name"] = self._translit(profile["surname_ru"])
+                if profile["name_ru"]:
+                    profile["name"] = profile["name_ru"]
+                    profile["first_name"] = self._translit(profile["name_ru"])
 
+        self._sanitize_profile_fio(profile)
         if profile.get("surname_ru") or profile.get("name_ru"):
             if not self._is_valid_leader_fio(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")):
                 logger.warning("invalid_fio_rejected: surname=%s name=%s source=%s", profile.get("surname_ru", ""), profile.get("name_ru", ""), field_sources.get("surname_ru", ""))
-                for field in ("surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name"):
+                for field in ("surname_ru", "name_ru", "middle_name_ru", "surname", "name", "family_name", "first_name"):
                     profile[field] = ""
                     field_sources.pop(field, None)
 
@@ -3462,6 +3528,7 @@ class CompanyWebApp:
 
         if not profile.get("appeal"):
             profile["appeal"] = self._derive_salutation(profile.get("gender", ""))
+        self._sanitize_profile_position(profile, source_hits, field_sources)
         profile["ru_position"], _ = self._normalize_positions_ru(profile.get("ru_position", ""))
         if not profile.get("position") and not profile.get("en_position") and profile.get("ru_position"):
             profile["position"] = self._generate_en_position(profile["ru_position"])
@@ -3488,11 +3555,16 @@ class CompanyWebApp:
             if profile["appeal"]:
                 field_sources.setdefault("appeal", "Автоопределение")
 
-        if not profile.get("family_name") and profile.get("surname_ru"):
-            profile["family_name"] = self._translit(profile["surname_ru"])
+        if profile.get("surname_ru") and not profile.get("surname"):
+            profile["surname"] = profile["surname_ru"]
+        if profile.get("name_ru") and not profile.get("name"):
+            profile["name"] = profile["name_ru"]
+
+        if not profile.get("family_name") and profile.get("surname"):
+            profile["family_name"] = self._translit(profile["surname"])
             field_sources.setdefault("family_name", "Транслитерация из Фамилия")
-        if not profile.get("first_name") and profile.get("name_ru"):
-            profile["first_name"] = self._translit(profile["name_ru"])
+        if not profile.get("first_name") and profile.get("name"):
+            profile["first_name"] = self._translit(profile["name"])
             field_sources.setdefault("first_name", "Транслитерация из Имя")
         profile["middle_name_en"] = ""
         profile["inn_or_ogrn"] = profile.get("inn") or profile.get("ogrn") or ""
@@ -4122,6 +4194,7 @@ class CompanyWebApp:
                 field_sources[key] = "Источник данных"
 
             candidate_sur, candidate_nam, candidate_pat, candidate_source = self._pick_best_leader_fio(source_hits)
+            self._sanitize_profile_fio(profile)
             current_sur = self._normalize_spaces(profile.get("surname_ru", ""))
             current_nam = self._normalize_spaces(profile.get("name_ru", ""))
             current_pat = self._normalize_spaces(profile.get("middle_name_ru", ""))
@@ -4142,7 +4215,7 @@ class CompanyWebApp:
             if (profile.get("surname_ru") or profile.get("name_ru")) and not self._is_valid_leader_fio(
                 profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")
             ):
-                for field in ("surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name"):
+                for field in ("surname_ru", "name_ru", "middle_name_ru", "surname", "name", "family_name", "first_name"):
                     profile[field] = ""
                     field_sources.pop(field, None)
 
