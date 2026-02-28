@@ -38,7 +38,7 @@ from socketserver import ThreadingMixIn
 from wsgiref.simple_server import WSGIServer, make_server
 
 from card_bot import Card
-from constants import PASSPORT_MAP, RU_TO_EN_OPF
+from constants import PASSPORT_MAP, POSITION_TRANSLATIONS, RU_TO_EN_OPF
 from scrape_client import ScrapeClient
 try:
     from nadin_scrapy.service import merge_provider_payloads as scrapy_merge_provider_payloads
@@ -254,6 +254,13 @@ POSITION_NOISE_MARKERS = {
     "результат",
     "подробнее",
 }
+
+
+def _clean_fio_part(s: str) -> str:
+    if not s:
+        return ""
+    tokens = re.findall(r"[А-Яа-яЁё-]+", s)
+    return tokens[0] if tokens else ""
 
 
 class CompanyWebApp:
@@ -584,16 +591,7 @@ class CompanyWebApp:
         return letters_count >= min_len
 
     def _clean_fio_part(self, value: str) -> str:
-        cleaned = self._normalize_spaces(str(value or ""))
-        if not cleaned:
-            return ""
-        tokens = re.findall(r"[А-Яа-яЁё\-]+", cleaned)
-        for token in tokens:
-            normalized = token.lower()
-            if normalized in FIO_STOP_TOKENS:
-                continue
-            return token.capitalize()
-        return ""
+        return _clean_fio_part(self._normalize_spaces(str(value or "")))
 
     def _sanitize_profile_fio(self, profile: dict[str, Any]) -> None:
         for field in ("surname_ru", "name_ru", "middle_name_ru"):
@@ -3506,7 +3504,9 @@ class CompanyWebApp:
                     profile["name"] = profile["name_ru"]
                     profile["first_name"] = self._translit(profile["name_ru"])
 
-        self._sanitize_profile_fio(profile)
+        profile["surname_ru"] = _clean_fio_part(profile.get("surname_ru", ""))
+        profile["name_ru"] = _clean_fio_part(profile.get("name_ru", ""))
+        profile["middle_name_ru"] = _clean_fio_part(profile.get("middle_name_ru", ""))
         if profile.get("surname_ru") or profile.get("name_ru"):
             if not self._is_valid_leader_fio(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")):
                 logger.warning("invalid_fio_rejected: surname=%s name=%s source=%s", profile.get("surname_ru", ""), profile.get("name_ru", ""), field_sources.get("surname_ru", ""))
@@ -3530,14 +3530,22 @@ class CompanyWebApp:
             profile["appeal"] = self._derive_salutation(profile.get("gender", ""))
         self._sanitize_profile_position(profile, source_hits, field_sources)
         profile["ru_position"], _ = self._normalize_positions_ru(profile.get("ru_position", ""))
-        if not profile.get("position") and not profile.get("en_position") and profile.get("ru_position"):
-            profile["position"] = self._generate_en_position(profile["ru_position"])
-            field_sources["position"] = field_sources.get("position", "Автоперевод из Должность")
-        profile["position"], _ = self._normalize_positions_en(profile.get("position", profile.get("en_position", "")))
+
+        ru_pos = profile.get("ru_position", "").strip()
+        noise_markers = ["юридического лица", "история", "проверить"]
+        if any(marker in ru_pos.lower() for marker in noise_markers):
+            ru_pos = ""
+        profile["ru_position"] = ru_pos
+
+        if ru_pos in POSITION_TRANSLATIONS:
+            profile["en_position"] = POSITION_TRANSLATIONS[ru_pos]
+        else:
+            profile["en_position"] = self._transliterate_ru_to_en(ru_pos) if ru_pos else ""
+        profile["position"] = profile["en_position"]
+        profile["position"], _ = self._normalize_positions_en(profile.get("position", ""))
+        profile["en_position"] = profile.get("position", "")
         profile["middle_name_en"] = ""
         profile["salutation"] = profile.get("appeal", "")
-        if not profile.get("en_position"):
-            profile["en_position"] = profile.get("position", "")
 
 
         profile = self._normalize_card_data(profile, field_sources)
@@ -3559,6 +3567,8 @@ class CompanyWebApp:
             profile["surname"] = profile["surname_ru"]
         if profile.get("name_ru") and not profile.get("name"):
             profile["name"] = profile["name_ru"]
+        if profile.get("middle_name_ru") and not profile.get("middle_name"):
+            profile["middle_name"] = profile["middle_name_ru"]
 
         if not profile.get("family_name") and profile.get("surname"):
             profile["family_name"] = self._translit(profile["surname"])
