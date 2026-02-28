@@ -143,6 +143,98 @@ RUSPROFILE_NOISE_RE = re.compile(
 )
 GARBAGE_ORG_TITLES = {"результаты поиска", "поиск", "search results"}
 
+EN_LOWER_WORDS = {
+    "a", "an", "and", "as", "at", "by", "de", "del", "der", "di", "do", "du",
+    "for", "from", "in", "la", "le", "of", "on", "or", "the", "to", "von", "vs",
+}
+THE_PREFIX_RE = re.compile(r"^\s*the\s+", re.IGNORECASE)
+PUNCT_STRIP_RE = re.compile(r"[\"'“”„«»()\[\]{}.,]")
+SPACES_RE = re.compile(r"\s+")
+DASH_RE = re.compile(r"\s*-\s*")
+ABBR_TAIL_RE = re.compile(r"\b[А-ЯA-Z0-9]{2,8}\b$")
+POSITION_NOISE_RE = re.compile(
+    r"(история|провер(ить|ка)|юридическ(ого|ое)\s+лица|сведения|карточк)",
+    re.IGNORECASE,
+)
+POSITION_WHITELIST_RE = re.compile(
+    r"^(генеральный директор|директор|президент|председатель|ректор|декан|"
+    r"исполнительный директор|управляющий|председатель правления|"
+    r"главный исполнительный директор|chief executive officer|ceo|chairman)$",
+    re.IGNORECASE,
+)
+
+
+def strip_diacritics(s: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+
+def cleanup_ru_org(raw: str) -> str:
+    if not raw:
+        return raw
+    s = raw.strip()
+    s = PUNCT_STRIP_RE.sub(" ", s)
+    parts = [p.strip() for p in re.split(r"\s{2,}|(?:\s+-\s+)|(?:\s+\bИНН\b\s+)|(?:\s+\bОГРН\b\s+)", s) if p.strip()]
+    if parts:
+        s = parts[0]
+    s = SPACES_RE.sub(" ", s).strip()
+    s = re.sub(r"\b[А-ЯA-Z]{2,8}\b$", "", s).strip()
+    s = " ".join(w[:1].upper() + w[1:] if w else "" for w in s.split())
+    return s.strip()
+
+
+def titlecase_en_name(name: str) -> str:
+    words = name.split()
+    out: list[str] = []
+    for i, w in enumerate(words):
+        wl = w.lower()
+        if i > 0 and wl in EN_LOWER_WORDS:
+            out.append(wl)
+        else:
+            out.append(w[:1].upper() + w[1:].lower() if w else w)
+    return " ".join(out)
+
+
+def cleanup_en_org(raw: str) -> str:
+    if not raw:
+        return raw
+    s = raw.strip()
+    s = strip_diacritics(s)
+    s = THE_PREFIX_RE.sub("", s).strip()
+    s = PUNCT_STRIP_RE.sub(" ", s)
+    s = DASH_RE.sub("-", s)
+    s = SPACES_RE.sub(" ", s).strip()
+    s = re.sub(r"[^A-Za-z0-9 &\-]", " ", s)
+    s = SPACES_RE.sub(" ", s).strip()
+    s = titlecase_en_name(s)
+    return s
+
+
+def cleanup_position_ru(raw: str) -> str:
+    if not raw:
+        return raw
+    s = SPACES_RE.sub(" ", raw).strip()
+    if POSITION_NOISE_RE.search(s) and not POSITION_WHITELIST_RE.match(s):
+        return ""
+    s = re.split(r"\b(история|проверить|проверка)\b", s, flags=re.IGNORECASE)[0].strip()
+    if len(s) > 80 and not POSITION_WHITELIST_RE.match(s):
+        s = s[:80].rsplit(" ", 1)[0].strip()
+    return s
+
+
+def apply_card_rules(profile: dict[str, Any]) -> dict[str, Any]:
+    profile["ru_org"] = cleanup_ru_org(str(profile.get("ru_org", "") or ""))
+    profile["en_org"] = cleanup_en_org(str(profile.get("en_org", "") or ""))
+    profile["ru_position"] = cleanup_position_ru(str(profile.get("ru_position", "") or ""))
+    if not profile.get("en_position") and profile.get("ru_position"):
+        try:
+            profile["en_position"] = cleanup_en_org(str(profile["ru_position"]))
+        except Exception:
+            profile["en_position"] = ""
+    if profile.get("en_org") and ABBR_TAIL_RE.search(str(profile["en_org"])):
+        profile["en_org"] = re.sub(r"\s+\b[A-Z0-9]{2,8}\b$", "", str(profile["en_org"])).strip()
+    return profile
+
 
 def is_person_query(raw: str) -> bool:
     """Определяет, является ли запрос по человеку (ФИО, ИНН 12 цифр, URL /person/)."""
@@ -4021,6 +4113,7 @@ class CompanyWebApp:
                 response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
             else:
                 logger.info("Все обязательные поля заполнены! Создаем карточку автоматически.")
+                profile = apply_card_rules(profile)
                 card_obj = Card.from_profile(profile)
                 profile["family_name"] = card_obj.family_name or profile.get("family_name", "")
                 profile["first_name"] = card_obj.first_name or profile.get("first_name", "")
@@ -4089,6 +4182,7 @@ class CompanyWebApp:
             params["error"] = f"Заполните обязательные поля: {', '.join(missing_fields)}"
             return "", "302 Found", [("Location", f"/create/manual?{urlencode(params)}")]
 
+        profile_data = apply_card_rules(profile_data)
         card_obj = Card.from_profile(profile_data)
         profile_data["family_name"] = card_obj.family_name or profile_data.get("family_name", "")
         profile_data["first_name"] = card_obj.first_name or profile_data.get("first_name", "")
@@ -4244,6 +4338,7 @@ class CompanyWebApp:
                 params[f"profile_{key}"] = value
             return "", "302 Found", [("Location", f"/create/manual?{urlencode(params)}")]
 
+        profile = apply_card_rules(profile)
         card_obj = Card.from_profile(profile)
         profile["family_name"] = card_obj.family_name or profile["family_name"]
         profile["first_name"] = card_obj.first_name or profile["first_name"]
