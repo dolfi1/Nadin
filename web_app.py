@@ -709,13 +709,13 @@ class CompanyWebApp:
         whitelist = (
             ("председатель правления", "Председатель правления"),
             ("генеральный директор", "Генеральный директор"),
+            ("директор", "Директор"),
             ("ректор", "Ректор"),
             ("президент", "Президент"),
-            ("директор", "Директор"),
             ("управляющий", "Управляющий"),
         )
         for needle, canonical in whitelist:
-            if needle in lowered:
+            if re.search(rf"\b{re.escape(needle)}\b", lowered):
                 return canonical
 
         if re.search(r"\d", cleaned):
@@ -913,6 +913,45 @@ class CompanyWebApp:
                     break
             en_positions.append(en_pos or self._transliterate_ru_to_en(pos))
         return ", ".join(en_positions)
+
+    def _detect_org_type(self, ru_org: str) -> str:
+        value = self._normalize_spaces(ru_org).upper()
+        if not value:
+            return "other"
+        school_markers = (
+            "СОШ", "ШКОЛ", "ЛИЦЕЙ", "ГИМНАЗ", "ДЕТСК", "МАОУ", "МБОУ", "МКОУ", "ДОУ",
+        )
+        university_markers = (
+            "УНИВЕРСИТЕТ", "ИНСТИТУТ", "АКАДЕМИ", "ФГАОУ ВО", "ФГБОУ ВО", "НИТУ", "ВПО",
+        )
+        if any(marker in value for marker in school_markers):
+            return "school"
+        if any(marker in value for marker in university_markers):
+            return "university"
+        return "company"
+
+    def _infer_ru_position_from_en(self, en_position: str, org_type: str) -> str:
+        value = self._normalize_spaces(en_position)
+        if not value:
+            return ""
+        mapping = {
+            "ceo": "Генеральный директор",
+            "general director": "Генеральный директор",
+            "director": "Директор",
+            "rector": "Ректор",
+        }
+        ru_positions: list[str] = []
+        for part in [self._normalize_spaces(x) for x in value.split(",") if self._normalize_spaces(x)]:
+            lowered = part.lower()
+            if lowered == "director":
+                ru_positions.append("Директор")
+            elif lowered == "rector":
+                ru_positions.append("Ректор" if org_type == "university" else "Директор")
+            elif lowered in mapping:
+                ru_positions.append(mapping[lowered])
+            else:
+                ru_positions.append(part)
+        return ", ".join(ru_positions)
 
     def _generate_middle_name_en(self, middle_name_ru: str) -> str:
         value = self._normalize_spaces(middle_name_ru)
@@ -3280,24 +3319,29 @@ class CompanyWebApp:
                 if not normalized.get(key):
                     normalized[key] = fio_from_noise[key]
 
-        if "ректор" in pos_raw.lower():
-            normalized["ru_position"] = "Ректор"
-        else:
+        org_type = self._detect_org_type(normalized.get("ru_org", ""))
+
+        if pos_raw:
             normalized["ru_position"] = self.sanitize_ru_position(pos_raw) or ""
+        else:
+            normalized["ru_position"] = self._infer_ru_position_from_en(
+                normalized.get("en_position") or normalized.get("position", ""),
+                org_type,
+            )
 
         ru_org, ru_notes = self.normalize_ru_org(normalized.get("ru_org", ""))
         en_org, en_notes = self.normalize_en_org(normalized.get("en_org", ""), ru_org)
         ru_pos, ru_pos_notes = self._normalize_positions_ru(normalized.get("ru_position", ""))
-        en_pos_raw = ""
+        en_pos_raw = normalized.get("en_position") or normalized.get("position", "")
         if ru_pos:
-            en_pos_raw = normalized.get("en_position") or normalized.get("position", "") or self._generate_en_position(ru_pos)
+            en_pos_raw = en_pos_raw or self._generate_en_position(ru_pos)
         en_pos, en_pos_notes = self._normalize_positions_en(en_pos_raw)
 
         normalized["ru_org"] = ru_org
         normalized["en_org"] = en_org
         normalized["ru_position"] = ru_pos
-        normalized["position"] = en_pos if ru_pos else ""
-        normalized["en_position"] = en_pos if ru_pos else ""
+        normalized["position"] = en_pos
+        normalized["en_position"] = en_pos
 
         profile_type = card_type or self._detect_profile_type(normalized)
         forced_search_type = self._normalize_spaces(str(normalized.get("search_type", ""))).lower()
