@@ -40,6 +40,10 @@ from wsgiref.simple_server import WSGIServer, make_server
 from card_bot import Card
 from constants import PASSPORT_MAP, RU_TO_EN_OPF
 from scrape_client import ScrapeClient
+try:
+    from nadin_scrapy.service import merge_provider_payloads as scrapy_merge_provider_payloads
+except Exception:  # pragma: no cover - optional runtime dependency
+    scrapy_merge_provider_payloads = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1316,6 +1320,29 @@ class CompanyWebApp:
             )
         return False
 
+    def _merge_hits_with_scrapy_pipeline(self, hits: list[dict[str, Any]]) -> dict[str, Any]:
+        payloads: list[dict[str, Any]] = []
+        for hit in hits:
+            data = hit.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            payloads.append(
+                {
+                    "source_name": hit.get("source", ""),
+                    "ru_org": data.get("ru_org", ""),
+                    "company_inn": data.get("inn", ""),
+                    "company_ogrn": data.get("ogrn", ""),
+                    "leader_surname_ru": data.get("surname_ru", ""),
+                    "leader_name_ru": data.get("name_ru", ""),
+                    "leader_middle_ru": data.get("middle_name_ru", ""),
+                    "leader_position_ru": data.get("ru_position", ""),
+                    "gender": data.get("gender", ""),
+                }
+            )
+        if not payloads or scrapy_merge_provider_payloads is None:
+            return {}
+        return scrapy_merge_provider_payloads(payloads)
+
     def _extract_revenue_from_soup(self, soup: BeautifulSoup) -> int:
         rev_tag = soup.find("td", string=re.compile(r"Выручка|Доход|Revenue", re.IGNORECASE))
         if isinstance(rev_tag, Tag):
@@ -1465,6 +1492,10 @@ class CompanyWebApp:
                 hits_by_provider.setdefault(provider["name"], 0)
 
             trace.append("hits_by_provider: " + ", ".join(f"{k}={v}" for k, v in hits_by_provider.items()))
+            if os.getenv("SCRAPY_PIPELINE_MERGE", "1").lower() in {"1", "true", "yes"} and hits:
+                merged = self._merge_hits_with_scrapy_pipeline(hits)
+                if merged:
+                    trace.append("🧪 Scrapy pipeline: merged profile assembled")
             hits.sort(key=lambda item: self._score_hit(item, raw), reverse=True)
             if not hits:
                 trace.append("Источники: не получено")
