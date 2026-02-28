@@ -913,18 +913,42 @@ class CompanyWebApp:
                 notes.append("RU организация: полная ОПФ сокращена")
         cleaned = re.sub(r"\b(УНИВЕРСИТЕТ)(\s+\1)+\b", r"\1", cleaned)
         tokens = cleaned.split()
+
+        # --- NEW: detect OPF written in words at the beginning ---
+        # Examples:
+        #   "АКЦИОНЕРНОЕ ОБЩЕСТВО УРАЛЬСКИЙ ЗАВОД ..." -> "... АО"
+        #   "ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО ..."       -> "... ПАО"
+        #   "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ ..." -> "... ООО"
+        def _starts_with(seq: list[str], prefix: list[str]) -> bool:
+            return len(seq) >= len(prefix) and seq[: len(prefix)] == prefix
+
+        opf_from_words: str | None = None
+        if _starts_with(tokens, ["ПУБЛИЧНОЕ", "АКЦИОНЕРНОЕ", "ОБЩЕСТВО"]):
+            opf_from_words = "ПАО"
+            tokens = tokens[3:]
+        elif _starts_with(tokens, ["АКЦИОНЕРНОЕ", "ОБЩЕСТВО"]):
+            opf_from_words = "АО"
+            tokens = tokens[2:]
+        elif _starts_with(tokens, ["ОБЩЕСТВО", "С", "ОГРАНИЧЕННОЙ", "ОТВЕТСТВЕННОСТЬЮ"]):
+            opf_from_words = "ООО"
+            tokens = tokens[5:]
+
         opf = ""
-        if len(tokens) >= 2 and tokens[0] == "ФГАОУ" and tokens[1] == "ВО":
-            opf, tokens = "ФГАОУ ВО", tokens[2:]
-            notes.append("RU организация: ОПФ перенесена в конец")
-        elif tokens and tokens[0] in RU_TO_EN_OPF:
-            opf, tokens = tokens[0], tokens[1:]
-        elif len(tokens) >= 2 and tokens[-2] == "ФГАОУ" and tokens[-1] == "ВО":
-            opf, tokens = "ФГАОУ ВО", tokens[:-2]
-        elif tokens and tokens[-1] in RU_TO_EN_OPF:
-            opf, tokens = tokens[-1], tokens[:-1]
-        else:
-            notes.append("RU организация: ОПФ должна быть в конце")
+        # if we detected OPF-in-words, force it as if it were the leading abbreviation
+        if opf_from_words:
+            opf = opf_from_words
+        if not opf:
+            if len(tokens) >= 2 and tokens[0] == "ФГАОУ" and tokens[1] == "ВО":
+                opf, tokens = "ФГАОУ ВО", tokens[2:]
+                notes.append("RU организация: ОПФ перенесена в конец")
+            elif tokens and tokens[0] in RU_TO_EN_OPF:
+                opf, tokens = tokens[0], tokens[1:]
+            elif len(tokens) >= 2 and tokens[-2] == "ФГАОУ" and tokens[-1] == "ВО":
+                opf, tokens = "ФГАОУ ВО", tokens[:-2]
+            elif tokens and tokens[-1] in RU_TO_EN_OPF:
+                opf, tokens = tokens[-1], tokens[:-1]
+            else:
+                notes.append("RU организация: ОПФ должна быть в конце")
 
         def _normalize_token(tok: str) -> str:
             if tok in {"ФГАОУ", "ВО"}:
