@@ -3258,7 +3258,11 @@ class CompanyWebApp:
             profile["en_position"], _ = self._normalize_positions_en(profile["ru_position"])
             if profile.get("en_position"):
                 field_sources.setdefault("en_position", "Автогенерация из RU")
-        profile["middle_name_en"] = ""
+        if not profile.get("middle_name_en"):
+            if profile.get("middle_name"):
+                profile["middle_name_en"] = self._translit(profile["middle_name"])
+            elif profile.get("middle_name_ru"):
+                profile["middle_name_en"] = self._translit(profile["middle_name_ru"])
         if not profile.get("appeal") and profile.get("gender"):
             profile["appeal"] = "Г-н" if profile["gender"] == "М" else "Г-жа"
             field_sources.setdefault("appeal", "Автоопределение")
@@ -3544,7 +3548,6 @@ class CompanyWebApp:
         profile["position"] = profile["en_position"]
         profile["position"], _ = self._normalize_positions_en(profile.get("position", ""))
         profile["en_position"] = profile.get("position", "")
-        profile["middle_name_en"] = ""
         profile["salutation"] = profile.get("appeal", "")
 
 
@@ -3570,13 +3573,18 @@ class CompanyWebApp:
         if profile.get("middle_name_ru") and not profile.get("middle_name"):
             profile["middle_name"] = profile["middle_name_ru"]
 
+        if not profile.get("middle_name_en"):
+            if profile.get("middle_name"):
+                profile["middle_name_en"] = self._translit(profile["middle_name"])
+            elif profile.get("middle_name_ru"):
+                profile["middle_name_en"] = self._translit(profile["middle_name_ru"])
+
         if not profile.get("family_name") and profile.get("surname"):
             profile["family_name"] = self._translit(profile["surname"])
             field_sources.setdefault("family_name", "Транслитерация из Фамилия")
         if not profile.get("first_name") and profile.get("name"):
             profile["first_name"] = self._translit(profile["name"])
             field_sources.setdefault("first_name", "Транслитерация из Имя")
-        profile["middle_name_en"] = ""
         profile["inn_or_ogrn"] = profile.get("inn") or profile.get("ogrn") or ""
 
         filled = [key for key, value in profile.items() if value and key not in {"title", "appeal"}]
@@ -3603,6 +3611,7 @@ class CompanyWebApp:
         search_trace: list[str],
         field_provenance: dict[str, str],
     ) -> int:
+        profile_data["middle_name_en"] = (profile_data.get("middle_name_en") or "").strip()
         ru_org = str(profile_data.get("ru_org", ""))
         en_org = str(profile_data.get("en_org", ""))
         status = self._status(notes, bool(ru_org and en_org))
@@ -4329,7 +4338,7 @@ class CompanyWebApp:
                 card_obj = Card.from_profile(profile)
                 profile["family_name"] = card_obj.family_name or profile.get("family_name", "")
                 profile["first_name"] = card_obj.first_name or profile.get("first_name", "")
-                profile["middle_name_en"] = ""
+                profile["middle_name_en"] = (card_obj.middle_name_en or profile.get("middle_name_en", "")).strip()
                 card_id = self._create_autofill_card(profile, notes, source_hits, search_trace, field_sources)
                 logger.info("Карточка #%d создана автоматически", card_id)
                 response = self._autofill_redirect_response(f"/card/{card_id}", wants_json=wants_json)
