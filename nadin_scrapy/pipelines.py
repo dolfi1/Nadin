@@ -16,7 +16,7 @@ FIELD_PRIORITIES = {
     "leader_surname_ru": ["companies.rbc.ru", "zachestnyibiznes.ru", "ФНС ЕГРЮЛ"],
     "leader_name_ru": ["companies.rbc.ru", "zachestnyibiznes.ru", "ФНС ЕГРЮЛ"],
     "leader_middle_ru": ["companies.rbc.ru", "zachestnyibiznes.ru", "ФНС ЕГРЮЛ"],
-    "leader_position_ru": ["companies.rbc.ru", "zachestnyibiznes.ru", "ФНС ЕГРЮЛ"],
+    "leader_position_ru": ["ФНС ЕГРЮЛ", "companies.rbc.ru", "zachestnyibiznes.ru"],
 }
 
 
