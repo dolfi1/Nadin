@@ -40,6 +40,12 @@ py -3.12 web_app.py
 
 Если не используете `venv`, всё равно запускайте и `pip`, и приложение через один и тот же интерпретатор `py -3.12`.
 
+
+## Scrapy-модуль (новое)
+- Добавлен пакет `nadin_scrapy/` с архитектурой Scrapy: `items.py`, `pipelines.py`, `middlewares.py`, `settings.py`, `spiders/`.
+- Пайплайн выполняет строгую валидацию ФИО, нормализацию `ru_org/en_org`, `leader_position_ru/en`, выставляет `review_required` и мержит данные по приоритетам источников.
+- В `web_app.py` добавлена интеграция с Scrapy-пайплайном для field-level merge (включено по умолчанию, управляется `SCRAPY_PIPELINE_MERGE`).
+
 ## Тесты
 ```bash
 pytest -q
