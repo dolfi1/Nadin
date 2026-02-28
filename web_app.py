@@ -1785,8 +1785,8 @@ class CompanyWebApp:
             middle_name_ru = str(director.get("Отчество") or director.get("patronymic") or director.get("middle_name_ru") or "")
             position = str(director.get("Должность") or director.get("position") or data.get("ru_position") or "")
 
-            if not surname_ru:
-                dol_candidates = self._deep_values_for_keys(data, {"СведДолжнФЛ"})
+            if not surname_ru or not name_ru or not middle_name_ru or not position:
+                dol_candidates = self._deep_values_for_keys(data, {"СведДолжнФЛ", "СвРукЮЛ", "Руководитель", "РукЮЛ"})
                 dol_list: list[dict[str, Any]] = []
                 for candidate in dol_candidates:
                     if isinstance(candidate, list):
@@ -1816,12 +1816,19 @@ class CompanyWebApp:
                         dolzhn = head.get("СвДолжн") or {}
                         position = str((dolzhn.get("НаимДолжн") if isinstance(dolzhn, dict) else "") or head.get("Должность") or "")
                     if not position:
-                        position = self._first_non_empty_deep_value(head, {"НаимДолжн", "Должность", "ru_position", "position"})
+                        position = self._first_non_empty_deep_value(head, {"НаимДолжн", "Должность", "ru_position", "position", "НаимДолжнРук"})
+                    if not (surname_ru and name_ru):
+                        deep_head_fio = self._first_non_empty_deep_value(head, {"ФИО", "ФИОПолн", "НаимРук", "Руководитель"})
+                        if deep_head_fio:
+                            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(deep_head_fio)
 
             if not surname_ru:
                 deep_fio = self._first_non_empty_deep_value(data, {"head_ru", "ФИО", "ФИОПолн"})
                 if deep_fio:
                     surname_ru, name_ru, middle_name_ru = self._split_fio_ru(deep_fio)
+
+            if not position:
+                position = self._first_non_empty_deep_value(data, {"НаимДолжн", "Должность", "НаимДолжнРук", "ru_position", "position"})
 
             if not surname_ru:
                 keywords = str(data.get("keywords") or data.get("meta_keywords") or "")
@@ -3061,6 +3068,39 @@ class CompanyWebApp:
             field_sources.setdefault("appeal", "Автоопределение")
         return profile
 
+    def apply_card_rules(self, profile: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+        """Применяет финальную нормализацию карточки перед сохранением."""
+        normalized = dict(profile)
+        notes: list[str] = []
+
+        ru_org, ru_notes = self.normalize_ru_org(normalized.get("ru_org", ""))
+        en_org, en_notes = self.normalize_en_org(normalized.get("en_org", ""), ru_org)
+        ru_pos, ru_pos_notes = self._normalize_positions_ru(normalized.get("ru_position", ""))
+        en_pos_raw = normalized.get("en_position") or normalized.get("position", "")
+        en_pos, en_pos_notes = self._normalize_positions_en(en_pos_raw)
+
+        normalized["ru_org"] = ru_org
+        normalized["en_org"] = en_org
+        normalized["ru_position"] = ru_pos
+        normalized["position"] = en_pos
+        normalized["en_position"] = en_pos
+
+        profile_type = self._detect_profile_type(normalized)
+        forced_search_type = self._normalize_spaces(str(normalized.get("search_type", ""))).lower()
+        if profile_type == "company" or forced_search_type == "company":
+            for field in ("surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en", "gender", "appeal", "salutation"):
+                normalized[field] = ""
+
+        if not normalized.get("appeal"):
+            normalized["appeal"] = self._derive_salutation(normalized.get("gender", ""))
+        normalized["salutation"] = normalized.get("appeal", "")
+
+        notes.extend(ru_notes)
+        notes.extend(en_notes)
+        notes.extend(ru_pos_notes)
+        notes.extend(en_pos_notes)
+        return normalized, notes
+
     def _build_profile_from_sources(
         self,
         source_hits: list[dict[str, Any]],
@@ -3264,8 +3304,6 @@ class CompanyWebApp:
         if not profile.get("en_position"):
             profile["en_position"] = profile.get("position", "")
 
-        if profile_type == "company":
-            profile_type = "person"
 
         profile = self._normalize_card_data(profile, field_sources)
 
@@ -3955,16 +3993,7 @@ class CompanyWebApp:
             filled_fields = [k for k, v in profile.items() if v and k not in {"title", "appeal"}]
             logger.info("Заполненные поля профиля: %s", filled_fields)
 
-            ru_org, ru_notes = self.normalize_ru_org(profile["ru_org"])
-            en_org, en_notes = self.normalize_en_org(profile["en_org"], ru_org)
-            ru_pos, ru_pos_notes = self._normalize_positions_ru(profile.get("ru_position", ""))
-            en_pos, en_pos_notes = self._normalize_positions_en(profile.get("position", profile.get("en_position", "")))
-            profile["ru_org"] = ru_org
-            profile["en_org"] = en_org
-            profile["ru_position"] = ru_pos
-            profile["position"] = en_pos
-            profile["appeal"] = self._derive_salutation(profile.get("gender", ""))
-            notes = ru_notes + en_notes + ru_pos_notes + en_pos_notes
+            profile, notes = self.apply_card_rules(profile)
             if source_hits:
                 notes.append(f"Источники: найдено {len(source_hits)}")
             else:
@@ -4010,6 +4039,16 @@ class CompanyWebApp:
                 with self._active_searches_lock:
                     self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
+            if forced_search_type == "company":
+                has_fio = bool(self._normalize_spaces(profile.get("surname_ru", "")) and self._normalize_spaces(profile.get("name_ru", "")))
+                has_position = bool(self._normalize_spaces(profile.get("ru_position", "")))
+                if has_position and not has_fio:
+                    logger.info("autocreate_skipped: reason=invalid_fields details=company_without_leader")
+                    manual_payload["error"] = "Не найден руководитель компании, уточните/выберите из списка"
+                    response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
+                    with self._active_searches_lock:
+                        self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+                    return response
 
             missing_fields = self._missing_required_fields(profile)
             logger.info("autofill.card_type=%s", self._detect_profile_type(profile))
@@ -4080,6 +4119,9 @@ class CompanyWebApp:
             for key, value in profile_data.items():
                 manual_payload[f"profile_{key}"] = value
             return "", "302 Found", [("Location", f"/create/manual?{urlencode(manual_payload)}")]
+
+        profile_data, rule_notes = self.apply_card_rules(profile_data)
+        notes = notes + rule_notes
 
         missing_fields = self._missing_required_fields(profile_data)
         if missing_fields:

@@ -1274,3 +1274,58 @@ def test_build_profile_keeps_higher_quality_valid_leader_fio(tmp_path):
     assert profile["surname_ru"] == "Греф"
     assert profile["name_ru"] == "Герман"
     assert profile["middle_name_ru"] == "Оскарович"
+
+
+def test_apply_card_rules_clears_person_fields_for_company_mode(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    profile, notes = app.apply_card_rules(
+        {
+            "type": "company",
+            "search_type": "company",
+            "ru_org": "Фгаоу ВО Тюмгу Университет Тюмгу",
+            "en_org": "Fgaou Vo Tyumgu Tyumgu",
+            "inn": "7202010863",
+            "surname_ru": "Иванов",
+            "name_ru": "Иван",
+            "middle_name_ru": "Иванович",
+            "family_name": "Ivanov",
+            "first_name": "Ivan",
+            "gender": "М",
+            "ru_position": "ГЕНЕРАЛЬНЫЙ ДИРЕКТОР",
+            "en_position": "GENERAL DIRECTOR",
+        }
+    )
+
+    assert profile["ru_org"]
+    assert profile["en_org"]
+    assert profile["surname_ru"] == ""
+    assert profile["name_ru"] == ""
+    assert profile["gender"] == ""
+    assert isinstance(notes, list)
+
+
+def test_parse_egrul_extracts_fio_from_nested_leader_block(tmp_path, monkeypatch):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    def fake_get(url, **_kwargs):
+        assert url == "https://egrul.itsoft.ru/7202010863.json"
+        return FakeResponse(
+            json_data={
+                "СвЮЛ": {"НаимСокр": "ООО Ромашка", "ИННЮЛ": "7202010863"},
+                "СвРукЮЛ": {
+                    "СвФЛ": {"ФИОПолн": "Петров Петр Петрович"},
+                    "СвДолжн": {"НаимДолжн": "Генеральный директор"},
+                },
+            }
+        )
+
+    monkeypatch.setattr(web_app.requests, "get", fake_get)
+
+    data = app._parse_egrul("7202010863")
+
+    assert data is not None
+    assert data["surname_ru"] == "Петров"
+    assert data["name_ru"] == "Петр"
+    assert data["middle_name_ru"] == "Петрович"
+    assert data["ru_position"] == "Генеральный директор"
