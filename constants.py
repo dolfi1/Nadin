@@ -21,3 +21,14 @@ PASSPORT_MAP: Dict[str, str] = {
     "С": "S", "Т": "T", "У": "U", "Ф": "F", "Х": "KH", "Ц": "TS", "Ч": "CH", "Ш": "SH", "Щ": "SHCH",
     "Ъ": "", "Ы": "Y", "Ь": "", "Э": "E", "Ю": "YU", "Я": "YA",
 }
+
+POSITION_TRANSLATIONS: Dict[str, str] = {
+    "Ректор": "Rector",
+    "Президент": "President",
+    "Председатель правления": "Chairman of the Board",
+    "Президент, Председатель правления": "President, Chairman of the Board",
+    "Генеральный директор": "CEO",
+    "Директор": "Director",
+    "Министр": "Minister",
+    "Губернатор": "Governor",
+}
