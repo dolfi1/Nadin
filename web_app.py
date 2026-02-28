@@ -239,10 +239,20 @@ FIELD_PRIORITIES: dict[str, list[str]] = {
     "name_ru": ["zachestnyibiznes.ru", "companies.rbc.ru", "ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
     "middle_name_ru": ["zachestnyibiznes.ru", "companies.rbc.ru", "ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
     "gender": ["rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru"],
-    "ru_position": ["rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru", "ФНС ЕГРЮЛ"],
+    "ru_position": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru"],
     "position": ["ФНС ЕГРЮЛ"],
     "ru_org": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
     "en_org": ["ФНС ЕГРЮЛ"],
+}
+
+POSITION_NOISE_MARKERS = {
+    "история",
+    "проверить",
+    "юридического лица",
+    "сведения",
+    "поиск",
+    "результат",
+    "подробнее",
 }
 
 
@@ -645,6 +655,56 @@ class CompanyWebApp:
     def _extract_fio_from_text(self, text: str) -> tuple[str, str, str]:
         fio_match = re.search(r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", text)
         return self._split_fio_ru(fio_match.group(1)) if fio_match else ("", "", "")
+
+    def extract_fio_from_noise(self, text: str) -> dict[str, str] | None:
+        sample = self._normalize_spaces(str(text))[:200]
+        if not sample:
+            return None
+        candidates: list[tuple[str, str, str]] = []
+        stop_tokens = {"юридического", "лица", "история", "проверить", "сведения", "поиск", "результат", "подробнее"}
+        for match in re.finditer(r"\b([А-ЯЁа-яё][а-яё-]+)\s+([А-ЯЁа-яё][а-яё-]+)\s+([А-ЯЁа-яё][а-яё-]+)\b", sample):
+            parts = (match.group(1), match.group(2), match.group(3))
+            if any(part.lower() in stop_tokens for part in parts):
+                continue
+            candidates.append(parts)
+        if len(candidates) != 1:
+            return None
+        surname, name, middle_name = candidates[0]
+        return {
+            "surname_ru": surname.title(),
+            "name_ru": name.title(),
+            "middle_name_ru": middle_name.title(),
+        }
+
+    def sanitize_ru_position(self, text: str) -> str | None:
+        cleaned = self._normalize_spaces(str(text or ""))
+        if not cleaned:
+            return None
+        if len(cleaned) > 100:
+            return None
+        lowered = cleaned.lower()
+        if any(marker in lowered for marker in POSITION_NOISE_MARKERS):
+            return None
+        if re.search(r"\b[А-ЯЁа-яё][а-яё-]+\s+[А-ЯЁа-яё][а-яё-]+\s+[А-ЯЁа-яё][а-яё-]+\b", cleaned):
+            return None
+
+        whitelist = (
+            ("председатель правления", "Председатель правления"),
+            ("генеральный директор", "Генеральный директор"),
+            ("ректор", "Ректор"),
+            ("президент", "Президент"),
+            ("директор", "Директор"),
+            ("управляющий", "Управляющий"),
+        )
+        for needle, canonical in whitelist:
+            if needle in lowered:
+                return canonical
+
+        if re.search(r"\d", cleaned):
+            return None
+        if not re.fullmatch(r"[А-Яа-яЁё\-\s,]+", cleaned):
+            return None
+        return cleaned
 
     def _normalize_positions_ru(self, raw: str) -> tuple[str, list[str]]:
         notes: list[str] = []
@@ -3154,17 +3214,31 @@ class CompanyWebApp:
         normalized = dict(profile)
         notes: list[str] = []
 
+        pos_raw = self._normalize_spaces(normalized.get("ru_position", ""))
+        fio_from_noise = self.extract_fio_from_noise(pos_raw)
+        if fio_from_noise and not (normalized.get("surname_ru") and normalized.get("name_ru") and normalized.get("middle_name_ru")):
+            for key in ("surname_ru", "name_ru", "middle_name_ru"):
+                if not normalized.get(key):
+                    normalized[key] = fio_from_noise[key]
+
+        if "ректор" in pos_raw.lower():
+            normalized["ru_position"] = "Ректор"
+        else:
+            normalized["ru_position"] = self.sanitize_ru_position(pos_raw) or ""
+
         ru_org, ru_notes = self.normalize_ru_org(normalized.get("ru_org", ""))
         en_org, en_notes = self.normalize_en_org(normalized.get("en_org", ""), ru_org)
         ru_pos, ru_pos_notes = self._normalize_positions_ru(normalized.get("ru_position", ""))
-        en_pos_raw = normalized.get("en_position") or normalized.get("position", "")
+        en_pos_raw = ""
+        if ru_pos:
+            en_pos_raw = normalized.get("en_position") or normalized.get("position", "") or self._generate_en_position(ru_pos)
         en_pos, en_pos_notes = self._normalize_positions_en(en_pos_raw)
 
         normalized["ru_org"] = ru_org
         normalized["en_org"] = en_org
         normalized["ru_position"] = ru_pos
-        normalized["position"] = en_pos
-        normalized["en_position"] = en_pos
+        normalized["position"] = en_pos if ru_pos else ""
+        normalized["en_position"] = en_pos if ru_pos else ""
 
         profile_type = card_type or self._detect_profile_type(normalized)
         forced_search_type = self._normalize_spaces(str(normalized.get("search_type", ""))).lower()
@@ -3262,6 +3336,8 @@ class CompanyWebApp:
 
         for field, _ in CARD_FIELDS:
             if field_sources.get(field) == "special_case":
+                continue
+            if field == "ru_position" and field_sources.get("ru_position") == "ФНС ЕГРЮЛ":
                 continue
             skip_person_noise = field in {"surname_ru", "name_ru", "middle_name_ru", "gender", "ru_position", "position"}
             value, source_name = self._pick_field_by_priority(field, source_hits, skip_person_noise=skip_person_noise)
