@@ -16,6 +16,49 @@ LEADER_LABEL_RE = re.compile(
 
 RU_FIO_TOKEN_RE = re.compile(r"^[А-ЯЁ][а-яё\-]{1,49}$")
 
+RU_QUOTES_RE = re.compile(r'^["«»„“”\']+|["«»„“”\']+$')
+RU_ABBREVIATIONS = {
+    "ФГАОУ", "ФГБОУ", "ФГБУ", "ФГБУК", "ВО", "МИД", "РАН", "СПБ", "СПБГУ", "МГИМО", "МИСИС", "НИИ",
+}
+RU_SMALL_WORDS = {"и", "по", "в", "во", "при", "на", "им.", "имени"}
+KNOWN_TOPO_REPLACEMENTS = {
+    "САНКТ ПЕТЕРБУРГ": "САНКТ-ПЕТЕРБУРГ",
+    "САНКТ ПЕТЕРБУРГСКИЙ": "САНКТ-ПЕТЕРБУРГСКИЙ",
+}
+OPF_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("ФГАОУ ВО", re.compile(r"\bФГАОУ\s+ВО\b", flags=re.IGNORECASE)),
+    ("ФГБОУ ВО", re.compile(r"\bФГБОУ\s+ВО\b", flags=re.IGNORECASE)),
+    ("ФГБУК", re.compile(r"\bФГБУК\b", flags=re.IGNORECASE)),
+    ("ФГБУ", re.compile(r"\bФГБУ\b", flags=re.IGNORECASE)),
+    ("СПБ ГБУЗ", re.compile(r"\bСПБ\s+ГБУЗ\b", flags=re.IGNORECASE)),
+    ("ГБУЗ", re.compile(r"\bГБУЗ\b", flags=re.IGNORECASE)),
+    ("ООО", re.compile(r"\bООО\b", flags=re.IGNORECASE)),
+    ("ПАО", re.compile(r"\bПАО\b", flags=re.IGNORECASE)),
+    ("АО", re.compile(r"\bАО\b", flags=re.IGNORECASE)),
+    ("АНО", re.compile(r"\bАНО\b", flags=re.IGNORECASE)),
+]
+
+COMMON_RU_TO_EN = {
+    "федеральное": "Federal",
+    "агентство": "Agency",
+    "фонд": "Foundation",
+    "благотворительный": "Charitable",
+    "институт": "Institute",
+    "центр": "Center",
+    "университет": "University",
+    "поликлиника": "Polyclinic",
+    "оркестр": "Orchestra",
+    "заповедник": "Reserve",
+    "филиал": "Branch",
+    "национальный": "National",
+    "исследовательский": "Research",
+}
+
+KNOWN_CITY_EN = {
+    "санкт-петербургский": "Saint-Petersburg",
+    "санкт-петербург": "Saint-Petersburg",
+}
+
 
 def normalize_spaces(value: str) -> str:
     return " ".join((value or "").replace("\xa0", " ").split())
@@ -50,17 +93,39 @@ def is_valid_leader_fio(surname: str, name: str, middle: str = "") -> bool:
 
 
 def normalize_ru_org(value: str) -> str:
-    raw = normalize_spaces(value).strip('"«»')
-    if not raw:
-        return ""
-    raw = re.sub(r"[()]", "", raw)
-    raw = raw.replace("ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "ПАО")
-    parts = raw.split()
-    if parts and parts[0].upper() in RU_TO_EN_OPF:
-        opf = parts[0].upper()
-        name = " ".join(parts[1:]).title()
-        return normalize_spaces(f"{name} {opf}")
-    return raw
+    name_ru, ru_opf = extract_opf_ru(value)
+    name_ru_norm = normalize_ru_name(name_ru)
+    return normalize_spaces(f"{name_ru_norm} {ru_opf}") if ru_opf else name_ru_norm
+
+
+def extract_opf_ru(ru_org_raw: str) -> tuple[str, str]:
+    cleaned = normalize_spaces(ru_org_raw)
+    for target, replacement in KNOWN_TOPO_REPLACEMENTS.items():
+        cleaned = re.sub(rf"\b{target}\b", replacement, cleaned, flags=re.IGNORECASE)
+    opf_hits: list[str] = []
+    for opf, pattern in OPF_PATTERNS:
+        if pattern.search(cleaned):
+            opf_hits.append(opf)
+            cleaned = pattern.sub(" ", cleaned)
+    ru_opf = opf_hits[0] if opf_hits else ""
+    return normalize_spaces(cleaned), ru_opf
+
+
+def normalize_ru_name(name_ru: str) -> str:
+    cleaned = normalize_spaces(name_ru)
+    cleaned = RU_QUOTES_RE.sub("", cleaned)
+    tokens = cleaned.split()
+    normalized_tokens: list[str] = []
+    for idx, token in enumerate(tokens):
+        token_clean = RU_QUOTES_RE.sub("", token)
+        upper = token_clean.upper()
+        if upper in RU_ABBREVIATIONS:
+            normalized_tokens.append(upper if upper != "СПБ" else "СПб")
+        elif idx > 0 and token_clean.lower() in RU_SMALL_WORDS:
+            normalized_tokens.append(token_clean.lower())
+        else:
+            normalized_tokens.append(token_clean[:1].upper() + token_clean[1:].lower())
+    return normalize_spaces(" ".join(normalized_tokens))
 
 
 def transliterate(value: str) -> str:
@@ -79,17 +144,44 @@ def transliterate(value: str) -> str:
 
 
 def normalize_en_org(ru_org: str) -> str:
-    ru_norm = normalize_ru_org(ru_org)
-    if not ru_norm:
+    name_ru, ru_opf = extract_opf_ru(ru_org)
+    name_ru_norm = normalize_ru_name(name_ru)
+    return build_en_name(name_ru_norm, ru_opf)
+
+
+def build_en_name(name_ru_norm: str, ru_opf: str) -> str:
+    if not name_ru_norm:
         return ""
-    tokens = ru_norm.split()
-    opf = tokens[-1].upper() if tokens else ""
-    opf_en = RU_TO_EN_OPF.get(opf, opf)
-    org_name = " ".join(tokens[:-1]) if opf_en != opf else ru_norm
-    org_name_en = transliterate(org_name).title()
-    if opf_en != opf:
-        return f"{org_name_en} {opf_en}".strip()
-    return org_name_en
+
+    prepared = re.sub(r"\bимени\s+([^,]+)", lambda m: f"named after {transliterate(m.group(1))}", name_ru_norm, flags=re.IGNORECASE)
+    prepared = re.sub(r"\bим\.\s*([^,]+)", lambda m: f"named after {transliterate(m.group(1))}", prepared, flags=re.IGNORECASE)
+    prepared = re.sub(
+        r"Российской\s+академии\s+наук",
+        "of the Russian Academy of Sciences",
+        prepared,
+        flags=re.IGNORECASE,
+    )
+
+    branch_match = re.match(r"^(Санкт\-Петербургский)\s+филиал\s+(.+)$", prepared, flags=re.IGNORECASE)
+    if branch_match:
+        city_ru, tail = branch_match.groups()
+        city_en = KNOWN_CITY_EN.get(city_ru.lower(), transliterate(city_ru).title())
+        prepared = f"{city_en} Branch of {tail}"
+
+    words = []
+    for token in prepared.split():
+        low = token.lower()
+        if low in COMMON_RU_TO_EN:
+            words.append(COMMON_RU_TO_EN[low])
+        elif re.fullmatch(r"№\d+", token):
+            words.append(token)
+        elif re.search(r"[А-Яа-яЁё]", token):
+            words.append(transliterate(token).title())
+        else:
+            words.append(token)
+
+    opf_en = RU_TO_EN_OPF.get(ru_opf.upper(), "") if ru_opf else ""
+    return normalize_spaces(f"{' '.join(words)} {opf_en}")
 
 
 def normalize_position_ru(value: str) -> str:

@@ -568,7 +568,7 @@ class CompanyWebApp:
         if not self._normalize_spaces(str(name)):
             return ""
 
-        normalized_name = str(name).strip().strip('"').strip("«»").strip()
+        normalized_name = str(name).strip().strip('"').strip("«»„“”").strip()
 
         opf_container = fns_svyl.get("СвОбрЮЛ") or {}
         if not isinstance(opf_container, dict):
