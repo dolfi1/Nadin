@@ -23,6 +23,7 @@ from urllib.request import urlopen
 from datetime import datetime, timezone
 from html import escape, unescape
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from typing import Any, Callable
 import shutil
 import subprocess
@@ -52,12 +53,33 @@ try:
 except Exception:  # pragma: no cover - optional runtime dependency
     scrapy_merge_provider_payloads = None
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-    filename=os.getenv("NADIN_LOG_PATH") or None,
-)
+
+
+def _resolve_log_path() -> Path:
+    env_path = os.getenv("NADIN_LOG_PATH")
+    if env_path:
+        return Path(env_path)
+
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "Nadin" / "logs" / "nadin.log"
+
+    return Path(__file__).resolve().parent / "logs" / "nadin.log"
+
+
+def _configure_logging() -> None:
+    log_path = _resolve_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[handler],
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+_configure_logging()
 
 logger = logging.getLogger(__name__)
 

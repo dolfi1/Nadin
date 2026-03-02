@@ -25,7 +25,7 @@
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python main.py
+python web_app.py
 ```
 
 Приложение стартует на `http://localhost:8000`.
@@ -35,7 +35,7 @@ python main.py
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 py -3.12 -m pip install -r requirements.txt
-py -3.12 main.py
+py -3.12 web_app.py
 ```
 
 Если не используете `venv`, всё равно запускайте и `pip`, и приложение через один и тот же интерпретатор `py -3.12`.
@@ -46,16 +46,19 @@ py -3.12 main.py
 - Пайплайн выполняет строгую валидацию ФИО, нормализацию `ru_org/en_org`, `leader_position_ru/en`, выставляет `review_required` и мержит данные по приоритетам источников.
 - В `web_app.py` добавлена интеграция с Scrapy-пайплайном для field-level merge (включено по умолчанию, управляется `SCRAPY_PIPELINE_MERGE`).
 
+## Тесты
+```bash
+pytest -q
+```
+
 ## Ограничения по сбору данных
 - Приложение работает в режиме **strict scraping mode** для доменов с антибот-защитой (`rusprofile.ru`): отключены прокси и любые попытки обхода CAPTCHA/anti-bot.
 - Рекомендуется использовать легальные источники и официальные API, соблюдать robots.txt, ToS и лимиты запросов.
 
 
-## Сборка Windows-приложения (.exe)
+## Portable-сборка для Windows (PyInstaller onedir)
 ```bat
-build_portable.bat
+build_windows_onedir.bat
 ```
 
-Результат: `dist\Nadin\Nadin.exe` + зависимости в одной папке и архив `release\Nadin_Portable.zip` для передачи пользователям.
-
-Запуск для пользователя: распаковать архив и открыть `Nadin.exe`.
+Результат: `dist\Nadin\Nadin.exe` + зависимости в одной папке. Скрипт также собирает `release.zip`, внутри которого лежит папка `Nadin` целиком. `Nadin.exe` запускает встроенный WebView-окно (не браузер), поднимает сервер из `web_app.py` в фоне, а логи пишет в `%LOCALAPPDATA%\Nadin\logs\nadin.log`.
