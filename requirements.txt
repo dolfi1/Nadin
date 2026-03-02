@@ -6,4 +6,5 @@ scrapling==0.2.96
 
 scrapy==2.11.2
 pywebview==5.1
+pythonnet>=3.0.0
 PySide6==6.7.2
