@@ -129,24 +129,51 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "if(Test-Path '%ZIP_PATH%'){Remove-Item -Force '%ZIP_PATH%'}; Compress-Archive -Path '%RELEASE_APP_DIR%\*' -DestinationPath '%ZIP_PATH%'" || exit /b 1
 
 REM =========================
-REM  CLEANUP (keep only release/)
+REM  CLEANUP
 REM =========================
 echo.
-echo === CLEANUP: removing build artifacts (keep only release/) ===
-if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
-if exist "%DIST_DIR%" rmdir /s /q "%DIST_DIR%"
-if exist "%ROOT%__pycache__" rmdir /s /q "%ROOT%__pycache__"
-if exist "%ROOT%nadin_scrapy\__pycache__" rmdir /s /q "%ROOT%nadin_scrapy\__pycache__"
+echo === CLEANUP ===
 
+REM 1) Always remove build artifacts (safe)
+if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
+if exist "%DIST_DIR%"  rmdir /s /q "%DIST_DIR%"
+if exist "%ROOT%__pycache__" rmdir /s /q "%ROOT%__pycache__"
+
+REM remove nested pyc caches (safe)
+for /d /r "%ROOT%" %%G in (__pycache__) do (
+  rmdir /s /q "%%G" 2>nul
+)
+
+REM optionally remove venv (safe-ish)
 if "%CLEAN_VENV%"=="1" (
   if exist "%VENV_DIR%" rmdir /s /q "%VENV_DIR%"
 )
 
+REM 2) OPTIONAL: delete EVERYTHING except release and git meta (DANGEROUS)
+REM Set FULL_PRUNE=1 if you really want to wipe the project folder after build.
+set "FULL_PRUNE=0"
+
+if "%FULL_PRUNE%"=="1" (
+  echo.
+  echo !!! FULL_PRUNE is ON. Wiping project files except release and git meta...
+  for /f "delims=" %%I in ('dir /b /a "%ROOT%"') do (
+    if /I not "%%I"=="release" ^
+    if /I not "%%I"==".git" ^
+    if /I not "%%I"==".gitignore" ^
+    if /I not "%%I"==".gitkeep" ^
+    if /I not "%%I"=="README_USER.txt" (
+      rmdir /s /q "%ROOT%%%I" 2>nul
+      del /f /q "%ROOT%%%I" 2>nul
+    )
+  )
+)
+
 echo.
 echo DONE ✅
-echo Portable folder: %RELEASE_APP_DIR%\
-echo Zip for users:   %ZIP_PATH%\
+echo Portable folder: %RELEASE_APP_DIR%
+echo Zip for users:   %ZIP_PATH%
 echo.
+
 echo Give users the ZIP. They unzip and start: %APP_NAME%.exe
 echo.
 
