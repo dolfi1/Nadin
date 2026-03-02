@@ -5,11 +5,11 @@ REM =========================
 REM  CONFIG (edit if needed)
 REM =========================
 set "APP_NAME=Nadin"
-set "ENTRYPOINT=main.py"
+set "ENTRYPOINT=desktop_app.py"
 
 REM Folders/files to include in portable package (if they exist)
 set "EXTRA_DIRS=templates static assets data"
-set "EXTRA_FILES=dlya_anala.xlsx positions_ru_en.xlsx positions_ru_en.json"
+set "EXTRA_FILES=dlya_anala.xlsx positions_ru_en.xlsx positions_ru_en.json cards.db"
 
 REM =========================
 REM  PATHS

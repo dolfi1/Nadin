@@ -9,7 +9,15 @@ APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
 
 
 def get_runtime_base_dir() -> Path:
-    """Return portable base dir (next to executable in frozen mode)."""
+    """Return a writable runtime base dir (LOCALAPPDATA in user mode, project dir otherwise)."""
+    explicit_base = os.getenv("APP_BASE_DIR")
+    if explicit_base:
+        return Path(explicit_base)
+
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "Nadin"
+
     return APP_DIR
 
 

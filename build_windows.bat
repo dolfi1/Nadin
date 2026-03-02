@@ -16,8 +16,11 @@ if exist static (
 if exist dlya_anala.xlsx (
   set "ADD_DATA=!ADD_DATA! --add-data dlya_anala.xlsx;."
 )
+if exist cards.db (
+  set "ADD_DATA=!ADD_DATA! --add-data cards.db;."
+)
 
-py -m PyInstaller --noconfirm --clean --name Nadin --windowed --onedir main.py !ADD_DATA!
+py -m PyInstaller --noconfirm --clean --name Nadin --windowed --onedir desktop_app.py !ADD_DATA!
 if errorlevel 1 exit /b 1
 
 echo Build complete: dist\Nadin\Nadin.exe
