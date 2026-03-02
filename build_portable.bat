@@ -22,6 +22,7 @@ set "BUILD_DIR=%ROOT%build"
 set "DIST_DIR=%ROOT%dist"
 set "RELEASE_DIR=%ROOT%release"
 set "OUT_DIR=%DIST_DIR%\%APP_NAME%"
+set "RELEASE_APP_DIR=%RELEASE_DIR%\%APP_NAME%"
 
 set "PYTHONHOME="
 set "PYTHONPATH="
@@ -83,6 +84,8 @@ echo [4/6] Running PyInstaller...
   --windowed ^
   --name "%APP_NAME%" ^
   --clean ^
+  --hidden-import=clr ^
+  --hidden-import=pythonnet ^
   --collect-all webview ^
   --collect-all PySide6 ^
   "%ROOT%%ENTRYPOINT%" || exit /b 1
@@ -111,17 +114,24 @@ for %%F in (%EXTRA_FILES%) do (
 )
 
 REM =========================
-REM  6) Zip portable folder
+REM  6) Move final app folder to release
 REM =========================
-echo [6/6] Creating portable zip...
+echo [6/7] Copying final app folder to release...
+if exist "%RELEASE_APP_DIR%" rmdir /s /q "%RELEASE_APP_DIR%"
+xcopy "%OUT_DIR%" "%RELEASE_APP_DIR%\" /E /I /Y >nul || exit /b 1
+
+REM =========================
+REM  7) Zip portable folder
+REM =========================
+echo [7/7] Creating portable zip...
 set "ZIP_PATH=%RELEASE_DIR%\%APP_NAME%_Portable.zip"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "if(Test-Path '%ZIP_PATH%'){Remove-Item -Force '%ZIP_PATH%'}; Compress-Archive -Path '%OUT_DIR%\*' -DestinationPath '%ZIP_PATH%'" || exit /b 1
+  "if(Test-Path '%ZIP_PATH%'){Remove-Item -Force '%ZIP_PATH%'}; Compress-Archive -Path '%RELEASE_APP_DIR%\*' -DestinationPath '%ZIP_PATH%'" || exit /b 1
 
 echo.
 echo DONE ✅
-echo Portable folder: %OUT_DIR%
+echo Portable folder: %RELEASE_APP_DIR%
 echo Zip for users:   %ZIP_PATH%
 echo.
 echo Give users the ZIP. They unzip and start: %APP_NAME%.exe
