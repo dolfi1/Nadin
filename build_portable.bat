@@ -5,15 +5,14 @@ REM =========================
 REM  CONFIG (edit if needed)
 REM =========================
 set "APP_NAME=Nadin"
-set "ENTRYPOINT=desktop_app.py"
+set "ENTRYPOINT=web_app.py"
+
+REM If you want to KEEP venv for faster rebuilds: set CLEAN_VENV=0
+set "CLEAN_VENV=1"
 
 REM Folders/files to include in portable package (if they exist)
-set "EXTRA_DIRS=templates static"
-set "EXTRA_FILES=cards.db dlya_anala.xlsx README_USER.txt"
-
-set "DO_CLEANUP=0"
-if /I "%~1"=="--cleanup" set "DO_CLEANUP=1"
-if /I "%~1"=="cleanup" set "DO_CLEANUP=1"
+set "EXTRA_DIRS=templates static assets data"
+set "EXTRA_FILES=dlya_anala.xlsx positions_ru_en.xlsx positions_ru_en.json cards.db README_USER.txt"
 
 REM =========================
 REM  PATHS
@@ -32,7 +31,7 @@ set "PYTHONHOME="
 set "PYTHONPATH="
 
 echo.
-echo === Building %APP_NAME% (onedir) from %ENTRYPOINT% ===
+echo === Building %APP_NAME% (portable onedir, local web site) from %ENTRYPOINT% ===
 echo Root: %ROOT%
 echo.
 
@@ -40,7 +39,7 @@ REM =========================
 REM  1) Create venv
 REM =========================
 if not exist "%VENV_DIR%\Scripts\python.exe" (
-  echo [1/8] Creating venv...
+  echo [1/7] Creating venv...
   py -3 -m venv "%VENV_DIR%" 2>nul
   if errorlevel 1 (
     python -m venv "%VENV_DIR%"
@@ -50,7 +49,7 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
     )
   )
 ) else (
-  echo [1/8] Venv already exists.
+  echo [1/7] Venv already exists.
 )
 
 set "PY=%VENV_DIR%\Scripts\python.exe"
@@ -59,7 +58,7 @@ set "PIP=%VENV_DIR%\Scripts\pip.exe"
 REM =========================
 REM  2) Install deps
 REM =========================
-echo [2/8] Installing dependencies...
+echo [2/7] Installing dependencies...
 "%PY%" -m pip install --upgrade pip setuptools wheel || exit /b 1
 if exist "%ROOT%requirements.txt" (
   "%PIP%" install -r "%ROOT%requirements.txt" || exit /b 1
@@ -70,37 +69,32 @@ if exist "%ROOT%requirements.txt" (
 "%PIP%" install pyinstaller || exit /b 1
 
 REM =========================
-REM  3) Clean old build artifacts
+REM  3) Clean old build artifacts (before build)
 REM =========================
-echo [3/8] Cleaning old build/dist/release and caches...
+echo [3/7] Cleaning old build/dist/release...
 if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
 if exist "%DIST_DIR%" rmdir /s /q "%DIST_DIR%"
 if exist "%RELEASE_DIR%" rmdir /s /q "%RELEASE_DIR%"
-for /d /r "%ROOT%" %%D in (__pycache__) do @if exist "%%D" rmdir /s /q "%%D"
 mkdir "%RELEASE_DIR%" >nul 2>&1
 
 REM =========================
-REM  4) Build onedir (windowed)
+REM  4) Build onedir (no GUI stack)
 REM =========================
-echo [4/8] Running PyInstaller...
+echo [4/7] Running PyInstaller...
 "%PY%" -m PyInstaller ^
   --noconfirm ^
   --onedir ^
-  --windowed ^
+  --console ^
   --name "%APP_NAME%" ^
   --clean ^
-  --exclude-module tests ^
-  --exclude-module test ^
-  --exclude-module pytest ^
-  --exclude-module tkinter ^
   "%ROOT%%ENTRYPOINT%" || exit /b 1
 
 REM =========================
-REM  5) Copy required user resources into dist folder
+REM  5) Copy extra resources into dist folder
 REM =========================
-echo [5/8] Copying user resources...
+echo [5/7] Copying extra resources...
 if not exist "%OUT_DIR%" (
-  echo ERROR: Output folder not found: %OUT_DIR%
+  echo ERROR: Output folder not found: %OUT_DIR%\
   exit /b 1
 )
 
@@ -119,37 +113,39 @@ for %%F in (%EXTRA_FILES%) do (
 )
 
 REM =========================
-REM  6) Prepare release app folder
+REM  6) Copy final app folder to release
 REM =========================
-echo [6/8] Copying final app folder to release...
+echo [6/7] Copying final app folder to release...
 if exist "%RELEASE_APP_DIR%" rmdir /s /q "%RELEASE_APP_DIR%"
 xcopy "%OUT_DIR%" "%RELEASE_APP_DIR%\" /E /I /Y >nul || exit /b 1
 
 REM =========================
-REM  7) Zip only release\Nadin for users
+REM  7) Zip portable folder
 REM =========================
-echo [7/8] Creating portable zip...
+echo [7/7] Creating portable zip...
 set "ZIP_PATH=%RELEASE_DIR%\%APP_NAME%_Portable.zip"
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "if(Test-Path '%ZIP_PATH%'){Remove-Item -Force '%ZIP_PATH%'}; Compress-Archive -Path '%RELEASE_APP_DIR%\*' -DestinationPath '%ZIP_PATH%'" || exit /b 1
 
 REM =========================
-REM  8) Optional cleanup
+REM  CLEANUP (keep only release/)
 REM =========================
-if "%DO_CLEANUP%"=="1" (
-  echo [8/8] Cleanup enabled. Removing build caches...
-  if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
-  for /d /r "%ROOT%" %%D in (__pycache__) do @if exist "%%D" rmdir /s /q "%%D"
+echo.
+echo === CLEANUP: removing build artifacts (keep only release/) ===
+if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
+if exist "%DIST_DIR%" rmdir /s /q "%DIST_DIR%"
+if exist "%ROOT%__pycache__" rmdir /s /q "%ROOT%__pycache__"
+if exist "%ROOT%nadin_scrapy\__pycache__" rmdir /s /q "%ROOT%nadin_scrapy\__pycache__"
+
+if "%CLEAN_VENV%"=="1" (
   if exist "%VENV_DIR%" rmdir /s /q "%VENV_DIR%"
-) else (
-  echo [8/8] Cleanup skipped. Use build_portable.bat --cleanup to remove caches.
 )
 
 echo.
 echo DONE ✅
-echo Portable folder: %RELEASE_APP_DIR%
-echo Zip for users:   %ZIP_PATH%
+echo Portable folder: %RELEASE_APP_DIR%\
+echo Zip for users:   %ZIP_PATH%\
 echo.
 echo Give users the ZIP. They unzip and start: %APP_NAME%.exe
 echo.
