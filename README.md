@@ -25,7 +25,7 @@
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python web_app.py
+python main.py
 ```
 
 Приложение стартует на `http://localhost:8000`.
@@ -35,7 +35,7 @@ python web_app.py
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 py -3.12 -m pip install -r requirements.txt
-py -3.12 web_app.py
+py -3.12 main.py
 ```
 
 Если не используете `venv`, всё равно запускайте и `pip`, и приложение через один и тот же интерпретатор `py -3.12`.
@@ -54,3 +54,11 @@ pytest -q
 ## Ограничения по сбору данных
 - Приложение работает в режиме **strict scraping mode** для доменов с антибот-защитой (`rusprofile.ru`): отключены прокси и любые попытки обхода CAPTCHA/anti-bot.
 - Рекомендуется использовать легальные источники и официальные API, соблюдать robots.txt, ToS и лимиты запросов.
+
+
+## Portable-сборка для Windows (PyInstaller onedir)
+```bat
+build_windows.bat
+```
+
+Результат: `dist\Nadin\Nadin.exe` + зависимости в одной папке. Приложение пишет данные в `data/` и логи в `logs/` рядом с `exe`.

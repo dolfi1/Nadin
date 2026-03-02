@@ -2,6 +2,19 @@ from __future__ import annotations
 
 from typing import Dict
 
+BASE_MODE_PROVIDER_KINDS = ["egrul"]
+EXTENDED_MODE_PROVIDER_KINDS = [
+    "egrul",
+    "wikipedia_html",
+    "duckduckgo_html",
+    "rusprofile",
+    "zachestnyibiznes_scrape",
+    "checko",
+    "kontur",
+    "rbc_companies_scrape",
+    "tbank_leadership_scrape",
+]
+
 RU_TO_EN_OPF: Dict[str, str] = {
     "ООО": "LLC",
     "АО": "JSC",
