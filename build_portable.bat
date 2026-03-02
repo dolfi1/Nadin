@@ -1,12 +1,29 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
+call :main
+exit /b %errorlevel%
+
+:main
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+
+echo.
+echo ======================================
+echo START BUILD %date% %time%
+echo Script: "%~f0"
+echo Root  : "%~dp0"
+echo ======================================
+
 set "LOG=%ROOT%\release\build_log.txt"
 if not exist "%ROOT%\release" mkdir "%ROOT%\release"
 if errorlevel 1 call :die "failed to create release directory"
 >"%LOG%" echo ==== BUILD START %date% %time% ====
+call :log LOG FILE: %LOG%
+call :log BAT FILE: %~f0
+call :log START BUILD %date% %time%
+call :log Script: %~f0
+call :log Root: %~dp0
 
 REM ================== CONFIG ==================
 set "APP_NAME=Nadin"
@@ -34,6 +51,8 @@ echo.
 echo === Nadin portable build ===
 echo ROOT: "%ROOT%"
 echo RELEASE_ROOT: "%RELEASE_ROOT%"
+call :log ROOT: %ROOT%
+call :log RELEASE_ROOT: %RELEASE_ROOT%
 
 if not exist "%ROOT%\%ENTRY%" (
   echo ERROR: entrypoint not found: "%ROOT%\%ENTRY%"
@@ -117,6 +136,7 @@ if errorlevel 1 (
 REM ================== BUILD ==================
 echo Running PyInstaller...
 pushd "%ROOT%"
+if errorlevel 1 call :die "failed to enter ROOT directory"
 call "%VENV%\Scripts\python.exe" -m PyInstaller ^
   --noconfirm ^
   --clean ^
@@ -125,6 +145,7 @@ call "%VENV%\Scripts\python.exe" -m PyInstaller ^
   "%ENTRY%" >>"%LOG%" 2>&1
 set "RC=%errorlevel%"
 popd
+if errorlevel 1 call :die "failed to leave ROOT directory"
 
 if not "%RC%"=="0" (
   echo ERROR: PyInstaller failed (code %RC%). See "%LOG%".
@@ -200,6 +221,7 @@ echo Portable folder: "%RELEASE_ROOT%"
 echo Zip: "%ROOT%\%RELEASE_BASE%\%APP_NAME%_Portable.zip"
 echo Log: "%LOG%"
 call :success
+exit /b 0
 
 REM ================== FUNCTIONS ==================
 :pick_python
@@ -226,20 +248,19 @@ set "PY_CMD="
 exit /b 0
 
 :log
+if "%LOG%"=="" exit /b 0
 >>"%LOG%" echo [%date% %time%] %*
 exit /b 0
 
 :die
-call :log BUILD FAILED: %*
+set "ERR=%errorlevel%"
+call :log BUILD FAILED: %* (errorlevel=%ERR%)
 echo.
-echo ======================================
-echo BUILD FAILED
-echo %*
-echo ======================================
+echo BUILD FAILED: %*
+echo errorlevel=%ERR%
 if exist "%LOG%" (
-  echo.
   echo ---- Last log lines ----
-  powershell -NoProfile -Command "Get-Content '%LOG%' -Tail 20"
+  powershell -NoProfile -Command "Get-Content '%LOG%' -Tail 50"
 )
 pause
 exit /b 1
