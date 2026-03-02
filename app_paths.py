@@ -5,20 +5,17 @@ import sys
 from pathlib import Path
 
 
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+
+
 def get_runtime_base_dir() -> Path:
     """Return portable base dir (next to executable in frozen mode)."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    return APP_DIR
 
 
 def resource_path(relative_path: str) -> str:
-    """Resolve bundled resource path for normal and PyInstaller runtime."""
-    if getattr(sys, "frozen", False):
-        base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
-    else:
-        base = Path(__file__).resolve().parent
-    return str(base / relative_path)
+    """Resolve resource path from APP_DIR for source and frozen onedir runtime."""
+    return str(APP_DIR / relative_path)
 
 
 def ensure_runtime_dirs(base_dir: Path | None = None) -> dict[str, Path]:
