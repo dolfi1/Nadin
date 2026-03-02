@@ -368,6 +368,22 @@ class CompanyWebApp:
                 missing.append(field)
         return missing
 
+    def _is_profile_complete(self, profile: dict[str, Any]) -> bool:
+        required = [
+            "surname_ru",
+            "name_ru",
+            "family_name",
+            "first_name",
+            "ru_org",
+            "en_org",
+            "inn",
+            "ru_position",
+            "en_position",
+            "gender",
+            "appeal",
+        ]
+        return all(self._normalize_spaces(str(profile.get(field, ""))) for field in required)
+
     def _init_db(self) -> None:
         with self._connect() as db:
             db.executescript(
@@ -1700,7 +1716,13 @@ class CompanyWebApp:
                 score += 100
         return score
 
-    def _search_external_sources(self, raw: str, no_cache: bool = False, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
+    def _search_external_sources(
+        self,
+        raw: str,
+        no_cache: bool = False,
+        search_type: str = "",
+        provider_names: list[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
         self._init_thread_state()
         input_type = self.detect_input_type(raw)
         request_fingerprint = hashlib.sha1(f"{input_type}|{self._normalize_spaces(raw).lower()}|{search_type}|{int(no_cache)}".encode("utf-8")).hexdigest()
@@ -1722,6 +1744,9 @@ class CompanyWebApp:
         trace: list[str] = [f"1. Тип ввода: {input_type}", f"2. Ключ поиска: {raw}"]
         hits_by_provider: dict[str, int] = {}
         providers = self._provider_chain(input_type, raw)
+        if provider_names is not None:
+            allowed = {name.strip() for name in provider_names if self._normalize_spaces(name)}
+            providers = [provider for provider in providers if provider.get("name") in allowed]
 
         def load_provider(provider: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
             started = time.perf_counter()
@@ -4294,37 +4319,74 @@ class CompanyWebApp:
             else:
                 reset_note = []
 
-            source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
             effective_hit_type = hit_type if hit_type in {"company", "person"} else ""
             if not effective_hit_type and forced_search_type in {"company", "person"}:
                 effective_hit_type = forced_search_type
+
+            fast_mode_used = input_type == INPUT_TYPE_INN
+            if fast_mode_used:
+                search_trace = ["⚡ FAST INN MODE: only ФНС ЕГРЮЛ"]
+                source_hits, fast_trace = self._search_external_sources(
+                    raw,
+                    no_cache=no_cache,
+                    search_type=forced_search_type,
+                    provider_names=["ФНС ЕГРЮЛ"],
+                )
+                search_trace.extend(fast_trace)
+            else:
+                source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
+
             if not effective_hit_type and source_hits:
                 first_hit_type = self._normalize_spaces(str(source_hits[0].get("type", ""))).lower()
                 if first_hit_type in {"company", "person"}:
                     effective_hit_type = first_hit_type
             search_trace = reset_note + search_trace
-            extracted_data: dict[str, str] = {}
-            for hit in source_hits:
-                data = hit.get("data", {})
-                if not isinstance(data, dict):
-                    continue
-                for field in [
-                    "surname_ru",
-                    "name_ru",
-                    "middle_name_ru",
-                    "ru_org",
-                    "en_org",
-                    "ru_position",
-                    "en_position",
-                    "gender",
-                    "inn",
-                ]:
-                    value = self._normalize_spaces(str(data.get(field, "")))
-                    if field in {"ru_org", "en_org", "ru_position"} and self.is_block_page_value(value):
-                        value = ""
-                    if value and not extracted_data.get(field):
-                        extracted_data[field] = value
+
+            def extract_data(hits: list[dict[str, Any]]) -> dict[str, str]:
+                extracted: dict[str, str] = {}
+                for hit in hits:
+                    data = hit.get("data", {})
+                    if not isinstance(data, dict):
+                        continue
+                    for field in [
+                        "surname_ru",
+                        "name_ru",
+                        "middle_name_ru",
+                        "ru_org",
+                        "en_org",
+                        "ru_position",
+                        "en_position",
+                        "gender",
+                        "inn",
+                    ]:
+                        value = self._normalize_spaces(str(data.get(field, "")))
+                        if field in {"ru_org", "en_org", "ru_position"} and self.is_block_page_value(value):
+                            value = ""
+                        if value and not extracted.get(field):
+                            extracted[field] = value
+                return extracted
+
+            extracted_data = extract_data(source_hits)
             profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type, forced_type=effective_hit_type)
+
+            if fast_mode_used and not self._is_profile_complete(profile):
+                search_trace.append("🔍 AUTOCOMPLETE MODE: FAST profile incomplete, enabling extended providers")
+                extended_hits, extended_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
+                search_trace.extend(extended_trace)
+                dedup: list[dict[str, Any]] = []
+                seen: set[tuple[str, str]] = set()
+                for hit in source_hits + extended_hits:
+                    key = (
+                        self._normalize_spaces(str(hit.get("source", ""))).lower(),
+                        self._normalize_spaces(str(hit.get("url", ""))).lower(),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    dedup.append(hit)
+                source_hits = dedup
+                extracted_data = extract_data(source_hits)
+                profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type, forced_type=effective_hit_type)
             if effective_hit_type in {"company", "person"}:
                 profile["type"] = effective_hit_type
             if forced_search_type in {"company", "person"}:
