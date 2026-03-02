@@ -60,9 +60,8 @@ def _resolve_log_path() -> Path:
     if env_path:
         return Path(env_path)
 
-    local_app_data = os.getenv("LOCALAPPDATA")
-    if local_app_data:
-        return Path(local_app_data) / "Nadin" / "logs" / "nadin.log"
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "logs" / "nadin.log"
 
     return Path(__file__).resolve().parent / "logs" / "nadin.log"
 
@@ -70,7 +69,7 @@ def _resolve_log_path() -> Path:
 def _configure_logging() -> None:
     log_path = _resolve_log_path()
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    handler = RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
     logging.basicConfig(
         level=logging.INFO,
         handlers=[handler],

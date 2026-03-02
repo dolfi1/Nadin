@@ -58,7 +58,13 @@ pytest -q
 
 ## Portable-сборка для Windows (PyInstaller onedir)
 ```bat
-build_windows_onedir.bat
+build_portable.bat
 ```
 
-Результат: `dist\Nadin\Nadin.exe` + зависимости в одной папке. Скрипт также собирает `release.zip`, внутри которого лежит папка `Nadin` целиком. `Nadin.exe` запускает встроенный WebView-окно (не браузер), поднимает сервер из `web_app.py` в фоне, а логи пишет в `%LOCALAPPDATA%\Nadin\logs\nadin.log`.
+Это единственный поддерживаемый build-скрипт.
+
+Результат:
+- `dist\Nadin\Nadin.exe` + зависимости в одной папке (onedir);
+- `release\Nadin_Portable.zip` для передачи пользователям.
+
+`Nadin.exe` запускает встроенное WebView-окно (не браузер), поднимает сервер в фоне и пишет логи рядом с приложением: `dist\Nadin\logs\nadin.log`.

@@ -8,22 +8,25 @@ from pathlib import Path
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 
 
+def _bundle_dir() -> Path:
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass)
+    return APP_DIR
+
+
 def get_runtime_base_dir() -> Path:
-    """Return a writable runtime base dir (LOCALAPPDATA in user mode, project dir otherwise)."""
+    """Return a writable runtime base dir next to app executable (or project dir in dev)."""
     explicit_base = os.getenv("APP_BASE_DIR")
     if explicit_base:
         return Path(explicit_base)
-
-    local_app_data = os.getenv("LOCALAPPDATA")
-    if local_app_data:
-        return Path(local_app_data) / "Nadin"
 
     return APP_DIR
 
 
 def resource_path(relative_path: str) -> str:
-    """Resolve resource path from APP_DIR for source and frozen onedir runtime."""
-    return str(APP_DIR / relative_path)
+    """Resolve resource path from bundle dir for source and frozen runtime."""
+    return str(_bundle_dir() / relative_path)
 
 
 def ensure_runtime_dirs(base_dir: Path | None = None) -> dict[str, Path]:
@@ -53,7 +56,7 @@ def configure_runtime_env(base_dir: Path | None = None) -> dict[str, Path]:
     os.environ.setdefault("APP_DB_DIR", str(paths["db_dir"]))
     os.environ.setdefault("APP_LOG_DIR", str(paths["logs_dir"]))
     os.environ.setdefault("NADIN_DB_PATH", str(paths["db_dir"] / "cards.db"))
-    os.environ.setdefault("NADIN_LOG_PATH", str(paths["logs_dir"] / "app.log"))
+    os.environ.setdefault("NADIN_LOG_PATH", str(paths["logs_dir"] / "nadin.log"))
     os.environ.setdefault("SCRAPE_MODE_DEFAULT", "fast")
     os.environ.setdefault("SCRAPE_MODE_FALLBACK", "fast")
     os.environ.setdefault("SCRAPE_MODE_HARD", "fast")
