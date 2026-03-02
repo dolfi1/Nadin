@@ -38,7 +38,14 @@ from socketserver import ThreadingMixIn
 from wsgiref.simple_server import WSGIServer, make_server
 
 from card_bot import Card
-from constants import PASSPORT_MAP, POSITION_TRANSLATIONS, RU_TO_EN_OPF
+from app_paths import resource_path
+from constants import (
+    BASE_MODE_PROVIDER_KINDS,
+    EXTENDED_MODE_PROVIDER_KINDS,
+    PASSPORT_MAP,
+    POSITION_TRANSLATIONS,
+    RU_TO_EN_OPF,
+)
 from scrape_client import ScrapeClient
 try:
     from nadin_scrapy.service import merge_provider_payloads as scrapy_merge_provider_payloads
@@ -49,6 +56,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
+    filename=os.getenv("NADIN_LOG_PATH") or None,
 )
 
 logger = logging.getLogger(__name__)
@@ -272,9 +280,11 @@ def _clean_fio_part(s: str) -> str:
 class CompanyWebApp:
     def __init__(self, db_path: str = "cards.db") -> None:
         self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.scrape_client: ScrapeClient | None = None
         self._ensure_scrape_client()
-        self.SOURCE_PROVIDERS = [dict(provider) for provider in SOURCE_PROVIDERS]
+        self._providers_mode = self._resolve_provider_mode()
+        self.SOURCE_PROVIDERS = self._build_provider_list()
         self._source_cache: dict[str, dict[str, Any]] = {}
         self._positive_cache_ttl = 30 * 24 * 60 * 60
         self._negative_cache_ttl_reliable = 4 * 60 * 60
@@ -298,6 +308,18 @@ class CompanyWebApp:
         self._init_db()
         self._clear_provider_cache_pattern("list-org.com")
         self._clear_provider_cache_pattern("list_org")
+
+    def _resolve_provider_mode(self) -> str:
+        mode = os.getenv("NADIN_PROVIDERS_MODE", "extended").strip().lower()
+        return mode if mode in {"base", "extended"} else "extended"
+
+    def _build_provider_list(self) -> list[dict[str, Any]]:
+        providers = [dict(provider) for provider in SOURCE_PROVIDERS]
+        if self._providers_mode == "extended":
+            allowed_kinds = set(EXTENDED_MODE_PROVIDER_KINDS)
+        else:
+            allowed_kinds = set(BASE_MODE_PROVIDER_KINDS)
+        return [provider for provider in providers if provider.get("kind") in allowed_kinds]
 
     def _ensure_scrape_client(self) -> ScrapeClient | None:
         client = getattr(self, "scrape_client", None)
@@ -4945,10 +4967,12 @@ def _startup_diagnostics(app: CompanyWebApp) -> None:
     logger.info("Interpreter: %s", sys.executable)
     logger.info("Playwright browsers: %s", browsers_info)
     logger.info("ScrapeClient initialized: %s", bool(getattr(app, "scrape_client", None)))
+    logger.info("Resource check dlya_anala.xlsx exists: %s", Path(resource_path("dlya_anala.xlsx")).exists())
 
 
 def run_server(db_path: str = "cards.db", host: str = "0.0.0.0", port: int = 8000) -> None:
-    app = CompanyWebApp(db_path=db_path)
+    resolved_db_path = os.getenv("NADIN_DB_PATH", db_path)
+    app = CompanyWebApp(db_path=resolved_db_path)
     _startup_diagnostics(app)
     with make_server(host, port, app, server_class=ThreadingWSGIServer) as httpd:
         browser_host = "localhost" if host == "0.0.0.0" else host
