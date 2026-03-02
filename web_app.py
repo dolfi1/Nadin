@@ -276,8 +276,9 @@ def _clean_fio_part(s: str) -> str:
 
 
 class CompanyWebApp:
-    def __init__(self, db_path: str = "cards.db") -> None:
+    def __init__(self, db_path: str = "cards.db", shutdown_callback: Callable[[], None] | None = None) -> None:
         self.db_path = Path(db_path)
+        self.shutdown_callback = shutdown_callback
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.scrape_client: ScrapeClient | None = None
         self._ensure_scrape_client()
@@ -486,6 +487,8 @@ class CompanyWebApp:
             elif re.fullmatch(r"/card/\d+/export", path) and method == "GET":
                 card_id = int(path.split("/")[-2])
                 body, status, headers = self.export_preview(card_id)
+            elif path == "/shutdown" and method == "POST":
+                body, status, headers = self.shutdown()
             else:
                 body, status, headers = "Not found", "404 Not Found", [("Content-Type", "text/plain; charset=utf-8")]
         except Exception as exc:  # noqa: BLE001
@@ -525,9 +528,19 @@ class CompanyWebApp:
             "<nav style='margin-bottom: 16px'>"
             "<a href='/' style='margin-right: 12px'>🏠 Главная</a>"
             f"<a href='{escape(back_href)}'>← Назад</a>"
+            "<form method='post' action='/shutdown' style='display:inline; margin-left: 12px;'>"
+            "<button type='submit' style='cursor:pointer;'>Выход</button>"
+            "</form>"
             "</nav>"
         )
         return f"<html><head><meta charset='utf-8'><title>{escape(title)}</title></head><body>{nav}{content}</body></html>"
+
+    def shutdown(self) -> tuple[str, str, list[tuple[str, str]]]:
+        logger.info("Shutdown requested from UI")
+        if self.shutdown_callback:
+            self.shutdown_callback()
+        body = self._page("Выход", "<p>Сервер завершает работу…</p>")
+        return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
     def _normalize_spaces(self, text: str) -> str:
         return re.sub(r"\s+", " ", text).strip()

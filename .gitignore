@@ -2,6 +2,7 @@ __pycache__/
 .venv/
 .venv_build/
 .env
+tests/
 build/
 dist/
 release/
