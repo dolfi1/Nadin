@@ -46,19 +46,16 @@ py -3.12 main.py
 - Пайплайн выполняет строгую валидацию ФИО, нормализацию `ru_org/en_org`, `leader_position_ru/en`, выставляет `review_required` и мержит данные по приоритетам источников.
 - В `web_app.py` добавлена интеграция с Scrapy-пайплайном для field-level merge (включено по умолчанию, управляется `SCRAPY_PIPELINE_MERGE`).
 
-## Тесты
-```bash
-pytest -q
-```
-
 ## Ограничения по сбору данных
 - Приложение работает в режиме **strict scraping mode** для доменов с антибот-защитой (`rusprofile.ru`): отключены прокси и любые попытки обхода CAPTCHA/anti-bot.
 - Рекомендуется использовать легальные источники и официальные API, соблюдать robots.txt, ToS и лимиты запросов.
 
 
-## Portable-сборка для Windows (PyInstaller onedir)
+## Сборка Windows-приложения (.exe)
 ```bat
-build_windows_onedir.bat
+build_portable.bat
 ```
 
-Результат: `dist\Nadin\Nadin.exe` + зависимости в одной папке. Скрипт также собирает `release.zip`, внутри которого лежит папка `Nadin` целиком. Приложение читает ресурсы из директории рядом с `exe` и пишет данные в `data/`, логи в `logs/`.
+Результат: `dist\Nadin\Nadin.exe` + зависимости в одной папке и архив `release\Nadin_Portable.zip` для передачи пользователям.
+
+Запуск для пользователя: распаковать архив и открыть `Nadin.exe`.
