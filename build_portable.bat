@@ -23,6 +23,9 @@ set "DIST_DIR=%ROOT%dist"
 set "RELEASE_DIR=%ROOT%release"
 set "OUT_DIR=%DIST_DIR%\%APP_NAME%"
 
+set "PYTHONHOME="
+set "PYTHONPATH="
+
 echo.
 echo === Building %APP_NAME% (onedir) from %ENTRYPOINT% ===
 echo Root: %ROOT%
@@ -75,10 +78,13 @@ REM  4) Build onedir
 REM =========================
 echo [4/6] Running PyInstaller...
 "%PY%" -m PyInstaller ^
+  --noconfirm ^
   --onedir ^
+  --windowed ^
   --name "%APP_NAME%" ^
   --clean ^
-  --noconsole ^
+  --collect-all webview ^
+  --collect-all PySide6 ^
   "%ROOT%%ENTRYPOINT%" || exit /b 1
 
 REM =========================
