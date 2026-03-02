@@ -925,16 +925,19 @@ class CompanyWebApp:
             notes.append("RU организация: оставлена первая часть до запятой")
         cleaned = self._strip_punct(cleaned, russian=True)
         cleaned = re.sub(r"\b(НЕ|НЕТ)\s+(ООО|АО|ПАО|ИП|ЗАО|ОАО)\b", r"\2", cleaned, flags=re.IGNORECASE)
-        cleaned = self._normalize_spaces(self._strip_noise(cleaned.upper()))
-        if "ТЮМЕНСКИЙ ГОСУДАРСТВЕННЫЙ УНИВЕРСИТЕТ" in cleaned:
-            cleaned = re.sub(r"\bТЮМГУ\b", "", cleaned)
+        cleaned = self._normalize_spaces(self._strip_noise(cleaned))
+        cleaned_upper = cleaned.upper()
+        if "ТЮМЕНСКИЙ ГОСУДАРСТВЕННЫЙ УНИВЕРСИТЕТ" in cleaned_upper:
+            cleaned = re.sub(r"\bТЮМГУ\b", "", cleaned, flags=re.IGNORECASE)
             notes.append("RU организация: удалена хвостовая аббревиатура")
         for full, short in FULL_RU_OPF.items():
-            if full in cleaned:
-                cleaned = cleaned.replace(full, short)
+            if full in cleaned_upper:
+                cleaned = re.sub(rf"\b{re.escape(full)}\b", short, cleaned, flags=re.IGNORECASE)
+                cleaned_upper = cleaned.upper()
                 notes.append("RU организация: полная ОПФ сокращена")
-        cleaned = re.sub(r"\b(УНИВЕРСИТЕТ)(\s+\1)+\b", r"\1", cleaned)
+        cleaned = re.sub(r"\b(УНИВЕРСИТЕТ)(\s+\1)+\b", r"\1", cleaned, flags=re.IGNORECASE)
         tokens = cleaned.split()
+        tokens_upper = [token.upper() for token in tokens]
 
         # --- NEW: detect OPF written in words at the beginning ---
         # Examples:
@@ -945,42 +948,57 @@ class CompanyWebApp:
             return len(seq) >= len(prefix) and seq[: len(prefix)] == prefix
 
         opf_from_words: str | None = None
-        if _starts_with(tokens, ["ПУБЛИЧНОЕ", "АКЦИОНЕРНОЕ", "ОБЩЕСТВО"]):
+        if _starts_with(tokens_upper, ["ПУБЛИЧНОЕ", "АКЦИОНЕРНОЕ", "ОБЩЕСТВО"]):
             opf_from_words = "ПАО"
             tokens = tokens[3:]
-        elif _starts_with(tokens, ["АКЦИОНЕРНОЕ", "ОБЩЕСТВО"]):
+            tokens_upper = tokens_upper[3:]
+        elif _starts_with(tokens_upper, ["АКЦИОНЕРНОЕ", "ОБЩЕСТВО"]):
             opf_from_words = "АО"
             tokens = tokens[2:]
-        elif _starts_with(tokens, ["ОБЩЕСТВО", "С", "ОГРАНИЧЕННОЙ", "ОТВЕТСТВЕННОСТЬЮ"]):
+            tokens_upper = tokens_upper[2:]
+        elif _starts_with(tokens_upper, ["ОБЩЕСТВО", "С", "ОГРАНИЧЕННОЙ", "ОТВЕТСТВЕННОСТЬЮ"]):
             opf_from_words = "ООО"
             tokens = tokens[5:]
+            tokens_upper = tokens_upper[5:]
 
         opf = ""
         # if we detected OPF-in-words, force it as if it were the leading abbreviation
         if opf_from_words:
             opf = opf_from_words
         if not opf:
-            if len(tokens) >= 2 and tokens[0] == "ФГАОУ" and tokens[1] == "ВО":
+            if len(tokens_upper) >= 2 and tokens_upper[0] == "ФГАОУ" and tokens_upper[1] == "ВО":
                 opf, tokens = "ФГАОУ ВО", tokens[2:]
+                tokens_upper = tokens_upper[2:]
                 notes.append("RU организация: ОПФ перенесена в конец")
-            elif tokens and tokens[0] in RU_TO_EN_OPF:
-                opf, tokens = tokens[0], tokens[1:]
-            elif len(tokens) >= 2 and tokens[-2] == "ФГАОУ" and tokens[-1] == "ВО":
+            elif tokens_upper and tokens_upper[0] in RU_TO_EN_OPF:
+                opf, tokens = tokens_upper[0], tokens[1:]
+                tokens_upper = tokens_upper[1:]
+            elif len(tokens_upper) >= 2 and tokens_upper[-2] == "ФГАОУ" and tokens_upper[-1] == "ВО":
                 opf, tokens = "ФГАОУ ВО", tokens[:-2]
-            elif tokens and tokens[-1] in RU_TO_EN_OPF:
-                opf, tokens = tokens[-1], tokens[:-1]
+                tokens_upper = tokens_upper[:-2]
+            elif tokens_upper and tokens_upper[-1] in RU_TO_EN_OPF:
+                opf, tokens = tokens_upper[-1], tokens[:-1]
+                tokens_upper = tokens_upper[:-1]
             else:
                 notes.append("RU организация: ОПФ должна быть в конце")
 
-        def _normalize_token(tok: str) -> str:
-            if tok in {"ФГАОУ", "ВО"}:
-                return tok
-            if tok.isupper() and (len(tok) <= 3 or not re.search(r"[АЕЁИОУЫЭЮЯ]", tok)):
-                return tok
-            return tok.capitalize()
+        def _smart_title_ru(name: str) -> str:
+            result_tokens: list[str] = []
+            for token in name.split():
+                token_upper = token.upper()
+                if token_upper in RU_TO_EN_OPF:
+                    result_tokens.append(token_upper)
+                elif len(token) <= 6 and token.isupper() and (
+                    re.search(r"[A-Z0-9]", token_upper) or not re.search(r"[АЕЁИОУЫЭЮЯ]", token_upper)
+                ):
+                    result_tokens.append(token_upper)
+                else:
+                    result_tokens.append(token.capitalize())
+            return " ".join(result_tokens)
 
-        name = " ".join(_normalize_token(tok) for tok in tokens)
+        name = " ".join(tokens)
         result = self._normalize_spaces(f"{name} {opf}" if opf else name)
+        result = _smart_title_ru(result)
         if re.search(r"тюменский\s+государственный\s+университет", result, flags=re.IGNORECASE):
             suffix = " ФГАОУ ВО" if "ФГАОУ ВО" in result.upper() else ""
             result = f"Тюменский государственный университет{suffix}"
