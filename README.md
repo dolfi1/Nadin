@@ -25,7 +25,7 @@
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python main.py
+python web_app.py
 ```
 
 Приложение стартует на `http://localhost:8000`.
@@ -35,7 +35,7 @@ python main.py
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 py -3.12 -m pip install -r requirements.txt
-py -3.12 main.py
+py -3.12 web_app.py
 ```
 
 Если не используете `venv`, всё равно запускайте и `pip`, и приложение через один и тот же интерпретатор `py -3.12`.
@@ -61,4 +61,4 @@ pytest -q
 build_windows_onedir.bat
 ```
 
-Результат: `dist\Nadin\Nadin.exe` + зависимости в одной папке. Скрипт также собирает `release.zip`, внутри которого лежит папка `Nadin` целиком. Приложение читает ресурсы из директории рядом с `exe` и пишет данные в `data/`, логи в `logs/`.
+Результат: `dist\Nadin\Nadin.exe` + зависимости в одной папке. Скрипт также собирает `release.zip`, внутри которого лежит папка `Nadin` целиком. `Nadin.exe` запускает встроенный WebView-окно (не браузер), поднимает сервер из `web_app.py` в фоне, а логи пишет в `%LOCALAPPDATA%\Nadin\logs\nadin.log`.

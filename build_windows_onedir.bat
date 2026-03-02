@@ -7,9 +7,10 @@ if errorlevel 1 exit /b 1
 py -m pip install pyinstaller
 if errorlevel 1 exit /b 1
 
-py -m PyInstaller --noconfirm --clean --name Nadin --windowed --onedir main.py ^
+py -m PyInstaller --noconfirm --clean --name Nadin --windowed --onedir desktop_app.py ^
   --add-data "templates;templates" ^
   --add-data "static;static" ^
+  --add-data "cards.db;." ^
   --add-data "dlya_anala.xlsx;."
 if errorlevel 1 exit /b 1
 
