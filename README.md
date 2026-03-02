@@ -58,7 +58,7 @@ pytest -q
 
 ## Portable-сборка для Windows (PyInstaller onedir)
 ```bat
-build_windows.bat
+build_windows_onedir.bat
 ```
 
-Результат: `dist\Nadin\Nadin.exe` + зависимости в одной папке. Приложение пишет данные в `data/` и логи в `logs/` рядом с `exe`.
+Результат: `dist\Nadin\Nadin.exe` + зависимости в одной папке. Скрипт также собирает `release.zip`, внутри которого лежит папка `Nadin` целиком. Приложение читает ресурсы из директории рядом с `exe` и пишет данные в `data/`, логи в `logs/`.
