@@ -67,4 +67,7 @@ build_portable.bat
 - `dist\Nadin\Nadin.exe` + зависимости в одной папке (onedir);
 - `release\Nadin_Portable.zip` для передачи пользователям.
 
-`Nadin.exe` запускает встроенное WebView-окно (не браузер), поднимает сервер в фоне и пишет логи рядом с приложением: `dist\Nadin\logs\nadin.log`.
+`Nadin.exe` запускает встроенное WebView-окно (не браузер), поднимает сервер в фоне и пишет логи в `%APPDATA%\Nadin\logs\nadin.log` (или путь из `NADIN_LOG_PATH`).
+
+
+Опционально можно запустить `build_portable.bat --cleanup`, чтобы после сборки удалить `build/`, `__pycache__/` и `.venv_build/`.

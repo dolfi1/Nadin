@@ -21,6 +21,10 @@ def get_runtime_base_dir() -> Path:
     if explicit_base:
         return Path(explicit_base)
 
+    appdata = os.getenv("APPDATA")
+    if appdata:
+        return Path(appdata) / "Nadin"
+
     return APP_DIR
 
 

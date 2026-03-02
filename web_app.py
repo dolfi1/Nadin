@@ -23,7 +23,6 @@ from urllib.request import urlopen
 from datetime import datetime, timezone
 from html import escape, unescape
 from pathlib import Path
-from logging.handlers import RotatingFileHandler
 from typing import Any, Callable
 import shutil
 import subprocess
@@ -40,6 +39,7 @@ from wsgiref.simple_server import WSGIServer, make_server
 
 from card_bot import Card
 from app_paths import resource_path
+from logging_setup import setup_logging
 from constants import (
     BASE_MODE_PROVIDER_KINDS,
     EXTENDED_MODE_PROVIDER_KINDS,
@@ -55,30 +55,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 
 
-def _resolve_log_path() -> Path:
-    env_path = os.getenv("NADIN_LOG_PATH")
-    if env_path:
-        return Path(env_path)
-
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent / "logs" / "nadin.log"
-
-    return Path(__file__).resolve().parent / "logs" / "nadin.log"
-
-
-def _configure_logging() -> None:
-    log_path = _resolve_log_path()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
-    logging.basicConfig(
-        level=logging.INFO,
-        handlers=[handler],
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-
-_configure_logging()
+setup_logging()
 
 logger = logging.getLogger(__name__)
 
