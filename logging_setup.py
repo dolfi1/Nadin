@@ -4,13 +4,12 @@ import logging
 import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+import sys
 
 
 def _default_log_path() -> Path:
-    appdata = os.getenv("APPDATA")
-    if appdata:
-        return Path(appdata) / "Nadin" / "logs" / "nadin.log"
-    return Path.home() / ".nadin" / "logs" / "nadin.log"
+    base_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    return base_dir / "logs" / "nadin.log"
 
 
 def setup_logging() -> Path:

@@ -72,10 +72,11 @@ if exist "%ROOT%requirements.txt" (
 REM =========================
 REM  3) Clean old build artifacts
 REM =========================
-echo [3/8] Cleaning old build/dist/release...
+echo [3/8] Cleaning old build/dist/release and caches...
 if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
 if exist "%DIST_DIR%" rmdir /s /q "%DIST_DIR%"
 if exist "%RELEASE_DIR%" rmdir /s /q "%RELEASE_DIR%"
+for /d /r "%ROOT%" %%D in (__pycache__) do @if exist "%%D" rmdir /s /q "%%D"
 mkdir "%RELEASE_DIR%" >nul 2>&1
 
 REM =========================
@@ -88,10 +89,10 @@ echo [4/8] Running PyInstaller...
   --windowed ^
   --name "%APP_NAME%" ^
   --clean ^
-  --hidden-import=clr ^
-  --hidden-import=pythonnet ^
-  --collect-all webview ^
-  --collect-all PySide6 ^
+  --exclude-module tests ^
+  --exclude-module test ^
+  --exclude-module pytest ^
+  --exclude-module tkinter ^
   "%ROOT%%ENTRYPOINT%" || exit /b 1
 
 REM =========================
