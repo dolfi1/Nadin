@@ -112,6 +112,12 @@ BLOCK_PAGE_MARKERS = (
 KNOWN_RU_TO_EN_ORG = {
     "тюменский государственный университет": "Tyumen State University",
 }
+RU_LEGAL_TO_EN = {
+    "ооо": "LLC",
+    "пао": "PJSC",
+    "ао": "JSC",
+    "ип": "IE",
+}
 RU_TO_EN_OPF_EXTENDED = {
     **RU_TO_EN_OPF,
     "ФГАОУ ВО": "FSAEI HE",
@@ -988,29 +994,21 @@ class CompanyWebApp:
         return self._normalize_spaces(" ".join(w for w in words if w))
 
     def _generate_en_position(self, ru_position: str) -> str:
-        position_map = {
-            "Президент": "President",
-            "Председатель правления": "Chairman of the Board",
-            "Генеральный директор": "CEO",
-            "Директор": "Director",
-            "Руководитель": "Head",
-            "Исполнительный директор": "Executive Director",
-            "Главный исполнительный директор": "Chief Executive Officer",
-            "Главный финансовый директор": "Chief Financial Officer",
-        }
         ru_position = self._normalize_spaces(ru_position)
         if not ru_position:
             return ""
-        positions = [p.strip() for p in ru_position.split(",") if p.strip()]
+
+        parts = [p for p in (self._normalize_spaces(chunk) for chunk in ru_position.split(",")) if p]
         en_positions: list[str] = []
-        for pos in positions:
-            en_pos = ""
-            for ru_title, en_title in position_map.items():
-                if ru_title.lower() in pos.lower():
-                    en_pos = en_title
-                    break
-            en_positions.append(en_pos or self._transliterate_ru_to_en(pos))
+        for part in parts:
+            key = self._normalize_ru_position_key(part)
+            translated = POSITION_TRANSLATIONS.get(key, "")
+            if translated:
+                en_positions.append(translated)
         return ", ".join(en_positions)
+
+    def _normalize_ru_position_key(self, value: str) -> str:
+        return " ".join((value or "").replace("ё", "е").strip().lower().split())
 
     def _detect_org_type(self, ru_org: str) -> str:
         value = self._normalize_spaces(ru_org).upper()
@@ -1070,8 +1068,13 @@ class CompanyWebApp:
         notes: list[str] = []
         cleaned = self._normalize_spaces(self._strip_noise(raw))
         ru_key = self._normalize_spaces(fallback_ru.lower())
+        ru_org_normalized, _ = self.normalize_ru_org(fallback_ru)
+        ru_exact_key = self._normalize_spaces(ru_org_normalized.lower())
         opf_ru = "ФГАОУ ВО" if fallback_ru.upper().endswith("ФГАОУ ВО") else ""
         opf_en = RU_TO_EN_OPF_EXTENDED.get(opf_ru, "")
+
+        if ru_exact_key and ru_exact_key in KNOWN_RU_TO_EN_ORG:
+            return self._normalize_spaces(f"{KNOWN_RU_TO_EN_ORG[ru_exact_key]} {opf_en}"), notes
 
         for key, value in KNOWN_RU_TO_EN_ORG.items():
             if key in ru_key:
@@ -1114,6 +1117,16 @@ class CompanyWebApp:
             notes.append("Organization EN: The в начале запрещен")
         result = self._normalize_spaces(f"{name} {opf}" if opf else name)
         result = re.sub(r"^The\s+", "", result, flags=re.IGNORECASE)
+        if not opf and ru_org_normalized:
+            ru_tokens = ru_org_normalized.split()
+            ru_opf = ""
+            if len(ru_tokens) >= 2 and ru_tokens[-2:] == ["ФГАОУ", "ВО"]:
+                ru_opf = "фгаоу во"
+            elif ru_tokens:
+                ru_opf = ru_tokens[-1].lower()
+            legal_en = RU_LEGAL_TO_EN.get(ru_opf)
+            if legal_en:
+                result = self._normalize_spaces(f"{result} {legal_en}")
         return result, notes
 
     def is_block_page_value(self, text: str) -> bool:
@@ -3693,10 +3706,11 @@ class CompanyWebApp:
             ru_pos = ""
         profile["ru_position"] = ru_pos
 
-        if ru_pos in POSITION_TRANSLATIONS:
-            profile["en_position"] = POSITION_TRANSLATIONS[ru_pos]
+        en_position_source = self._normalize_spaces(profile.get("en_position", "") or profile.get("position", ""))
+        if en_position_source:
+            profile["en_position"] = en_position_source
         else:
-            profile["en_position"] = self._transliterate_ru_to_en(ru_pos) if ru_pos else ""
+            profile["en_position"] = self._generate_en_position(ru_pos) if ru_pos else ""
         profile["position"] = profile["en_position"]
         profile["position"], _ = self._normalize_positions_en(profile.get("position", ""))
         profile["en_position"] = profile.get("position", "")

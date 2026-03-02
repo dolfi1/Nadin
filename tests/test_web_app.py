@@ -630,6 +630,31 @@ def test_parse_rusprofile_person_skips_noise_position(tmp_path, monkeypatch):
     assert data.get("ru_position", "") == ""
 
 
+def test_generate_en_position_returns_empty_for_unknown_role(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    assert app._generate_en_position("Главный вдохновитель") == ""
+
+
+def test_build_profile_prefers_provider_en_position(tmp_path):
+    app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
+
+    hits = [{
+        "source": "rusprofile.ru",
+        "data": {
+            "surname_ru": "Иванов",
+            "name_ru": "Иван",
+            "ru_position": "Генеральный директор",
+            "en_position": "CEO",
+            "ru_org": "ООО Ромашка",
+        },
+    }]
+
+    profile, _ = app._build_profile_from_sources(hits, "Иванов Иван", web_app.INPUT_TYPE_PERSON_TEXT)
+
+    assert profile["en_position"] == "CEO"
+
+
 def test_build_profile_generates_position_and_middle_name_en(tmp_path):
     app = CompanyWebApp(db_path=str(tmp_path / "cards.db"))
 
@@ -646,7 +671,7 @@ def test_build_profile_generates_position_and_middle_name_en(tmp_path):
 
     profile, _sources = app._build_profile_from_sources(hits, "Греф Герман", web_app.INPUT_TYPE_PERSON_TEXT)
 
-    assert profile["position"] == "President, Chairman of the Board"
+    assert profile["position"] == "President, Chairman of the Management Board"
     assert profile["middle_name_en"] == "Oskarovich"
 
 
@@ -850,7 +875,7 @@ def test_build_profile_from_sources_keeps_special_case_position_and_names(tmp_pa
                 "ru_org": "ПАО Сбербанк",
                 "en_org": "Sberbank PJSC",
                 "ru_position": "Президент, Председатель правления",
-                "en_position": "President, Chairman of the Board",
+                "en_position": "President, Chairman of the Management Board",
                 "gender": "М",
                 "appeal": "Г-н",
             },
@@ -870,7 +895,7 @@ def test_build_profile_from_sources_keeps_special_case_position_and_names(tmp_pa
     assert profile["surname_ru"] == "Греф"
     assert profile["name_ru"] == "Герман"
     assert profile["ru_position"] == "Президент, Председатель правления"
-    assert profile["en_position"] == "President, Chairman of the Board"
+    assert profile["en_position"] == "President, Chairman of the Management Board"
     assert profile["en_org"] == "Sberbank PJSC"
 
 def test_card_view_renders_en_position_from_profile_field(tmp_path):
