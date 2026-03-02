@@ -1,107 +1,115 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-REM ====== CONFIG ======
+REM ================== CONFIG ==================
 set "APP_NAME=Nadin"
 set "ENTRY=web_app.py"
-set "CLEAN_MODE=release_only"
 
-REM ====== ROOT = folder where this bat is located ======
+REM release layout
+set "RELEASE_BASE=release"
+set "PORTABLE_DIR_NAME=NadinPortable"
+set "APP_SUBDIR=app"
+
+REM cleanup toggles
+set "CLEAN_BUILD_DIST=1"
+set "CLEAN_VENV_BUILD=1"
+set "CLEAN_PY_IN_PORTABLE=1"
+
+REM ================== ROOT ==================
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
-set "RELEASE_BASE=%ROOT%\release"
-set "RELEASE=%RELEASE_BASE%\%APP_NAME%"
-set "LOG=%RELEASE_BASE%\build_log.txt"
 set "MARKER=%ROOT%\.nadin_root_marker"
 set "VENV=%ROOT%\.venv_build"
+
+set "RELEASE_ROOT=%ROOT%\%RELEASE_BASE%\%PORTABLE_DIR_NAME%"
+set "RELEASE_APP=%RELEASE_ROOT%\%APP_SUBDIR%"
+set "LOG=%ROOT%\%RELEASE_BASE%\build_log.txt"
 
 echo.
 echo === Nadin portable build ===
 echo ROOT: "%ROOT%"
-echo CLEAN_MODE: "%CLEAN_MODE%"
-
-if not exist "%RELEASE_BASE%" mkdir "%RELEASE_BASE%"
-
->"%LOG%" echo [START] %date% %time%
-call :log ROOT=%ROOT%
-call :log CLEAN_MODE=%CLEAN_MODE%
-
-REM ====== SAFETY GUARDS ======
-if /I "%ROOT%"=="C:" (
-  echo ERROR: ROOT points to C:\ . Abort.
-  call :log ERROR: ROOT points to C:\
-  exit /b 1
-)
-
-if "%ROOT:~3,1%"=="" (
-  echo ERROR: ROOT path is suspiciously short: "%ROOT%"
-  call :log ERROR: ROOT path is suspiciously short: %ROOT%
-  exit /b 1
-)
-
-if not exist "%ROOT%\build_portable.bat" (
-  echo ERROR: build_portable.bat is missing in ROOT. Abort.
-  call :log ERROR: build_portable.bat is missing in ROOT
-  exit /b 1
-)
+echo RELEASE_ROOT: "%RELEASE_ROOT%"
 
 if not exist "%ROOT%\%ENTRY%" (
   echo ERROR: entrypoint not found: "%ROOT%\%ENTRY%"
-  call :log ERROR: entrypoint not found: %ROOT%\%ENTRY%
+  exit /b 1
+)
+
+REM ===== SAFETY =====
+if /I "%ROOT%"=="C:" (
+  echo ERROR: ROOT points to C:\ (drive root). Abort.
   exit /b 1
 )
 
 if not exist "%MARKER%" (
-  echo WARNING: marker not found. Creating "%MARKER%"
+  echo Creating marker "%MARKER%"
   >"%MARKER%" echo nadin-root
-  call :log WARNING: marker created: %MARKER%
 )
 
-call :log Guards passed
+if not exist "%ROOT%\build_portable.bat" (
+  echo ERROR: build_portable.bat missing in ROOT. Abort.
+  exit /b 1
+)
 
-REM ====== CLEAN BUILD ARTIFACTS ======
-echo.
-echo Cleaning old build artifacts...
-if exist "%ROOT%\build" rmdir /s /q "%ROOT%\build"
-if exist "%ROOT%\dist"  rmdir /s /q "%ROOT%\dist"
+if not exist "%ROOT%\%RELEASE_BASE%" mkdir "%ROOT%\%RELEASE_BASE%"
+>"%LOG%" echo [START] %date% %time%
+call :log ROOT=%ROOT%
+call :log RELEASE_ROOT=%RELEASE_ROOT%
 
-REM ====== BUILD VENV ======
+REM ================== PYTHON DETECT ==================
+set "PY_CMD="
+call :pick_python
+if "%PY_CMD%"=="" (
+  echo ERROR: Python not found (py launcher / python). Install Python 3.x and retry.
+  call :log ERROR: Python not found
+  exit /b 1
+)
+
+echo Using Python: %PY_CMD%
+call :log Using Python: %PY_CMD%
+
+REM ================== CLEAN build/dist ==================
+if "%CLEAN_BUILD_DIST%"=="1" (
+  echo Cleaning old build/dist...
+  if exist "%ROOT%\build" rmdir /s /q "%ROOT%\build"
+  if exist "%ROOT%\dist"  rmdir /s /q "%ROOT%\dist"
+)
+
+REM ================== VENV ==================
 if not exist "%VENV%\Scripts\python.exe" (
-  echo.
   echo Creating build venv...
-  py -3.9 -m venv "%VENV%"
+  %PY_CMD% -m venv "%VENV%"
   if errorlevel 1 (
     echo ERROR: failed to create venv
-    call :log ERROR: failed to create venv
+    call :log ERROR: venv create failed
     exit /b 1
   )
 )
 
-call :log Using venv: %VENV%
-
-echo.
 echo Installing deps...
-call "%VENV%\Scripts\python.exe" -m pip install --upgrade pip
+call "%VENV%\Scripts\python.exe" -m pip install --upgrade pip >>"%LOG%" 2>&1
 if errorlevel 1 (
+  echo ERROR: pip upgrade failed (see log)
   call :log ERROR: pip upgrade failed
   exit /b 1
 )
 
-call "%VENV%\Scripts\python.exe" -m pip install -r "%ROOT%\requirements.txt"
+call "%VENV%\Scripts\python.exe" -m pip install -r "%ROOT%\requirements.txt" >>"%LOG%" 2>&1
 if errorlevel 1 (
+  echo ERROR: requirements install failed (see log)
   call :log ERROR: requirements install failed
   exit /b 1
 )
 
-call "%VENV%\Scripts\python.exe" -m pip install pyinstaller
+call "%VENV%\Scripts\python.exe" -m pip install pyinstaller >>"%LOG%" 2>&1
 if errorlevel 1 (
+  echo ERROR: pyinstaller install failed (see log)
   call :log ERROR: pyinstaller install failed
   exit /b 1
 )
 
-REM ====== BUILD ======
-echo.
+REM ================== BUILD ==================
 echo Running PyInstaller...
 pushd "%ROOT%"
 call "%VENV%\Scripts\python.exe" -m PyInstaller ^
@@ -109,160 +117,101 @@ call "%VENV%\Scripts\python.exe" -m PyInstaller ^
   --clean ^
   --onedir ^
   --name "%APP_NAME%" ^
-  "%ENTRY%"
+  "%ENTRY%" >>"%LOG%" 2>&1
 set "RC=%errorlevel%"
 popd
 
 if not "%RC%"=="0" (
-  echo ERROR: PyInstaller failed with code %RC%
-  call :log ERROR: PyInstaller failed with code %RC%
+  echo ERROR: PyInstaller failed (code %RC%). See "%LOG%".
+  call :log ERROR: PyInstaller failed code=%RC%
   exit /b %RC%
 )
 
 if not exist "%ROOT%\dist\%APP_NAME%\%APP_NAME%.exe" (
   echo ERROR: EXE not found: "%ROOT%\dist\%APP_NAME%\%APP_NAME%.exe"
-  call :log ERROR: dist exe missing: %ROOT%\dist\%APP_NAME%\%APP_NAME%.exe
+  call :log ERROR: dist exe missing
   exit /b 1
 )
 
-call :log EXE found in dist: %ROOT%\dist\%APP_NAME%\%APP_NAME%.exe
+REM ================== PREPARE PORTABLE ==================
+echo Preparing portable folder...
+if exist "%RELEASE_ROOT%" rmdir /s /q "%RELEASE_ROOT%"
+mkdir "%RELEASE_ROOT%"
+mkdir "%RELEASE_APP%"
 
-REM ====== RELEASE FOLDER ======
-echo.
-echo Preparing release folder: "%RELEASE%"
-if exist "%RELEASE%" rmdir /s /q "%RELEASE%"
-mkdir "%RELEASE%"
-
-xcopy "%ROOT%\dist\%APP_NAME%\*" "%RELEASE%\" /E /I /H /Y >nul
+xcopy "%ROOT%\dist\%APP_NAME%\*" "%RELEASE_APP%\" /E /I /H /Y >nul
 if errorlevel 1 (
-  echo ERROR: failed to copy dist to release
-  call :log ERROR: xcopy dist->release failed
+  echo ERROR: failed to copy dist -> portable
+  call :log ERROR: xcopy dist->portable failed
   exit /b 1
 )
 
-if not exist "%RELEASE%\%APP_NAME%.exe" (
-  echo ERROR: EXE not found in release: "%RELEASE%\%APP_NAME%.exe"
-  call :log ERROR: release exe missing: %RELEASE%\%APP_NAME%.exe
+if not exist "%RELEASE_APP%\%APP_NAME%.exe" (
+  echo ERROR: EXE not found in portable: "%RELEASE_APP%\%APP_NAME%.exe"
+  call :log ERROR: portable exe missing
   exit /b 1
 )
 
-call :log EXE found in release: %RELEASE%\%APP_NAME%.exe
+REM стартовый бат для пользователя
+>"%RELEASE_ROOT%\Start %APP_NAME%.bat" echo @echo off
+>>"%RELEASE_ROOT%\Start %APP_NAME%.bat" echo setlocal
+>>"%RELEASE_ROOT%\Start %APP_NAME%.bat" echo cd /d "%%~dp0%APP_SUBDIR%"
+>>"%RELEASE_ROOT%\Start %APP_NAME%.bat" echo start "" "%APP_NAME%.exe"
+>>"%RELEASE_ROOT%\Start %APP_NAME%.bat" echo exit /b 0
 
-REM ====== CLEAN STEP (ONLY AFTER SUCCESSFUL BUILD) ======
-if /I "%CLEAN_MODE%"=="release_only" (
-  call :clean_release
-) else if /I "%CLEAN_MODE%"=="repo_root" (
-  call :clean_repo_root
-) else (
-  echo ERROR: unknown CLEAN_MODE="%CLEAN_MODE%"
-  call :log ERROR: unknown CLEAN_MODE=%CLEAN_MODE%
-  exit /b 1
+REM ================== CLEAN .py INSIDE PORTABLE ONLY ==================
+if "%CLEAN_PY_IN_PORTABLE%"=="1" (
+  echo Cleaning *.py in portable (safe)...
+  for /r "%RELEASE_ROOT%" %%F in (*.py *.pyc *.pyo *.spec) do del /f /q "%%F" >nul 2>&1
+  for /d /r "%RELEASE_ROOT%" %%D in (__pycache__) do rmdir /s /q "%%D" >nul 2>&1
 )
 
-REM ====== OPTIONAL ZIP ======
-echo.
+REM ================== OPTIONAL ZIP ==================
 echo Creating zip...
 powershell -NoProfile -Command ^
-  "Compress-Archive -Path '%RELEASE%\*' -DestinationPath '%RELEASE_BASE%\%APP_NAME%_Portable.zip' -Force" >nul
-if errorlevel 1 (
-  call :log WARNING: zip creation failed
-) else (
-  call :log ZIP created: %RELEASE_BASE%\%APP_NAME%_Portable.zip
+  "Compress-Archive -Path '%RELEASE_ROOT%\*' -DestinationPath '%ROOT%\%RELEASE_BASE%\%APP_NAME%_Portable.zip' -Force" >nul 2>&1
+
+REM ================== FINAL CLEANUP ==================
+if "%CLEAN_BUILD_DIST%"=="1" (
+  if exist "%ROOT%\build" rmdir /s /q "%ROOT%\build"
+  if exist "%ROOT%\dist"  rmdir /s /q "%ROOT%\dist"
 )
 
-REM ====== CLEAN BUILD ARTIFACTS ======
-if exist "%ROOT%\build" rmdir /s /q "%ROOT%\build"
-if exist "%ROOT%\dist"  rmdir /s /q "%ROOT%\dist"
-call :log build/dist cleaned
+if "%CLEAN_VENV_BUILD%"=="1" (
+  if exist "%VENV%" rmdir /s /q "%VENV%"
+)
 
-echo.
-echo DONE: "%RELEASE%\%APP_NAME%.exe"
-echo ZIP:  "%RELEASE_BASE%\%APP_NAME%_Portable.zip"
 call :log DONE
-
+echo.
+echo DONE.
+echo Portable folder: "%RELEASE_ROOT%"
+echo Zip: "%ROOT%\%RELEASE_BASE%\%APP_NAME%_Portable.zip"
+echo Log: "%LOG%"
 pause
 exit /b 0
 
-:clean_release
-echo.
-echo Cleaning release folder only...
-call :log Clean mode: release_only
+REM ================== FUNCTIONS ==================
+:pick_python
+REM prefer py launcher if present
+where py >nul 2>&1
+if not errorlevel 1 (
+  REM try explicit 3.12 first
+  py -3.12 -c "import sys;print(sys.version)" >nul 2>&1
+  if not errorlevel 1 ( set "PY_CMD=py -3.12" & exit /b 0 )
 
-for /r "%RELEASE%" %%F in (*.py *.pyc *.pyo *.spec) do (
-  del /f /q "%%F"
-  call :log Deleted file (release): %%F
+  REM then any 3.x
+  py -3 -c "import sys;print(sys.version)" >nul 2>&1
+  if not errorlevel 1 ( set "PY_CMD=py -3" & exit /b 0 )
 )
 
-for /d /r "%RELEASE%" %%D in (__pycache__) do (
-  rmdir /s /q "%%D"
-  call :log Deleted dir (release): %%D
+REM fallback: python in PATH
+where python >nul 2>&1
+if not errorlevel 1 (
+  python -c "import sys;print(sys.version)" >nul 2>&1
+  if not errorlevel 1 ( set "PY_CMD=python" & exit /b 0 )
 )
 
-for %%D in (tests .git .github .venv_build nadin_scrapy) do (
-  if exist "%RELEASE%\%%D" (
-    rmdir /s /q "%RELEASE%\%%D"
-    call :log Deleted dir (release): %RELEASE%\%%D
-  )
-)
-
-for %%F in (requirements.txt README README.txt README.md .gitignore .gitattributes) do (
-  if exist "%RELEASE%\%%F" (
-    del /f /q "%RELEASE%\%%F"
-    call :log Deleted file (release): %RELEASE%\%%F
-  )
-)
-
-exit /b 0
-
-:clean_repo_root
-echo.
-echo Cleaning repository root (dangerous mode)...
-call :log Clean mode: repo_root
-
-for %%F in (
-  web_app.py
-  scrape_client.py
-  card_bot.py
-  constants.py
-  logging_setup.py
-  desktop_app.py
-  app_paths.py
-) do (
-  if exist "%ROOT%\%%F" (
-    echo Will delete: "%ROOT%\%%F"
-    call :log Will delete file (repo_root): %ROOT%\%%F
-  )
-)
-
-for %%D in (tests nadin_scrapy .venv_build __pycache__) do (
-  if exist "%ROOT%\%%D" (
-    echo Will delete: "%ROOT%\%%D"
-    call :log Will delete dir (repo_root): %ROOT%\%%D
-  )
-)
-
-for %%F in (
-  web_app.py
-  scrape_client.py
-  card_bot.py
-  constants.py
-  logging_setup.py
-  desktop_app.py
-  app_paths.py
-) do (
-  if exist "%ROOT%\%%F" (
-    del /f /q "%ROOT%\%%F"
-    call :log Deleted file (repo_root): %ROOT%\%%F
-  )
-)
-
-for %%D in (tests nadin_scrapy .venv_build __pycache__) do (
-  if exist "%ROOT%\%%D" (
-    rmdir /s /q "%ROOT%\%%D"
-    call :log Deleted dir (repo_root): %ROOT%\%%D
-  )
-)
-
+set "PY_CMD="
 exit /b 0
 
 :log
