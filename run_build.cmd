@@ -1,3 +1,3 @@
 @echo off
 cd /d "%~dp0"
-cmd /k build_portable.bat
+cmd /k portable\build_portable.bat
