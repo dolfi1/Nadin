@@ -100,6 +100,22 @@ FIO_STOP_TOKENS = {
     "инвестиции",
     "мероприятия",
 }
+LEADER_FIO_STOP = {
+    "действует",
+    "обновлено",
+    "актуально",
+    "статус",
+    "карточка",
+    "организация",
+    "инн",
+    "огрн",
+    "кпп",
+    "пао",
+    "ооо",
+    "ао",
+    "банк",
+    "россии",
+}
 FIO_FALSE_SURNAME_TOKENS = {
     "россии",
     "инн",
@@ -715,6 +731,29 @@ class CompanyWebApp:
         letters_count = len(re.findall(r"[А-Яа-яЁё]", token))
         return letters_count >= min_len
 
+    def is_valid_person_name_tokens(self, tokens: list[str]) -> bool:
+        cleaned_tokens = [self._clean_fio_part(token) for token in tokens if self._clean_fio_part(token)]
+        if len(cleaned_tokens) < 2:
+            return False
+        for token in cleaned_tokens:
+            lowered = token.lower()
+            if len(token) < 2:
+                return False
+            if lowered in LEADER_FIO_STOP:
+                return False
+            if not re.fullmatch(r"[А-Яа-яЁё\-]+", token):
+                return False
+            if any(ch.isdigit() for ch in token):
+                return False
+        return True
+
+    def is_valid_ru_fio(self, surname_ru: str, name_ru: str, middle_name_ru: str = "") -> bool:
+        cleaned = [self._clean_fio_part(surname_ru), self._clean_fio_part(name_ru), self._clean_fio_part(middle_name_ru)]
+        tokens = [token for token in cleaned if token]
+        if not self.is_valid_person_name_tokens(tokens):
+            return False
+        return bool(cleaned[0] and cleaned[1])
+
     def _clean_fio_part(self, value: str) -> str:
         return _clean_fio_part(self._normalize_spaces(str(value or "")))
 
@@ -731,6 +770,8 @@ class CompanyWebApp:
         name = self._clean_fio_part(name_ru)
         middle = self._clean_fio_part(middle_name_ru)
         words = [x for x in (surname, name, middle) if x]
+        if not self.is_valid_person_name_tokens(words):
+            return False, "stop_or_invalid_tokens"
         if len(words) < 2:
             return False, "too_few_words"
         if surname.lower() in FIO_FALSE_SURNAME_TOKENS:
@@ -745,6 +786,33 @@ class CompanyWebApp:
             if not self._valid_fio_part(token, min_len=min_len):
                 return False, f"invalid_token:{lowered}"
         return True, "ok"
+
+    def _extract_fio_from_leader_obj(self, obj: dict[str, Any]) -> tuple[str, str, str]:
+        if not isinstance(obj, dict):
+            return "", "", ""
+
+        sv_fl = obj.get("СвФЛ")
+        if isinstance(sv_fl, dict):
+            surname = self._clean_fio_part(str(sv_fl.get("Фамилия") or ""))
+            name = self._clean_fio_part(str(sv_fl.get("Имя") or ""))
+            middle = self._clean_fio_part(str(sv_fl.get("Отчество") or ""))
+            if surname and name:
+                return surname, name, middle
+            fio_full = self._normalize_spaces(str(sv_fl.get("ФИОПолн") or ""))
+            if fio_full:
+                return self._split_fio_ru(fio_full)
+
+        for key in ("ФИОПолн", "ФИО"):
+            fio_str = self._normalize_spaces(str(obj.get(key) or ""))
+            if fio_str:
+                return self._split_fio_ru(fio_str)
+
+        surname = self._clean_fio_part(str(obj.get("Фамилия") or ""))
+        name = self._clean_fio_part(str(obj.get("Имя") or ""))
+        middle = self._clean_fio_part(str(obj.get("Отчество") or ""))
+        if surname and name:
+            return surname, name, middle
+        return "", "", ""
 
     def _leader_source_rank(self, source_name: str) -> int:
         return LEADER_FIO_SOURCE_PRIORITY.get(source_name, 100)
@@ -2178,6 +2246,21 @@ class CompanyWebApp:
                 sv_yul = {}
 
             dol_candidates = []
+            sv_dolzhn_fl = sv_yul.get("СведДолжнФЛ")
+            if sv_dolzhn_fl is not None:
+                if isinstance(sv_dolzhn_fl, list):
+                    first_item = sv_dolzhn_fl[0] if sv_dolzhn_fl else None
+                    first_keys = sorted(list(first_item.keys()))[:30] if isinstance(first_item, dict) else []
+                    logger.info(
+                        "FNS СвЮЛ.СведДолжнФЛ diag: type=list len=%d first_item_type=%s first_item_keys=%s",
+                        len(sv_dolzhn_fl),
+                        type(first_item).__name__ if first_item is not None else "None",
+                        first_keys,
+                    )
+                elif isinstance(sv_dolzhn_fl, dict):
+                    logger.info("FNS СвЮЛ.СведДолжнФЛ diag: type=dict keys=%s", sorted(list(sv_dolzhn_fl.keys()))[:30])
+                else:
+                    logger.info("FNS СвЮЛ.СведДолжнФЛ diag: type=%s", type(sv_dolzhn_fl).__name__)
             for k in ("СведДолжнФЛ", "СвДолжнФЛ", "СведДолжнФЛЮЛ", "СвРуководитель", "СведРуководитель"):
                 v = sv_yul.get(k)
                 if v is not None:
@@ -2268,23 +2351,13 @@ class CompanyWebApp:
                             break
                     if head is None:
                         head = dol_list[0]
-                    fio_str = str(head.get("ФИО") or head.get("ФИОПолн") or "")
-                    if not fio_str:
+                    extracted_surname, extracted_name, extracted_middle = self._extract_fio_from_leader_obj(head)
+                    if extracted_surname or extracted_name or extracted_middle:
+                        surname_ru, name_ru, middle_name_ru = extracted_surname, extracted_name, extracted_middle
+                    if not (surname_ru and name_ru):
                         fio_str = self._first_non_empty_deep_value(head, {"ФИО", "ФИОПолн", "head_ru"})
-                    if fio_str:
-                        surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_str)
-                    else:
-                        sv_fl = head.get("СвФЛ") or head.get("ФИО") or {}
-                        if isinstance(sv_fl, dict):
-                            fio_full = str(sv_fl.get("ФИОПолн") or "")
-                            if fio_full:
-                                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_full)
-                            else:
-                                surname_ru = str(sv_fl.get("Фамилия") or sv_fl.get("surname") or "").capitalize()
-                                name_ru = str(sv_fl.get("Имя") or sv_fl.get("name") or "").capitalize()
-                                middle_name_ru = str(sv_fl.get("Отчество") or sv_fl.get("patronymic") or "").capitalize()
-                        elif isinstance(sv_fl, str):
-                            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(sv_fl)
+                        if fio_str:
+                            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_str)
                     if not position:
                         dolzhn = head.get("СвДолжн") or {}
                         position = str((dolzhn.get("НаимДолжн") if isinstance(dolzhn, dict) else "") or head.get("Должность") or "")
@@ -3662,6 +3735,10 @@ class CompanyWebApp:
             logger.info("Данные special_case применены с приоритетом")
             break
 
+        fns_fio_locked = self.is_valid_ru_fio(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")) and (
+            field_sources.get("surname_ru") == "ФНС ЕГРЮЛ" or field_sources.get("name_ru") == "ФНС ЕГРЮЛ"
+        )
+
         for hit_idx, hit in enumerate(source_hits):
             if hit.get("source") == "special_case":
                 continue
@@ -3705,10 +3782,16 @@ class CompanyWebApp:
                 "en_org",
                 "en_position",
             ]:
+                if fns_fio_locked and field in {"surname_ru", "name_ru", "middle_name_ru"} and source_name != "ФНС ЕГРЮЛ":
+                    continue
                 if data.get(field) and not profile.get(field):
                     profile[field] = str(data[field])
                     field_sources[field] = source_name
                     logger.info("Поле %s заполнено из %s", field, source_name)
+                    if field in {"surname_ru", "name_ru", "middle_name_ru"}:
+                        fns_fio_locked = self.is_valid_ru_fio(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")) and (
+                            field_sources.get("surname_ru") == "ФНС ЕГРЮЛ" or field_sources.get("name_ru") == "ФНС ЕГРЮЛ"
+                        )
 
         for field, _ in CARD_FIELDS:
             if field_sources.get(field) == "special_case":
@@ -3718,6 +3801,8 @@ class CompanyWebApp:
             skip_person_noise = field in {"surname_ru", "name_ru", "middle_name_ru", "gender", "ru_position", "position"}
             value, source_name = self._pick_field_by_priority(field, source_hits, skip_person_noise=skip_person_noise)
             if value:
+                if fns_fio_locked and field in {"surname_ru", "name_ru", "middle_name_ru"} and source_name != "ФНС ЕГРЮЛ":
+                    continue
                 if (
                     field in {"surname_ru", "name_ru", "middle_name_ru"}
                     and profile.get(field)
@@ -3727,6 +3812,10 @@ class CompanyWebApp:
                     continue
                 profile[field] = value
                 field_sources[field] = source_name
+                if field in {"surname_ru", "name_ru", "middle_name_ru"}:
+                    fns_fio_locked = self.is_valid_ru_fio(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")) and (
+                        field_sources.get("surname_ru") == "ФНС ЕГРЮЛ" or field_sources.get("name_ru") == "ФНС ЕГРЮЛ"
+                    )
 
         required_fallback_fields = ["surname_ru", "name_ru", "ru_org", "en_org", "inn"]
         for field in required_fallback_fields:
@@ -3739,6 +3828,8 @@ class CompanyWebApp:
                     continue
                 if candidate and candidate not in {"", " ", query}:
                     if field in {"surname_ru", "name_ru"}:
+                        if fns_fio_locked and hit.get("source") != "ФНС ЕГРЮЛ":
+                            continue
                         source_data = hit.get("data", {}) if isinstance(hit.get("data", {}), dict) else {}
                         surname = self._clean_fio_part(str(source_data.get("surname_ru", "") or (candidate if field == "surname_ru" else "")))
                         name = self._clean_fio_part(str(source_data.get("name_ru", "") or (candidate if field == "name_ru" else "")))
@@ -4680,7 +4771,7 @@ class CompanyWebApp:
                     self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
             if forced_search_type == "company":
-                has_fio_ru = bool(self._normalize_spaces(profile.get("surname_ru", "")) and self._normalize_spaces(profile.get("name_ru", "")))
+                has_fio_ru = self.is_valid_ru_fio(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", ""))
                 has_fio_en = bool(self._normalize_spaces(profile.get("family_name", "")) and self._normalize_spaces(profile.get("first_name", "")))
                 has_fio = has_fio_ru or has_fio_en
                 has_position = bool(self._normalize_spaces(profile.get("ru_position", "")))
