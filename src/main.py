@@ -186,6 +186,16 @@ REVIEW_MARKERS = (
 )
 KNOWN_RU_TO_EN_ORG = {
     "тюменский государственный университет": "Tyumen State University",
+    "тюмнц со ран": "Tyumen Scientific Centre SB RAS",
+    "сбербанк": "Sberbank",
+    "газпром": "Gazprom",
+    "роснефть": "Rosneft",
+    "лукойл": "Lukoil",
+    "россельхозбанк": "Rosselkhozbank",
+    "втб": "VTB Bank",
+    "московский государственный университет": "Lomonosov Moscow State University",
+    "санкт-петербургский государственный университет": "Saint Petersburg State University",
+    "российская академия наук": "Russian Academy of Sciences",
 }
 RU_LEGAL_TO_EN = {
     "ооо": "LLC",
@@ -376,6 +386,7 @@ class CompanyWebApp:
         self._endpoint_rate_limit: dict[str, list[float]] = defaultdict(list)
         self._ddg_query_cache: dict[str, tuple[float, list[str]]] = {}
         self._thread_state = threading.local()
+        self.search_timeout_seconds = 45
         self._http_session = requests.Session()
         _adapter = requests.adapters.HTTPAdapter(
             pool_connections=10,
@@ -443,6 +454,8 @@ class CompanyWebApp:
             self._thread_state.last_fetch_status = FETCH_STATUS_EMPTY_OK
         if not hasattr(self._thread_state, "blocked_fetch"):
             self._thread_state.blocked_fetch = False
+        if not hasattr(self._thread_state, "last_fetch_status_by_domain"):
+            self._thread_state.last_fetch_status_by_domain = {}
 
     def _profile_value(self, profile: dict[str, Any], field: str) -> str:
         if field == "en_position":
@@ -1051,19 +1064,19 @@ class CompanyWebApp:
             return None
 
         whitelist = (
-            ("председатель правления", "Председатель правления"),
-            ("генеральный директор", "Генеральный директор"),
             ("исполняющий обязанности генерального директора", "Исполняющий обязанности генерального директора"),
             ("исполняющий обязанности директора", "Исполняющий обязанности директора"),
             ("исполняющий обязанности ректора", "Исполняющий обязанности ректора"),
             ("исполняющий обязанности", "Исполняющий обязанности"),
+            ("председатель правления", "Председатель правления"),
+            ("заместитель генерального директора", "Заместитель генерального директора"),
+            ("генеральный директор", "Генеральный директор"),
+            ("заместитель директора", "Заместитель директора"),
+            ("главный врач", "Главный врач"),
             ("директор", "Директор"),
             ("ректор", "Ректор"),
             ("президент", "Президент"),
             ("управляющий", "Управляющий"),
-            ("главный врач", "Главный врач"),
-            ("заместитель генерального директора", "Заместитель генерального директора"),
-            ("заместитель директора", "Заместитель директора"),
             ("председатель", "Председатель"),
             ("проректор", "Проректор"),
             ("декан", "Декан"),
@@ -1397,6 +1410,8 @@ class CompanyWebApp:
 
         cleaned = unicodedata.normalize("NFKD", cleaned)
         cleaned = "".join(ch for ch in cleaned if ord(ch) < 128)
+        if cleaned and all(tok == tok.upper() for tok in cleaned.split()):
+            notes.append("Organization EN: только аббревиатуры — требует перевода вручную")
         parts = cleaned.split()
         opf = ""
         if parts and parts[0].upper() in EN_TO_RU_OPF:
@@ -2062,7 +2077,10 @@ class CompanyWebApp:
         if last_started is not None:
             time_diff = time.time() - last_started
             if time_diff < 10:
-                logger.warning("Дубликат запроса %s через %.1f сек", request_key, time_diff)
+                if time_diff < 1.0:
+                    logger.debug("Внутренний повторный запрос %s (%.1f сек) — нормально для fast+extended", request_key, time_diff)
+                else:
+                    logger.warning("Дубликат запроса от пользователя %s через %.1f сек", request_key, time_diff)
         self._last_search_time[request_key] = time.time()
         logger.info("🔍 НАЧАЛО ПОИСКА: '%s' (Тип: %s, Режим: %s)", raw, input_type, search_type or "auto")
         hits: list[dict[str, Any]] = []
@@ -2140,7 +2158,7 @@ class CompanyWebApp:
                 with ThreadPoolExecutor(max_workers=4) as executor:
                     futures = {executor.submit(load_provider, provider): provider for provider in active_providers}
                     try:
-                        for future in as_completed(futures, timeout=30):
+                        for future in as_completed(futures, timeout=self.search_timeout_seconds):
                             try:
                                 provider_name, provider_hits, state = future.result()
                             except Exception as exc:  # noqa: BLE001
@@ -2231,7 +2249,11 @@ class CompanyWebApp:
         if not self._normalize_spaces(url):
             logger.error("Provider generated empty URL, fetch skipped")
             return None
-        timeout = max(15, timeout)
+        domain = urlparse(url).netloc.lower()
+        last_status_by_domain = getattr(self._thread_state, "last_fetch_status_by_domain", {})
+        if last_status_by_domain.get(domain) == FETCH_STATUS_NETWORK_ERROR:
+            timeout = min(timeout, 5)
+        timeout = max(5, timeout)
         self._thread_state.last_fetch_status = FETCH_STATUS_EMPTY_OK
         scrape_client = self._ensure_scrape_client()
         if scrape_client is None:
@@ -2240,6 +2262,7 @@ class CompanyWebApp:
                 result_text = str(getattr(response, "text", ""))
                 status_code = int(getattr(response, "status_code", 500))
                 if status_code == 200 and not self._is_captcha_or_block(result_text, url=url):
+                    self._thread_state.last_fetch_status_by_domain[domain] = FETCH_STATUS_EMPTY_OK
                     return result_text
                 if status_code == 403:
                     self._thread_state.last_fetch_status = FETCH_STATUS_BLOCKED_403
@@ -2247,10 +2270,12 @@ class CompanyWebApp:
                     self._thread_state.last_fetch_status = FETCH_STATUS_RATE_LIMIT_202
                 else:
                     self._thread_state.last_fetch_status = FETCH_STATUS_NETWORK_ERROR
+                self._thread_state.last_fetch_status_by_domain[domain] = self._thread_state.last_fetch_status
                 logger.warning("Fallback fetch failed for %s: status=%d", url, status_code)
                 return None
             except requests.RequestException as exc:
                 self._thread_state.last_fetch_status = FETCH_STATUS_NETWORK_ERROR
+                self._thread_state.last_fetch_status_by_domain[domain] = FETCH_STATUS_NETWORK_ERROR
                 logger.warning("Fallback fetch request error for %s: %s", url, exc)
                 return None
 
@@ -2270,6 +2295,7 @@ class CompanyWebApp:
             self._thread_state.last_fetch_status = FETCH_STATUS_RATE_LIMIT_202
         elif result.status_code >= 500 or result.error_code in {"network_error", "timeout", "request_error"}:
             self._thread_state.last_fetch_status = FETCH_STATUS_NETWORK_ERROR
+        self._thread_state.last_fetch_status_by_domain[domain] = self._thread_state.last_fetch_status
 
         if result.blocked or self._is_captcha_or_block(result.text, url=url):
             host = urlparse(url).netloc.lower()
@@ -5578,7 +5604,6 @@ def _startup_diagnostics(app: CompanyWebApp) -> None:
     logger.info("Interpreter: %s", sys.executable)
     logger.info("Playwright browsers: %s", browsers_info)
     logger.info("ScrapeClient initialized: %s", bool(getattr(app, "scrape_client", None)))
-    logger.info("Resource check dlya_anala.xlsx exists: %s", Path(resource_path("dlya_anala.xlsx")).exists())
 
 
 def _pick_free_port(host: str, start: int = 8000, end: int = 8050) -> int:
