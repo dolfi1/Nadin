@@ -99,11 +99,28 @@ FIO_STOP_TOKENS = {
     "лиц",
     "организации",
     "руководитель",
+    "руководителя",
+    "руководителю",
+    "руководителем",
     "директор",
+    "директора",
+    "директору",
+    "директором",
     "генеральный",
+    "генерального",
     "президент",
+    "президента",
     "председатель",
+    "председателя",
     "правления",
+    "исполняющий",
+    "обязанности",
+    "врач",
+    "врача",
+    "ректор",
+    "ректора",
+    "проректор",
+    "декан",
     "лицо",
     "история",
     "физлиц",
@@ -206,7 +223,7 @@ SOURCE_DOMAINS = {
 }
 
 SOURCE_PROVIDERS: list[dict[str, Any]] = [
-    {"name": "ФНС ЕГРЮЛ", "kind": "egrul", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": True, "priority": 1},
+    {"name": "ФНС ЕГРЮЛ", "kind": "egrul", "supports_inn": True, "supports_name": False, "supports_url": False, "is_person_source": False, "priority": 1},
     {"name": "Wikipedia", "kind": "wikipedia_html", "supports_inn": False, "supports_name": True, "supports_url": True, "is_person_source": False, "priority": 3},
     {"name": "DuckDuckGo HTML", "kind": "duckduckgo_html", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 4},
     {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True, "priority": 5},
@@ -998,7 +1015,14 @@ class CompanyWebApp:
         position = self._normalize_spaces(position)
 
         role_matches = re.findall(
-            r"(президент|председатель\s+правления|председатель|генеральный\s+директор|директор|руководитель|ректор|управляющий)",
+            r"(исполняющий\s+обязанности\s+(?:генерального\s+)?директора"
+            r"|исполняющий\s+обязанности\s+ректора"
+            r"|исполняющий\s+обязанности"
+            r"|президент|председатель\s+правления|председатель"
+            r"|генеральный\s+директор|директор"
+            r"|главный\s+врач|руководитель|ректор|управляющий"
+            r"|заместитель\s+(?:генерального\s+)?директора"
+            r"|заместитель\s+председателя|проректор|декан)",
             position,
             flags=re.IGNORECASE,
         )
@@ -1025,8 +1049,6 @@ class CompanyWebApp:
         lowered = cleaned.lower()
         if any(marker in lowered for marker in POSITION_NOISE_MARKERS):
             return None
-        if _RE_FIO_CANDIDATE.search(cleaned):
-            return None
 
         whitelist = (
             ("председатель правления", "Председатель правления"),
@@ -1048,11 +1070,13 @@ class CompanyWebApp:
             ("начальник", "Начальник"),
             ("руководитель", "Руководитель"),
         )
-        cleaned_key = self._normalize_ru_position_key(cleaned)
+        lowered = self._normalize_ru_position_key(cleaned)
         for needle, canonical in whitelist:
-            if cleaned_key == needle:
+            if re.search(rf"\b{re.escape(needle)}\b", lowered):
                 return canonical
 
+        if _RE_FIO_CANDIDATE.search(cleaned):
+            return None
         if re.search(r"\d", cleaned):
             return None
         if not re.fullmatch(r"[А-Яа-яЁё\-\s,]+", cleaned):
@@ -1168,6 +1192,18 @@ class CompanyWebApp:
             rows += f"<tr><td>{label}</td><td>{escape(str(value))}</td><td>{source}</td><td>{status}</td></tr>"
         return f"<table border='1' cellpadding='6' cellspacing='0'><tr><th>Поле</th><th>Значение</th><th>Источник</th><th>Статус</th></tr>{rows}</table>"
 
+    def _preserve_abbreviations_case(self, text: str) -> str:
+        """Title-case для слов, но аббревиатуры (все заглавные, длина <= 6) сохраняются."""
+        words = text.split()
+        result: list[str] = []
+        for word in words:
+            letters_only = re.sub(r"[^А-ЯЁа-яёA-Za-z]", "", word)
+            if letters_only and letters_only == letters_only.upper():
+                result.append(word)
+            else:
+                result.append(word[0].upper() + word[1:].lower() if word else word)
+        return " ".join(result)
+
     def normalize_ru_org(self, raw: str) -> tuple[str, list[str]]:
         notes: list[str] = []
         cleaned = self._normalize_spaces(str(raw))
@@ -1237,21 +1273,9 @@ class CompanyWebApp:
             else:
                 notes.append("RU организация: ОПФ должна быть в конце")
 
-        def _smart_title_ru(name: str) -> str:
-            result_tokens: list[str] = []
-            for token in name.split():
-                token_upper = token.upper()
-                if token_upper in RU_TO_EN_OPF:
-                    result_tokens.append(token_upper)
-                elif len(token) <= 6 and token.isupper():
-                    result_tokens.append(token_upper)
-                else:
-                    result_tokens.append(token.capitalize())
-            return " ".join(result_tokens)
-
         name = " ".join(tokens)
         result = self._normalize_spaces(f"{name} {opf}" if opf else name)
-        result = _smart_title_ru(result)
+        result = self._preserve_abbreviations_case(result)
         if re.search(r"тюменский\s+государственный\s+университет", result, flags=re.IGNORECASE):
             suffix = " ФГАОУ ВО" if "ФГАОУ ВО" in result.upper() else ""
             result = f"Тюменский государственный университет{suffix}"
@@ -2431,6 +2455,7 @@ class CompanyWebApp:
                 )
             ru_org_raw = self._pick_fns_ru_org_full(sv_yul, str(ru_org_raw or "")) or ru_org_raw
             ru_org = self._clean_ru_org_name(str(ru_org_raw).replace("ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО", "ПАО"))
+            ru_org = self._preserve_abbreviations_case(ru_org)
             if ru_org:
                 ru_org, _ = self.normalize_ru_org(ru_org)
             if not ru_org:
@@ -3390,7 +3415,7 @@ class CompanyWebApp:
             if fallback:
                 return fallback, state, reason
             return None, "empty", "not found"
-        return {"source": "ФНС ЕГРЮЛ", "url": data.get("url", ""), "data": data}, "ok", ""
+        return {"source": "ФНС ЕГРЮЛ", "url": data.get("url", ""), "type": "company", "data": data}, "ok", ""
 
     def _fetch_html_page(self, url: str) -> tuple[str | None, str, str]:
         self._domain_throttle(url)
@@ -4282,6 +4307,7 @@ class CompanyWebApp:
                 has_company_markers = bool(normalized_data.get("ru_org") or normalized_data.get("inn") or normalized_data.get("ogrn"))
                 if not has_person_names and has_company_markers:
                     source_is_company = True
+                    hit_type = "company"
 
             if search_type == "person" and source_is_company:
                 continue
@@ -4369,6 +4395,19 @@ class CompanyWebApp:
         position = re.sub(r"(Факторы риска|Дисквалификация|Нахождение под)", "", position)
         position = self._normalize_spaces(position)
         position = re.sub(r"[,;:]+$", "", position)
+        canonical_map = {
+            "исполняющий обязанности директора": "Исполняющий обязанности директора",
+            "исполняющий обязанности генерального директора": "Исполняющий обязанности генерального директора",
+            "исполняющий обязанности ректора": "Исполняющий обязанности ректора",
+            "исполняющий обязанности": "Исполняющий обязанности",
+            "главный врач": "Главный врач",
+            "заместитель директора": "Заместитель директора",
+            "заместитель генерального директора": "Заместитель генерального директора",
+        }
+        key = self._normalize_ru_position_key(position)
+        if key in canonical_map:
+            return canonical_map[key]
+
         parts = [part.strip() for part in position.split(",") if part.strip()]
         normalized_parts: list[str] = []
         stop_words = {"и", "на", "в", "по", "за", "с", "под", "над"}
@@ -5560,11 +5599,9 @@ def _open_browser(url: str) -> None:
 
 def run_server(db_path: str = "cards.db", host: str = "127.0.0.1", port: int = 8000) -> None:
     resolved_db_path = os.getenv("NADIN_DB_PATH", db_path)
-
     host = os.getenv("NADIN_HOST", host)
     port = int(os.getenv("NADIN_PORT", str(port)))
 
-    # если порт занят — берём свободный (иначе “exe запустился, но сайта нет”)
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             if s.connect_ex((host, port)) == 0:
@@ -5572,13 +5609,24 @@ def run_server(db_path: str = "cards.db", host: str = "127.0.0.1", port: int = 8
     except Exception:
         pass
 
-    app = CompanyWebApp(db_path=resolved_db_path)
-    _startup_diagnostics(app)
+    with make_server(host, port, lambda _environ, start_response: (start_response("503 Starting", []), [b""])[1], server_class=ThreadingWSGIServer) as httpd:
+        def _shutdown_callback() -> None:
+            logger.info("Shutdown initiated from UI — stopping server")
 
-    url = f"http://{host}:{port}/"
+            def _stop() -> None:
+                import time as _t
 
-    with make_server(host, port, app, server_class=ThreadingWSGIServer) as httpd:
-        # открываем браузер один раз после старта
+                _t.sleep(0.4)
+                httpd.shutdown()
+                os._exit(0)
+
+            threading.Thread(target=_stop, daemon=True).start()
+
+        app = CompanyWebApp(db_path=resolved_db_path, shutdown_callback=_shutdown_callback)
+        httpd.set_app(app)
+        _startup_diagnostics(app)
+
+        url = f"http://{host}:{port}/"
         threading.Thread(target=_open_browser, args=(url,), daemon=True).start()
         httpd.serve_forever()
 
