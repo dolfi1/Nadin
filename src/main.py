@@ -100,6 +100,16 @@ FIO_STOP_TOKENS = {
     "инвестиции",
     "мероприятия",
 }
+FIO_FALSE_SURNAME_TOKENS = {
+    "россии",
+    "инн",
+    "банк",
+    "пао",
+    "ооо",
+    "ао",
+    "огрн",
+}
+FIO_FORBIDDEN_TOKEN_RE = re.compile(r"\d|\b(?:инн|огрн|кпп|пао|ооо|ао|оао|зао|банк)\b", flags=re.IGNORECASE)
 LEADER_FIO_SOURCE_PRIORITY = {
     "zachestnyibiznes.ru": 1,
     "companies.rbc.ru": 2,
@@ -713,12 +723,28 @@ class CompanyWebApp:
             profile[field] = self._clean_fio_part(str(profile.get(field, "")))
 
     def _is_valid_leader_fio(self, surname_ru: str, name_ru: str, middle_name_ru: str = "") -> bool:
-        if not (self._valid_fio_part(surname_ru, min_len=3) and self._valid_fio_part(name_ru, min_len=2)):
-            return False
-        if middle_name_ru and not self._valid_fio_part(middle_name_ru, min_len=3):
-            return False
-        joined = " ".join(x for x in [surname_ru, name_ru, middle_name_ru] if x).lower()
-        return not any(re.search(rf"\b{re.escape(stop)}\b", joined) for stop in FIO_STOP_TOKENS)
+        accepted, _ = self._validate_leader_fio_candidate(surname_ru, name_ru, middle_name_ru)
+        return accepted
+
+    def _validate_leader_fio_candidate(self, surname_ru: str, name_ru: str, middle_name_ru: str = "") -> tuple[bool, str]:
+        surname = self._clean_fio_part(surname_ru)
+        name = self._clean_fio_part(name_ru)
+        middle = self._clean_fio_part(middle_name_ru)
+        words = [x for x in (surname, name, middle) if x]
+        if len(words) < 2:
+            return False, "too_few_words"
+        if surname.lower() in FIO_FALSE_SURNAME_TOKENS:
+            return False, "surname_in_false_stoplist"
+        for idx, token in enumerate(words):
+            lowered = token.lower()
+            if lowered in FIO_STOP_TOKENS:
+                return False, f"token_in_stoplist:{lowered}"
+            if FIO_FORBIDDEN_TOKEN_RE.search(lowered):
+                return False, f"token_contains_forbidden_marker:{lowered}"
+            min_len = 2 if idx == 1 else 3
+            if not self._valid_fio_part(token, min_len=min_len):
+                return False, f"invalid_token:{lowered}"
+        return True, "ok"
 
     def _leader_source_rank(self, source_name: str) -> int:
         return LEADER_FIO_SOURCE_PRIORITY.get(source_name, 100)
@@ -786,8 +812,17 @@ class CompanyWebApp:
         return ""
 
     def _extract_fio_from_text(self, text: str) -> tuple[str, str, str]:
-        fio_match = re.search(r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", text)
-        return self._split_fio_ru(fio_match.group(1)) if fio_match else ("", "", "")
+        patterns = [
+            r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
+            r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, text):
+                surname_ru, name_ru, middle_name_ru = self._split_fio_ru(match.group(1))
+                accepted, _ = self._validate_leader_fio_candidate(surname_ru, name_ru, middle_name_ru)
+                if accepted:
+                    return surname_ru, name_ru, middle_name_ru
+        return "", "", ""
 
     def extract_fio_from_noise(self, text: str) -> dict[str, str] | None:
         sample = self._normalize_spaces(str(text))[:200]
@@ -3164,7 +3199,8 @@ class CompanyWebApp:
                 if not match:
                     continue
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(match.group(1))
-                if self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
+                accepted, _ = self._validate_leader_fio_candidate(surname_ru, name_ru, middle_name_ru)
+                if accepted:
                     return surname_ru, name_ru, middle_name_ru
         return "", "", ""
 
@@ -3417,17 +3453,12 @@ class CompanyWebApp:
             if not value:
                 continue
             if field in {"surname_ru", "name_ru", "middle_name_ru"}:
-                min_len = 3 if field != "name_ru" else 2
-                if not self._valid_fio_part(value, min_len=min_len):
+                surname = self._normalize_spaces(str(data.get("surname_ru", "")))
+                name = self._normalize_spaces(str(data.get("name_ru", "")))
+                middle = self._normalize_spaces(str(data.get("middle_name_ru", "")))
+                accepted, _ = self._validate_leader_fio_candidate(surname, name, middle)
+                if not accepted:
                     continue
-                if field in {"surname_ru", "name_ru"}:
-                    other = self._normalize_spaces(str(data.get("name_ru" if field == "surname_ru" else "surname_ru", "")))
-                    if other and not self._is_valid_leader_fio(
-                        value if field == "surname_ru" else other,
-                        value if field == "name_ru" else other,
-                        self._normalize_spaces(str(data.get("middle_name_ru", ""))),
-                    ):
-                        continue
             if skip_person_noise and not self._source_is_person_eligible(source_name, data):
                 continue
             return value, source_name
@@ -3594,6 +3625,22 @@ class CompanyWebApp:
             for noisy_field in ("ru_org", "en_org", "ru_position"):
                 if self.is_block_page_value(data.get(noisy_field, "")):
                     data[noisy_field] = None
+            fio_surname = self._clean_fio_part(str(data.get("surname_ru", "")))
+            fio_name = self._clean_fio_part(str(data.get("name_ru", "")))
+            fio_middle = self._clean_fio_part(str(data.get("middle_name_ru", "")))
+            if fio_surname or fio_name or fio_middle:
+                accepted, reason = self._validate_leader_fio_candidate(fio_surname, fio_name, fio_middle)
+                logger.info(
+                    "leader_fio_candidate source=%s fio='%s' accepted=%s reason=%s",
+                    "special_case",
+                    " ".join(part for part in (fio_surname, fio_name, fio_middle) if part),
+                    accepted,
+                    reason,
+                )
+                if not accepted:
+                    data["surname_ru"] = ""
+                    data["name_ru"] = ""
+                    data["middle_name_ru"] = ""
             for field in [
                 "surname_ru",
                 "name_ru",
@@ -3630,6 +3677,23 @@ class CompanyWebApp:
             )
             if not isinstance(data, dict):
                 continue
+            fio_surname = self._clean_fio_part(str(data.get("surname_ru", "")))
+            fio_name = self._clean_fio_part(str(data.get("name_ru", "")))
+            fio_middle = self._clean_fio_part(str(data.get("middle_name_ru", "")))
+            if fio_surname or fio_name or fio_middle:
+                accepted, reason = self._validate_leader_fio_candidate(fio_surname, fio_name, fio_middle)
+                logger.info(
+                    "leader_fio_candidate source=%s fio='%s' accepted=%s reason=%s",
+                    source_name,
+                    " ".join(part for part in (fio_surname, fio_name, fio_middle) if part),
+                    accepted,
+                    reason,
+                )
+                if not accepted:
+                    data = dict(data)
+                    data["surname_ru"] = ""
+                    data["name_ru"] = ""
+                    data["middle_name_ru"] = ""
             for field in [
                 "surname_ru",
                 "name_ru",
@@ -3674,6 +3738,14 @@ class CompanyWebApp:
                 if field in {"ru_org", "en_org", "ru_position"} and self.is_block_page_value(candidate):
                     continue
                 if candidate and candidate not in {"", " ", query}:
+                    if field in {"surname_ru", "name_ru"}:
+                        source_data = hit.get("data", {}) if isinstance(hit.get("data", {}), dict) else {}
+                        surname = self._clean_fio_part(str(source_data.get("surname_ru", "") or (candidate if field == "surname_ru" else "")))
+                        name = self._clean_fio_part(str(source_data.get("name_ru", "") or (candidate if field == "name_ru" else "")))
+                        middle = self._clean_fio_part(str(source_data.get("middle_name_ru", "")))
+                        accepted, _ = self._validate_leader_fio_candidate(surname, name, middle)
+                        if not accepted:
+                            continue
                     profile[field] = candidate
                     field_sources[field] = f"fallback:{hit.get('source', 'unknown')}"
                     logger.info("FALLBACK: %s = '%s' из %s", field, candidate[:50], field_sources[field])
@@ -3771,12 +3843,15 @@ class CompanyWebApp:
         profile["surname_ru"] = _clean_fio_part(profile.get("surname_ru", ""))
         profile["name_ru"] = _clean_fio_part(profile.get("name_ru", ""))
         profile["middle_name_ru"] = _clean_fio_part(profile.get("middle_name_ru", ""))
-        if profile.get("surname_ru") or profile.get("name_ru"):
-            if not self._is_valid_leader_fio(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")):
-                logger.warning("invalid_fio_rejected: surname=%s name=%s source=%s", profile.get("surname_ru", ""), profile.get("name_ru", ""), field_sources.get("surname_ru", ""))
-                for field in ("surname_ru", "name_ru", "middle_name_ru", "surname", "name", "family_name", "first_name"):
-                    profile[field] = ""
-                    field_sources.pop(field, None)
+        candidate_source = field_sources.get("surname_ru", field_sources.get("name_ru", ""))
+        candidate_fio = " ".join(part for part in (profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")) if part)
+        accepted, reason = self._validate_leader_fio_candidate(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", ""))
+        logger.info("leader_fio_candidate source=%s fio='%s' accepted=%s reason=%s", candidate_source or "", candidate_fio, accepted, reason)
+        if candidate_fio and not accepted:
+            logger.warning("invalid_fio_rejected: surname=%s name=%s source=%s", profile.get("surname_ru", ""), profile.get("name_ru", ""), candidate_source)
+            for field in ("surname_ru", "name_ru", "middle_name_ru", "surname", "name", "family_name", "first_name"):
+                profile[field] = ""
+                field_sources.pop(field, None)
 
         input_inn = self._extract_inn(raw_name) if input_type == INPUT_TYPE_INN else ""
         if input_inn and not profile.get("inn"):
@@ -4504,8 +4579,11 @@ class CompanyWebApp:
                 if not value or profile.get(key):
                     continue
                 if key in {"surname_ru", "name_ru", "middle_name_ru"}:
-                    min_len = 3 if key != "name_ru" else 2
-                    if not self._valid_fio_part(value, min_len=min_len):
+                    surname = self._normalize_spaces(str(extracted_data.get("surname_ru", "")))
+                    name = self._normalize_spaces(str(extracted_data.get("name_ru", "")))
+                    middle = self._normalize_spaces(str(extracted_data.get("middle_name_ru", "")))
+                    accepted, _ = self._validate_leader_fio_candidate(surname, name, middle)
+                    if not accepted:
                         continue
                 profile[key] = value
                 field_sources[key] = "Источник данных"
@@ -4529,9 +4607,11 @@ class CompanyWebApp:
                     field_sources["name_ru"] = candidate_source
                     if candidate_pat:
                         field_sources["middle_name_ru"] = candidate_source
-            if (profile.get("surname_ru") or profile.get("name_ru")) and not self._is_valid_leader_fio(
-                profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")
-            ):
+            final_source = field_sources.get("surname_ru", field_sources.get("name_ru", ""))
+            final_fio = " ".join(part for part in (profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")) if part)
+            accepted, reason = self._validate_leader_fio_candidate(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", ""))
+            logger.info("leader_fio_candidate source=%s fio='%s' accepted=%s reason=%s", final_source, final_fio, accepted, reason)
+            if final_fio and not accepted:
                 for field in ("surname_ru", "name_ru", "middle_name_ru", "surname", "name", "family_name", "first_name"):
                     profile[field] = ""
                     field_sources.pop(field, None)
@@ -4600,7 +4680,9 @@ class CompanyWebApp:
                     self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
             if forced_search_type == "company":
-                has_fio = bool(self._normalize_spaces(profile.get("surname_ru", "")) and self._normalize_spaces(profile.get("name_ru", "")))
+                has_fio_ru = bool(self._normalize_spaces(profile.get("surname_ru", "")) and self._normalize_spaces(profile.get("name_ru", "")))
+                has_fio_en = bool(self._normalize_spaces(profile.get("family_name", "")) and self._normalize_spaces(profile.get("first_name", "")))
+                has_fio = has_fio_ru or has_fio_en
                 has_position = bool(self._normalize_spaces(profile.get("ru_position", "")))
                 if has_position and not has_fio:
                     logger.info("autocreate_skipped: reason=invalid_fields details=company_without_leader")
