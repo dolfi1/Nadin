@@ -160,6 +160,13 @@ BLOCK_PAGE_MARKERS = (
     "429",
     "access denied",
 )
+REVIEW_MARKERS = (
+    "автотранслит",
+    "нужно уточнить",
+    "не найден",
+    "заполните",
+    "ошибка",
+)
 KNOWN_RU_TO_EN_ORG = {
     "тюменский государственный университет": "Tyumen State University",
 }
@@ -563,6 +570,9 @@ class CompanyWebApp:
             elif re.fullmatch(r"/card/\d+/export.csv", path) and method == "GET":
                 card_id = int(path.split("/")[-2])
                 body, status, headers = self.export_csv(card_id)
+            elif re.fullmatch(r"/card/\d+/export/xlsx", path) and method == "GET":
+                card_id = int(path.split("/")[-3])
+                body, status, headers = self.export_xlsx(card_id)
             elif re.fullmatch(r"/card/\d+/export", path) and method == "GET":
                 card_id = int(path.split("/")[-2])
                 body, status, headers = self.export_preview(card_id)
@@ -1391,9 +1401,7 @@ class CompanyWebApp:
         fatal_markers = ("пол должен", "forbidden", "only english")
         if any(any(marker in n.lower() for marker in fatal_markers) for n in notes):
             return "Ошибка формата"
-        if any("автотранслит" in n.lower() for n in notes):
-            return "Нужно проверить"
-        if notes:
+        if any(any(marker in n.lower() for marker in REVIEW_MARKERS) for n in notes):
             return "Нужно проверить"
         return "Найдено"
 
@@ -3804,7 +3812,14 @@ class CompanyWebApp:
 
         profile_type = card_type or self._detect_profile_type(normalized)
         forced_search_type = self._normalize_spaces(str(normalized.get("search_type", ""))).lower()
-        is_company = profile_type == "company" or forced_search_type == "company"
+        has_leader = bool(
+            self._normalize_spaces(str(normalized.get("surname_ru", "")))
+            and self._normalize_spaces(str(normalized.get("name_ru", "")))
+        )
+        if forced_search_type == "company" and has_leader:
+            profile_type = "person_in_company"
+
+        is_company = profile_type == "company"
         if is_company:
             for field in (
                 "surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en",
@@ -3812,6 +3827,10 @@ class CompanyWebApp:
             ):
                 normalized.pop(field, None)
         else:
+            if normalized.get("middle_name_ru"):
+                middle_en = self._normalize_spaces(str(normalized.get("middle_name_en", "")))
+                if not middle_en or re.search(r"[А-Яа-яЁё]", middle_en):
+                    normalized["middle_name_en"] = self._generate_middle_name_en(normalized["middle_name_ru"])
             if not normalized.get("appeal"):
                 normalized["appeal"] = self._derive_salutation(normalized.get("gender", ""))
             normalized["salutation"] = normalized.get("appeal", "")
@@ -4889,13 +4908,6 @@ class CompanyWebApp:
             filled_fields = [k for k, v in profile.items() if v and k not in {"title", "appeal"}]
             logger.info("Заполненные поля профиля: %s", filled_fields)
 
-            # Сохраняем ФИО до apply_card_rules — он удаляет их для company-профиля
-            _pre_rules_surname_ru = self._normalize_spaces(profile.get("surname_ru", ""))
-            _pre_rules_name_ru = self._normalize_spaces(profile.get("name_ru", ""))
-            _pre_rules_middle_ru = self._normalize_spaces(profile.get("middle_name_ru", ""))
-            _pre_rules_family_name = self._normalize_spaces(profile.get("family_name", ""))
-            _pre_rules_first_name = self._normalize_spaces(profile.get("first_name", ""))
-
             profile, notes = self.apply_card_rules(profile)
             if source_hits:
                 notes.append(f"Источники: найдено {len(source_hits)}")
@@ -4907,10 +4919,10 @@ class CompanyWebApp:
                 "q": profile.get("ru_org", "") or raw,
                 "en_org": profile.get("en_org", ""),
                 "person_ru": "  ".join(
-                    x for x in [_pre_rules_surname_ru, _pre_rules_name_ru, _pre_rules_middle_ru] if x
+                    x for x in [profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")] if x
                 ).strip(),
                 "person_en": "  ".join(
-                    x for x in [_pre_rules_family_name, _pre_rules_first_name, profile.get("middle_name_en", "")] if x
+                    x for x in [profile.get("family_name", ""), profile.get("first_name", ""), profile.get("middle_name_en", "")] if x
                 ).strip(),
                 "gender": profile.get("gender", ""),
                 "ru_position": profile.get("ru_position", ""),
@@ -4918,11 +4930,6 @@ class CompanyWebApp:
             }
             for key, value in profile.items():
                 manual_payload[f"profile_{key}"] = value
-            manual_payload["profile_surname_ru"] = _pre_rules_surname_ru
-            manual_payload["profile_name_ru"] = _pre_rules_name_ru
-            manual_payload["profile_middle_name_ru"] = _pre_rules_middle_ru
-            manual_payload["profile_family_name"] = _pre_rules_family_name
-            manual_payload["profile_first_name"] = _pre_rules_first_name
 
             if forced_search_type == "person" and not (self._normalize_spaces(profile.get("surname_ru", "")) and self._normalize_spaces(profile.get("name_ru", ""))):
                 logger.info("autocreate_skipped: reason=invalid_fields details=person_without_name")
@@ -4948,11 +4955,11 @@ class CompanyWebApp:
                     self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
             if forced_search_type == "company":
-                surname_ru = _pre_rules_surname_ru
-                name_ru = _pre_rules_name_ru
-                middle_name_ru = _pre_rules_middle_ru
-                family_name = _pre_rules_family_name
-                first_name = _pre_rules_first_name
+                surname_ru = self._normalize_spaces(profile.get("surname_ru", ""))
+                name_ru = self._normalize_spaces(profile.get("name_ru", ""))
+                middle_name_ru = self._normalize_spaces(profile.get("middle_name_ru", ""))
+                family_name = self._normalize_spaces(profile.get("family_name", ""))
+                first_name = self._normalize_spaces(profile.get("first_name", ""))
                 ru_position = self._normalize_spaces(profile.get("ru_position", ""))
                 has_fio_ru = bool(surname_ru and name_ru)
                 has_fio_en = bool(family_name and first_name)
@@ -5298,6 +5305,7 @@ class CompanyWebApp:
             f"<p>Источник: {escape(card['source'])}</p>"
             f"<p><a href='/card/{card['id']}/edit'>Редактировать карточку</a></p>"
             f"<a href='/card/{card['id']}/export'>Показать данные карточки на сайте</a>"
+            f"<br><a href='/card/{card['id']}/export/xlsx'>Скачать Excel</a>"
             f"{trace_html}"
             "<h3>Audit log</h3><ul>" + entries + "</ul>"
         )
@@ -5447,6 +5455,38 @@ class CompanyWebApp:
             ("Content-Disposition", f'attachment; filename="card_{card_id}.csv"'),
         ]
         return buffer.getvalue(), "200 OK", headers
+
+    def export_xlsx(self, card_id: int) -> tuple[str | bytes, str, list[tuple[str, str]]]:
+        with self._connect() as db:
+            card = db.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
+        if not card:
+            return "Not found", "404 Not Found", [("Content-Type", "text/plain; charset=utf-8")]
+
+        payload = json.loads(card["data_json"] or "{}")
+        profile = payload.get("profile", {})
+        try:
+            import openpyxl
+
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Карточка"
+            for field, label in CARD_FIELDS:
+                ws.append([label, profile.get(field, "")])
+            ws.append(["Статус", card["status"]])
+            ws.append(["Источник", card["source"]])
+            ws.append(["Дата создания", card["created_at"]])
+            buf = io.BytesIO()
+            wb.save(buf)
+            return (
+                buf.getvalue(),
+                "200 OK",
+                [
+                    ("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                    ("Content-Disposition", f'attachment; filename="card_{card_id}.xlsx"'),
+                ],
+            )
+        except ImportError:
+            return self.export_csv(card_id)
 
 
 def _startup_diagnostics(app: CompanyWebApp) -> None:
