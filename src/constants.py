@@ -25,12 +25,17 @@ RU_TO_EN_OPF: Dict[str, str] = {
     "ФГАОУ ВО": "FSAEI HE",
     "ФГБОУ ВО": "FSBEI HE",
     "СПБ ГБУЗ": "SPb SBIH",
-    "ГБУЗ": "SBIH",
+    "ГБУЗ": "SBHI",
+    "ФГБУН": "FSBI",
+    "ФГУП": "FSUE",
+    "ОГБУ": "RSBI",
+    "ГБУ": "SBI",
     "ОАО": "OJSC",
     "ИП": "IE",
-    "МУП": "MUE",
+    "МУП": "MSUE",
     "МАУ": "MAI",
     "ЧУ": "PI",
+    "НКО": "NPO",
 }
 
 PASSPORT_MAP: Dict[str, str] = {
