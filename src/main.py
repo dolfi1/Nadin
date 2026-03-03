@@ -8,11 +8,13 @@ import json
 import os
 import random
 import re
+import socket
 import sqlite3
 import time
 import threading
 import unicodedata
 import uuid
+import webbrowser
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -4999,13 +5001,44 @@ def _startup_diagnostics(app: CompanyWebApp) -> None:
     logger.info("Resource check dlya_anala.xlsx exists: %s", Path(resource_path("dlya_anala.xlsx")).exists())
 
 
-def run_server(db_path: str = "cards.db", host: str = "0.0.0.0", port: int = 8000) -> None:
+def _pick_free_port(host: str, start: int = 8000, end: int = 8050) -> int:
+    for p in range(start, end + 1):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.2)
+            if s.connect_ex((host, p)) != 0:
+                return p
+    raise RuntimeError("No free port available")
+
+
+def _open_browser(url: str) -> None:
+    try:
+        webbrowser.open(url, new=1)
+    except Exception:
+        pass
+
+
+def run_server(db_path: str = "cards.db", host: str = "127.0.0.1", port: int = 8000) -> None:
     resolved_db_path = os.getenv("NADIN_DB_PATH", db_path)
+
+    host = os.getenv("NADIN_HOST", host)
+    port = int(os.getenv("NADIN_PORT", str(port)))
+
+    # если порт занят — берём свободный (иначе “exe запустился, но сайта нет”)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex((host, port)) == 0:
+                port = _pick_free_port(host, 8000, 8050)
+    except Exception:
+        pass
+
     app = CompanyWebApp(db_path=resolved_db_path)
     _startup_diagnostics(app)
+
+    url = f"http://{host}:{port}/"
+
     with make_server(host, port, app, server_class=ThreadingWSGIServer) as httpd:
-        browser_host = "localhost" if host == "0.0.0.0" else host
-        print(f"Running on http://{browser_host}:{port} (bound to {host}:{port})")
+        # открываем браузер один раз после старта
+        threading.Thread(target=_open_browser, args=(url,), daemon=True).start()
         httpd.serve_forever()
 
 
