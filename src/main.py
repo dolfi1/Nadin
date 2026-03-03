@@ -61,6 +61,16 @@ setup_logging()
 
 logger = logging.getLogger(__name__)
 
+# === Предкомпилированные регулярные выражения ===
+_MAX_MEMORY_CACHE = 500
+_RE_SPACES = re.compile(r"\s+")
+_RE_NOISE_CHARS = re.compile(r"[\"'\u201c\u201d«»()\[\]{}.,;:!?]")
+_RE_INN = re.compile(r"\d{10,12}")
+_RE_HTTP = re.compile(r"https?://", re.IGNORECASE)
+_RE_FIO_CANDIDATE = re.compile(r"\b[А-ЯЁа-яё][а-яё-]+\s+[А-ЯЁа-яё][а-яё-]+\s+[А-ЯЁа-яё][а-яё-]+\b")
+_RE_TRAILING_PUNCT = re.compile(r"\s*[,;:]+\s*$")
+_RE_POSITION_NOISE = re.compile(r"(Факторы риска|Дисквалификация|Нахождение под)")
+
 
 class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
     daemon_threads = True
@@ -333,6 +343,7 @@ class CompanyWebApp:
         self._provider_error_streak: dict[str, int] = defaultdict(int)
         self._provider_disabled_until: dict[str, float] = {}
         self._domain_last_call: dict[str, float] = {}
+        self._domain_last_call_lock = threading.Lock()
         self._domain_throttle_seconds = 2
         self._rusprofile_throttle_range = (3, 7)
         self._active_searches: dict[str, float] = {}
@@ -341,12 +352,21 @@ class CompanyWebApp:
         self._endpoint_rate_limit: dict[str, list[float]] = defaultdict(list)
         self._ddg_query_cache: dict[str, tuple[float, list[str]]] = {}
         self._thread_state = threading.local()
+        self._http_session = requests.Session()
+        _adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=20,
+            max_retries=0,
+        )
+        self._http_session.mount("https://", _adapter)
+        self._http_session.mount("http://", _adapter)
         self._source_cache_lock = threading.Lock()
         self._provider_state_lock = threading.Lock()
         self._active_searches_lock = threading.Lock()
         self._strict_scraping_mode = False
         self._init_thread_state()
         self._init_db()
+        threading.Thread(target=self._cache_cleanup_loop, daemon=True).start()
         self._clear_provider_cache_pattern("list-org.com")
         self._clear_provider_cache_pattern("list_org")
 
@@ -386,8 +406,12 @@ class CompanyWebApp:
             db.commit()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-32000")
+        conn.execute("PRAGMA temp_store=MEMORY")
         return conn
 
     def _init_thread_state(self) -> None:
@@ -489,9 +513,21 @@ class CompanyWebApp:
                 );
                 CREATE INDEX IF NOT EXISTS idx_cards_ru_org ON cards(ru_org);
                 CREATE INDEX IF NOT EXISTS idx_cards_inn ON cards(json_extract(data_json, '$.profile.inn'));
+                CREATE INDEX IF NOT EXISTS idx_source_cache_expires ON source_cache(expires_at);
                 """
             )
             db.commit()
+
+
+    def _cache_cleanup_loop(self) -> None:
+        while True:
+            time.sleep(3600)
+            try:
+                with self._connect() as db:
+                    db.execute("DELETE FROM source_cache WHERE expires_at < ?", (time.time(),))
+                    db.commit()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Cache cleanup error: %s", exc)
 
     def __call__(self, environ: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
         method = environ.get("REQUEST_METHOD", "GET")
@@ -586,10 +622,10 @@ class CompanyWebApp:
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
     def _normalize_spaces(self, text: str) -> str:
-        return re.sub(r"\s+", " ", text).strip()
+        return _RE_SPACES.sub(" ", text).strip()
 
     def _strip_noise(self, text: str) -> str:
-        return re.sub(r"[\"'“”«»()\[\]{}.,;:!?]", " ", text)
+        return _RE_NOISE_CHARS.sub(" ", text)
 
     def _strip_punct(self, text: str, russian: bool = False) -> str:
         allowed = "A-Za-z0-9А-Яа-яЁё -" if russian else "A-Za-z0-9 -"
@@ -597,9 +633,9 @@ class CompanyWebApp:
 
     def detect_input_type(self, raw: str) -> str:
         value = self._normalize_spaces(raw)
-        if re.fullmatch(r"\d{10,12}", value):
+        if _RE_INN.fullmatch(value):
             return INPUT_TYPE_INN
-        if re.match(r"https?://", value, flags=re.IGNORECASE):
+        if _RE_HTTP.match(value):
             return INPUT_TYPE_URL
         if self._looks_like_person_text(value):
             return INPUT_TYPE_PERSON_TEXT
@@ -948,7 +984,7 @@ class CompanyWebApp:
         surname_ru, name_ru, middle_name_ru, fio_raw = self._extract_fio_from_position_text(position)
         if fio_raw:
             position = self._normalize_spaces(position.replace(fio_raw, " "))
-        position = re.sub(r"\s*[,;:]+\s*$", "", position)
+        position = _RE_TRAILING_PUNCT.sub("", position)
         position = self._normalize_spaces(position)
 
         role_matches = re.findall(
@@ -979,7 +1015,7 @@ class CompanyWebApp:
         lowered = cleaned.lower()
         if any(marker in lowered for marker in POSITION_NOISE_MARKERS):
             return None
-        if re.search(r"\b[А-ЯЁа-яё][а-яё-]+\s+[А-ЯЁа-яё][а-яё-]+\s+[А-ЯЁа-яё][а-яё-]+\b", cleaned):
+        if _RE_FIO_CANDIDATE.search(cleaned):
             return None
 
         whitelist = (
@@ -1422,6 +1458,12 @@ class CompanyWebApp:
         expires_at = time.time() + ttl
         payload = json.dumps(hits, ensure_ascii=False)
         with self._source_cache_lock:
+            if len(self._source_cache) >= _MAX_MEMORY_CACHE:
+                oldest_key = min(
+                    self._source_cache,
+                    key=lambda k: self._source_cache[k].get("expires_at", 0),
+                )
+                self._source_cache.pop(oldest_key, None)
             self._source_cache[cache_key] = {"hits": hits, "expires_at": expires_at}
         with self._connect() as db:
             db.execute(
@@ -1442,7 +1484,7 @@ class CompanyWebApp:
             return len(dropped) + int(cur.rowcount)
 
     def _clear_cache_for_person(self, query: str) -> int:
-        normalized = re.sub(r"\s+", "", self._normalize_spaces(query).lower())
+        normalized = _RE_SPACES.sub("", self._normalize_spaces(query).lower())
         if not normalized:
             return 0
         key_fragment = f"person:{normalized}"
@@ -1863,7 +1905,7 @@ class CompanyWebApp:
         if search_type == "person":
             return bool(merged.get("surname_ru") and merged.get("name_ru"))
         if search_type == "company" or input_type == INPUT_TYPE_INN:
-            return bool(
+            if bool(
                 merged.get("inn")
                 and merged.get("ru_org")
                 and merged.get("surname_ru")
@@ -1871,7 +1913,20 @@ class CompanyWebApp:
                 and merged.get("ru_position")
                 and (merged.get("family_name") or merged.get("surname_ru"))
                 and (merged.get("first_name") or merged.get("name_ru"))
-            )
+            ):
+                return True
+
+        fns_hits = [h for h in hits if h.get("source") == "ФНС ЕГРЮЛ"]
+        if fns_hits:
+            fns_data = fns_hits[0].get("data", {})
+            if (
+                fns_data.get("inn")
+                and fns_data.get("ru_org")
+                and fns_data.get("ru_position")
+                and fns_data.get("surname_ru")
+                and fns_data.get("name_ru")
+            ):
+                return True
         return False
 
     def _merge_hits_with_scrapy_pipeline(self, hits: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2039,16 +2094,27 @@ class CompanyWebApp:
                 and not (search_type == "person" and not provider.get("is_person_source", False))
             ]
             if active_providers:
-                for provider in active_providers:
-                    provider_name, provider_hits, state = load_provider(provider)
-                    if provider_hits:
-                        hits.extend(provider_hits)
-                    hits_by_provider[provider_name] = len(provider_hits)
-                    icon = "✅" if provider_hits else "❌"
-                    trace.append(f"{icon} Источник: {provider_name} — {state}")
-                    if self._can_stop_provider_search(hits, search_type=search_type, input_type=input_type):
-                        trace.append("⏹️ Источники: ранняя остановка (достаточно данных)")
-                        break
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = {executor.submit(load_provider, provider): provider for provider in active_providers}
+                    try:
+                        for future in as_completed(futures, timeout=30):
+                            try:
+                                provider_name, provider_hits, state = future.result()
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("Provider future error: %s", exc)
+                                continue
+                            if provider_hits:
+                                hits.extend(provider_hits)
+                            hits_by_provider[provider_name] = len(provider_hits)
+                            icon = "✅" if provider_hits else "❌"
+                            trace.append(f"{icon} Источник: {provider_name} — {state}")
+                            if self._can_stop_provider_search(hits, search_type=search_type, input_type=input_type):
+                                trace.append("⏹️ Ранняя остановка")
+                                for pending in futures:
+                                    pending.cancel()
+                                break
+                    except FuturesTimeoutError:
+                        trace.append("⏱️ Источники: timeout ожидания результатов")
             for provider in providers:
                 if not self._should_call_provider(provider, input_type):
                     continue
@@ -2075,12 +2141,13 @@ class CompanyWebApp:
         throttle_seconds = self._domain_throttle_seconds
         if host in {"rusprofile.ru", "www.rusprofile.ru"}:
             throttle_seconds = random.randint(*self._rusprofile_throttle_range)
-        last_call = self._domain_last_call.get(host, 0)
-        wait_for = throttle_seconds - (time.time() - last_call)
-        if wait_for > 0:
-            logger.info("Throttle for %s: %.1f sec", host, wait_for)
-            time.sleep(wait_for)
-        self._domain_last_call[host] = time.time()
+        with self._domain_last_call_lock:
+            last_call = self._domain_last_call.get(host, 0)
+            wait_for = throttle_seconds - (time.time() - last_call)
+            if wait_for > 0:
+                logger.info("Throttle for %s: %.1f sec", host, wait_for)
+                time.sleep(wait_for)
+            self._domain_last_call[host] = time.time()
 
     def _is_captcha_or_block(self, response_text: str, url: str = "") -> bool:
         text_lower = response_text.lower()
@@ -2126,7 +2193,7 @@ class CompanyWebApp:
         scrape_client = self._ensure_scrape_client()
         if scrape_client is None:
             try:
-                response = requests.get(url, timeout=timeout, allow_redirects=True)
+                response = self._http_session.get(url, timeout=timeout, allow_redirects=True)
                 result_text = str(getattr(response, "text", ""))
                 status_code = int(getattr(response, "status_code", 500))
                 if status_code == 200 and not self._is_captcha_or_block(result_text, url=url):
@@ -2260,7 +2327,7 @@ class CompanyWebApp:
         for attempt in range(attempts):
             try:
                 headers = self._get_random_headers(self._get_random_user_agent())
-                response = requests.get(url, timeout=timeout, headers=headers, verify=True, allow_redirects=True)
+                response = self._http_session.get(url, timeout=timeout, headers=headers, verify=True, allow_redirects=True)
                 if getattr(response, "apparent_encoding", None):
                     response.encoding = response.apparent_encoding
                 return response
@@ -3279,11 +3346,12 @@ class CompanyWebApp:
         return payload
 
     def _throttle_acquire(self, domain: str) -> bool:
-        now = time.time()
-        last = self._domain_last_call.get(domain, 0)
-        if now - last < self._domain_throttle_seconds:
-            time.sleep(self._domain_throttle_seconds)
-        self._domain_last_call[domain] = now
+        with self._domain_last_call_lock:
+            now = time.time()
+            last = self._domain_last_call.get(domain, 0)
+            if now - last < self._domain_throttle_seconds:
+                time.sleep(self._domain_throttle_seconds)
+            self._domain_last_call[domain] = now
         return True
 
     def _save_rate_limited(self, provider_name: str, key: str, retry_seconds: int = 300) -> None:
@@ -4544,6 +4612,21 @@ class CompanyWebApp:
 
         return source_hits, candidates, trace
 
+    def _dedup_source_hits(self, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[tuple[str, str, str]] = set()
+        result: list[dict[str, Any]] = []
+        for hit in hits:
+            data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+            source_key = self._normalize_spaces(str(hit.get("source", ""))).lower()
+            inn_key = self._normalize_spaces(str(data.get("inn", ""))).lower()
+            org_key = self._normalize_spaces(str(data.get("ru_org", ""))).lower()
+            key = (source_key, inn_key, "" if inn_key else org_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(hit)
+        return result
+
     def search_page(self, query: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
         q = (query.get("q") or [""])[0].strip()
         surname = (query.get("surname") or [""])[0].strip()
@@ -4702,6 +4785,8 @@ class CompanyWebApp:
             else:
                 source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
 
+            source_hits = self._dedup_source_hits(source_hits)
+
             if not effective_hit_type and source_hits:
                 first_hit_type = self._normalize_spaces(str(source_hits[0].get("type", ""))).lower()
                 if first_hit_type in {"company", "person"}:
@@ -4739,20 +4824,7 @@ class CompanyWebApp:
                 search_trace.append("🔍 AUTOCOMPLETE MODE: FAST profile incomplete, enabling extended providers")
                 extended_hits, extended_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
                 search_trace.extend(extended_trace)
-                dedup: list[dict[str, Any]] = []
-                seen: set[tuple[str, str, str]] = set()
-                for hit in source_hits + extended_hits:
-                    data = hit.get("data", {})
-                    key = (
-                        self._normalize_spaces(str(hit.get("source", ""))).lower(),
-                        self._normalize_spaces(str(data.get("inn", ""))).lower() if isinstance(data, dict) else "",
-                        self._normalize_spaces(str(data.get("ru_org", ""))).lower() if isinstance(data, dict) else "",
-                    )
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    dedup.append(hit)
-                source_hits = dedup
+                source_hits = self._dedup_source_hits(source_hits + extended_hits)
                 extracted_data = extract_data(source_hits)
                 profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type, forced_type=effective_hit_type)
             if effective_hit_type in {"company", "person"}:
@@ -4817,6 +4889,13 @@ class CompanyWebApp:
             filled_fields = [k for k, v in profile.items() if v and k not in {"title", "appeal"}]
             logger.info("Заполненные поля профиля: %s", filled_fields)
 
+            # Сохраняем ФИО до apply_card_rules — он удаляет их для company-профиля
+            _pre_rules_surname_ru = self._normalize_spaces(profile.get("surname_ru", ""))
+            _pre_rules_name_ru = self._normalize_spaces(profile.get("name_ru", ""))
+            _pre_rules_middle_ru = self._normalize_spaces(profile.get("middle_name_ru", ""))
+            _pre_rules_family_name = self._normalize_spaces(profile.get("family_name", ""))
+            _pre_rules_first_name = self._normalize_spaces(profile.get("first_name", ""))
+
             profile, notes = self.apply_card_rules(profile)
             if source_hits:
                 notes.append(f"Источники: найдено {len(source_hits)}")
@@ -4828,10 +4907,10 @@ class CompanyWebApp:
                 "q": profile.get("ru_org", "") or raw,
                 "en_org": profile.get("en_org", ""),
                 "person_ru": "  ".join(
-                    x for x in [profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")] if x
+                    x for x in [_pre_rules_surname_ru, _pre_rules_name_ru, _pre_rules_middle_ru] if x
                 ).strip(),
                 "person_en": "  ".join(
-                    x for x in [profile.get("family_name", ""), profile.get("first_name", ""), profile.get("middle_name_en", "")] if x
+                    x for x in [_pre_rules_family_name, _pre_rules_first_name, profile.get("middle_name_en", "")] if x
                 ).strip(),
                 "gender": profile.get("gender", ""),
                 "ru_position": profile.get("ru_position", ""),
@@ -4839,6 +4918,11 @@ class CompanyWebApp:
             }
             for key, value in profile.items():
                 manual_payload[f"profile_{key}"] = value
+            manual_payload["profile_surname_ru"] = _pre_rules_surname_ru
+            manual_payload["profile_name_ru"] = _pre_rules_name_ru
+            manual_payload["profile_middle_name_ru"] = _pre_rules_middle_ru
+            manual_payload["profile_family_name"] = _pre_rules_family_name
+            manual_payload["profile_first_name"] = _pre_rules_first_name
 
             if forced_search_type == "person" and not (self._normalize_spaces(profile.get("surname_ru", "")) and self._normalize_spaces(profile.get("name_ru", ""))):
                 logger.info("autocreate_skipped: reason=invalid_fields details=person_without_name")
@@ -4864,11 +4948,11 @@ class CompanyWebApp:
                     self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
             if forced_search_type == "company":
-                surname_ru = self._normalize_spaces(profile.get("surname_ru", ""))
-                name_ru = self._normalize_spaces(profile.get("name_ru", ""))
-                middle_name_ru = self._normalize_spaces(profile.get("middle_name_ru", ""))
-                family_name = self._normalize_spaces(profile.get("family_name", ""))
-                first_name = self._normalize_spaces(profile.get("first_name", ""))
+                surname_ru = _pre_rules_surname_ru
+                name_ru = _pre_rules_name_ru
+                middle_name_ru = _pre_rules_middle_ru
+                family_name = _pre_rules_family_name
+                first_name = _pre_rules_first_name
                 ru_position = self._normalize_spaces(profile.get("ru_position", ""))
                 has_fio_ru = bool(surname_ru and name_ru)
                 has_fio_en = bool(family_name and first_name)
