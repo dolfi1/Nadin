@@ -19,6 +19,12 @@ echo Root  : "%~dp0"
 echo ======================================
 
 set "LOG=%ROOT%\release\build_log.txt"
+
+REM --- self-check: forbid dot-only lines like ".." / "..."
+for /f "delims=" %%A in ('findstr /n /r "^[.][.][.]*$" "%~f0"') do (
+  call :die "Invalid line (dot-only) found in bat: %%A"
+)
+
 if not exist "%ROOT%\release" mkdir "%ROOT%\release"
 if errorlevel 1 call :die "failed to create release directory"
 >"%LOG%" echo ==== BUILD START %date% %time% ====
