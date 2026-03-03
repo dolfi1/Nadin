@@ -5,6 +5,9 @@ call :main
 exit /b %errorlevel%
 
 :main
+set "TRACE=1"
+if "%TRACE%"=="1" echo on
+
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
@@ -51,6 +54,7 @@ echo.
 echo === Nadin portable build ===
 echo ROOT: "%ROOT%"
 echo RELEASE_ROOT: "%RELEASE_ROOT%"
+echo Reached checkpoint: after ROOT/RELEASE vars
 call :log ROOT: %ROOT%
 call :log RELEASE_ROOT: %RELEASE_ROOT%
 
