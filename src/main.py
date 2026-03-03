@@ -86,6 +86,7 @@ LEADER_LABEL_RE = re.compile(
 FIO_STOP_TOKENS = {
     "юридического",
     "лица",
+    "лиц",
     "организации",
     "руководитель",
     "директор",
@@ -115,6 +116,12 @@ LEADER_FIO_STOP = {
     "ао",
     "банк",
     "россии",
+    "история",
+    "проверить",
+    "юридического",
+    "лица",
+    "лиц",
+    "физлиц",
 }
 FIO_FALSE_SURNAME_TOKENS = {
     "россии",
@@ -294,6 +301,11 @@ POSITION_NOISE_MARKERS = {
     "результат",
     "подробнее",
 }
+
+POSITION_NOISE_PHRASES_RE = re.compile(
+    r"\b(?:история|проверить|юридического\s+лица|физлиц|действует|обновлено|сведения|инн|огрн)\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _clean_fio_part(s: str) -> str:
@@ -911,6 +923,49 @@ class CompanyWebApp:
             "name_ru": name.title(),
             "middle_name_ru": middle_name.title(),
         }
+
+    def _extract_fio_from_position_text(self, text: str) -> tuple[str, str, str, str]:
+        normalized = self._normalize_spaces(text)
+        if not normalized:
+            return "", "", "", ""
+        for match in re.finditer(r"\b([А-ЯЁа-яё][а-яё-]+(?:\s+[А-ЯЁа-яё][а-яё-]+){1,2})\b", normalized):
+            fio_raw = self._normalize_spaces(match.group(1))
+            surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_raw.title())
+            accepted, _ = self._validate_leader_fio_candidate(surname_ru, name_ru, middle_name_ru)
+            if accepted:
+                return surname_ru, name_ru, middle_name_ru, fio_raw
+        return "", "", "", ""
+
+    def _clean_position_and_extract_fio(self, raw_position: str) -> tuple[str, str, str, str, str]:
+        position = self._normalize_spaces(raw_position)
+        if not position:
+            return "", "", "", "", ""
+        position = POSITION_NOISE_PHRASES_RE.sub(" ", position)
+        position = self._normalize_spaces(position)
+        surname_ru, name_ru, middle_name_ru, fio_raw = self._extract_fio_from_position_text(position)
+        if fio_raw:
+            position = self._normalize_spaces(position.replace(fio_raw, " "))
+        position = re.sub(r"\s*[,;:]+\s*$", "", position)
+        position = self._normalize_spaces(position)
+
+        role_matches = re.findall(
+            r"(президент|председатель\s+правления|председатель|генеральный\s+директор|директор|руководитель|ректор|управляющий)",
+            position,
+            flags=re.IGNORECASE,
+        )
+        if role_matches:
+            unique_roles: list[str] = []
+            for role in role_matches:
+                normalized_role = self._normalize_position_ru(role)
+                if normalized_role and normalized_role not in unique_roles:
+                    unique_roles.append(normalized_role)
+            cleaned_position = ", ".join(unique_roles)
+        else:
+            cleaned_position = self.sanitize_ru_position(position) or ""
+            if cleaned_position:
+                cleaned_position = self._normalize_position_ru(cleaned_position)
+
+        return cleaned_position, surname_ru, name_ru, middle_name_ru, fio_raw
 
     def sanitize_ru_position(self, text: str) -> str | None:
         cleaned = self._normalize_spaces(str(text or ""))
@@ -3094,6 +3149,12 @@ class CompanyWebApp:
         if director:
             surname_ru, name_ru, middle_name_ru = self._split_fio_ru(director)
 
+        cleaned_position, pos_surname, pos_name, pos_middle, _ = self._clean_position_and_extract_fio(position)
+        if cleaned_position:
+            position = cleaned_position
+        if not (surname_ru and name_ru) and pos_surname and pos_name:
+            surname_ru, name_ru, middle_name_ru = pos_surname, pos_name, pos_middle
+
         text = self._normalize_spaces(page_text)
         if not self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
             surname_ru = name_ru = middle_name_ru = ""
@@ -3120,6 +3181,12 @@ class CompanyWebApp:
             )
             if pos_match:
                 position = self._normalize_spaces(pos_match.group(1).split("ИНН")[0])
+
+        cleaned_position, pos_surname, pos_name, pos_middle, _ = self._clean_position_and_extract_fio(position)
+        if cleaned_position:
+            position = cleaned_position
+        if not (surname_ru and name_ru) and pos_surname and pos_name:
+            surname_ru, name_ru, middle_name_ru = pos_surname, pos_name, pos_middle
 
         inn = ""
         inn_match = re.search(r"ИНН[:\s]*(\d{10,12})", text)
@@ -3626,11 +3693,14 @@ class CompanyWebApp:
         notes: list[str] = []
 
         pos_raw = self._normalize_spaces(normalized.get("ru_position", ""))
-        fio_from_noise = self.extract_fio_from_noise(pos_raw)
-        if fio_from_noise and not (normalized.get("surname_ru") and normalized.get("name_ru") and normalized.get("middle_name_ru")):
-            for key in ("surname_ru", "name_ru", "middle_name_ru"):
-                if not normalized.get(key):
-                    normalized[key] = fio_from_noise[key]
+        cleaned_position, pos_surname, pos_name, pos_middle, _ = self._clean_position_and_extract_fio(pos_raw)
+        if cleaned_position:
+            normalized["ru_position"] = cleaned_position
+            pos_raw = cleaned_position
+        if pos_surname and pos_name and not (normalized.get("surname_ru") and normalized.get("name_ru")):
+            normalized["surname_ru"] = normalized.get("surname_ru") or pos_surname
+            normalized["name_ru"] = normalized.get("name_ru") or pos_name
+            normalized["middle_name_ru"] = normalized.get("middle_name_ru") or pos_middle
 
         org_type = self._detect_org_type(normalized.get("ru_org", ""))
 
@@ -4112,7 +4182,16 @@ class CompanyWebApp:
                 normalized_data["en_org"], _ = self.normalize_en_org(str(normalized_data["en_org"]), str(normalized_data.get("ru_org", "")))
 
             if normalized_data.get("ru_position"):
-                normalized_data["ru_position"] = self._normalize_position_ru(str(normalized_data["ru_position"]))
+                cleaned_position, pos_surname, pos_name, pos_middle, fio_raw = self._clean_position_and_extract_fio(str(normalized_data["ru_position"]))
+                normalized_data["ru_position"] = cleaned_position
+                if fio_raw:
+                    normalized_data["leader_fio_raw"] = fio_raw
+                if not normalized_data.get("surname_ru") and pos_surname:
+                    normalized_data["surname_ru"] = pos_surname
+                if not normalized_data.get("name_ru") and pos_name:
+                    normalized_data["name_ru"] = pos_name
+                if not normalized_data.get("middle_name_ru") and pos_middle:
+                    normalized_data["middle_name_ru"] = pos_middle
             if normalized_data.get("ru_position") and not normalized_data.get("en_position"):
                 normalized_data["en_position"] = self._generate_en_position(str(normalized_data["ru_position"]))
             elif normalized_data.get("en_position"):
@@ -4150,6 +4229,7 @@ class CompanyWebApp:
                 "fio_ru": fio_ru,
                 "org_ru": self._clean_ru_org_name(str(normalized_data.get("ru_org", ""))),
                 "position_ru": self._normalize_spaces(str(normalized_data.get("ru_position", ""))),
+                "leader_ru": fio_ru,
                 "inn": self._normalize_spaces(str(normalized_data.get("inn", ""))),
                 "query_for_autofill": self._normalize_spaces(str(normalized_data.get("inn", "")))
                 or (fio_ru if hit_type == "person" else self._clean_ru_org_name(str(normalized_data.get("ru_org", ""))))
@@ -4224,12 +4304,13 @@ class CompanyWebApp:
                     f"<input type='hidden' name='hit_type' value='{escape(c.get('type', ''))}' />"
                     f"<input type='hidden' name='search_type' value='{escape(search_type)}' />"
                     "<button type='submit' style='width: 100%; text-align: left; border: 1px solid #ddd; padding: 15px; border-radius: 8px; cursor: pointer; background: white;'>"
-                    f"<h4 style='margin: 0 0 8px;'>{escape(c['fio_ru'] or c['org_ru'] or 'Вариант')}</h4>"
-                    f"<p style='margin: 4px 0;'><b>Организация:</b> {escape(c['org_ru'] or '—')}</p>"
-                    f"<p style='margin: 4px 0;'><b>Должность:</b> {escape(c['position_ru'] or '—')}</p>"
-                    f"<p style='margin: 4px 0;'><b>Выручка:</b> {escape(self._revenue_billions(c.get('revenue')))} млрд руб</p>"
-                    f"<p style='margin: 4px 0;'><b>ИНН:</b> {escape(c.get('inn', '') or '—')}</p>"
-                    f"<p style='margin: 4px 0;'><small><span style='background: {'#e3f2fd' if c.get('type') == 'company' else '#fce4ec'}; padding: 2px 8px; border-radius: 4px; font-size: 11px;'>{'🏢 Юр. лицо' if c.get('type') == 'company' else '👤 Физ. лицо'}</span> | Источник: {escape(c['source'])}</small></p>"
+                    + f"<h4 style='margin: 0 0 8px;'>{escape(c['fio_ru'] or c['org_ru'] or 'Вариант')}</h4>"
+                    + f"<p style='margin: 4px 0;'><b>Организация:</b> {escape(c['org_ru'] or '—')}</p>"
+                    + (f"<p style='margin: 4px 0;'><b>Руководитель:</b> {escape(c.get('leader_ru', ''))}</p>" if c.get('leader_ru') else "")
+                    + f"<p style='margin: 4px 0;'><b>Должность:</b> {escape(c['position_ru'] or '—')}</p>"
+                    + f"<p style='margin: 4px 0;'><b>Выручка:</b> {escape(self._revenue_billions(c.get('revenue')))} млрд руб</p>"
+                    + f"<p style='margin: 4px 0;'><b>ИНН:</b> {escape(c.get('inn', '') or '—')}</p>"
+                    + f"<p style='margin: 4px 0;'><small><span style='background: {'#e3f2fd' if c.get('type') == 'company' else '#fce4ec'}; padding: 2px 8px; border-radius: 4px; font-size: 11px;'>{'🏢 Юр. лицо' if c.get('type') == 'company' else '👤 Физ. лицо'}</span> | Источник: {escape(c['source'])}</small></p>"
                     "<span style='display: inline-block; margin-top: 10px;'>Автозаполнить</span>"
                     "</button></form>"
                 )
@@ -4771,10 +4852,31 @@ class CompanyWebApp:
                     self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
                 return response
             if forced_search_type == "company":
-                has_fio_ru = self.is_valid_ru_fio(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", ""))
-                has_fio_en = bool(self._normalize_spaces(profile.get("family_name", "")) and self._normalize_spaces(profile.get("first_name", "")))
+                surname_ru = self._normalize_spaces(profile.get("surname_ru", ""))
+                name_ru = self._normalize_spaces(profile.get("name_ru", ""))
+                middle_name_ru = self._normalize_spaces(profile.get("middle_name_ru", ""))
+                family_name = self._normalize_spaces(profile.get("family_name", ""))
+                first_name = self._normalize_spaces(profile.get("first_name", ""))
+                ru_position = self._normalize_spaces(profile.get("ru_position", ""))
+                has_fio_ru = bool(surname_ru and name_ru)
+                has_fio_en = bool(family_name and first_name)
                 has_fio = has_fio_ru or has_fio_en
                 has_position = bool(self._normalize_spaces(profile.get("ru_position", "")))
+                logger.info(
+                    "autocreate_company_leader_check surname_ru='%s' name_ru='%s' middle_name_ru='%s' family_name='%s' first_name='%s' ru_position='%s' sources={surname_ru:%s,name_ru:%s,middle_name_ru:%s,family_name:%s,first_name:%s,ru_position:%s}",
+                    surname_ru,
+                    name_ru,
+                    middle_name_ru,
+                    family_name,
+                    first_name,
+                    ru_position,
+                    field_sources.get("surname_ru", ""),
+                    field_sources.get("name_ru", ""),
+                    field_sources.get("middle_name_ru", ""),
+                    field_sources.get("family_name", ""),
+                    field_sources.get("first_name", ""),
+                    field_sources.get("ru_position", ""),
+                )
                 if has_position and not has_fio:
                     logger.info("autocreate_skipped: reason=invalid_fields details=company_without_leader")
                     manual_payload["error"] = "Не найден руководитель компании, уточните/выберите из списка"
