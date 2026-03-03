@@ -295,7 +295,9 @@ FIELD_PRIORITIES: dict[str, list[str]] = {
 POSITION_NOISE_MARKERS = {
     "история",
     "проверить",
+    "юридического",
     "юридического лица",
+    "физлицо",
     "сведения",
     "поиск",
     "результат",
@@ -511,7 +513,8 @@ class CompanyWebApp:
             elif path == "/create/manual" and method == "GET":
                 body, status, headers = self.manual_get(query)
             elif path == "/create/manual" and method == "POST":
-                body, status, headers = self.manual_post(form)
+                wants_json = self._request_wants_json(environ)
+                body, status, headers = self.manual_post(form, wants_json=wants_json)
             elif re.fullmatch(r"/card/\d+", path) and method == "GET":
                 card_id = int(path.split("/")[-1])
                 body, status, headers = self.card_view(card_id)
@@ -3088,6 +3091,11 @@ class CompanyWebApp:
         if card_url.startswith("/"):
             card_url = f"https://zachestnyibiznes.ru{card_url}"
         profile = self._parse_generic_osint(card_url, "zachestnyibiznes.ru")
+        ru_position = self._normalize_spaces(str(profile.get("ru_position", "")))
+        if ru_position:
+            tokens = [token.lower() for token in re.findall(r"[А-Яа-яЁёA-Za-z-]+", ru_position)]
+            if any(token in FIO_STOP_TOKENS for token in tokens):
+                profile["ru_position"] = ""
         if self._is_garbage_org_title(str(profile.get("ru_org", "")), query):
             return {}
         return profile
@@ -4055,6 +4063,8 @@ class CompanyWebApp:
                 continue
             value, source_name = self._pick_field_by_priority(field, source_hits)
             if value:
+                if field == "ru_position" and not self.sanitize_ru_position(value):
+                    continue
                 profile[field] = value
                 field_sources[field] = source_name
 
@@ -4730,11 +4740,13 @@ class CompanyWebApp:
                 extended_hits, extended_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
                 search_trace.extend(extended_trace)
                 dedup: list[dict[str, Any]] = []
-                seen: set[tuple[str, str]] = set()
+                seen: set[tuple[str, str, str]] = set()
                 for hit in source_hits + extended_hits:
+                    data = hit.get("data", {})
                     key = (
                         self._normalize_spaces(str(hit.get("source", ""))).lower(),
-                        self._normalize_spaces(str(hit.get("url", ""))).lower(),
+                        self._normalize_spaces(str(data.get("inn", ""))).lower() if isinstance(data, dict) else "",
+                        self._normalize_spaces(str(data.get("ru_org", ""))).lower() if isinstance(data, dict) else "",
                     )
                     if key in seen:
                         continue
@@ -5064,7 +5076,7 @@ class CompanyWebApp:
         body = self._page("Ручное создание", content, back_href="/")
         return body, "200 OK", [("Content-Type", "text/html; charset=utf-8")]
 
-    def manual_post(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
+    def manual_post(self, form: dict[str, list[str]], *, wants_json: bool = False) -> tuple[str, str, list[tuple[str, str]]]:
         ru_org_raw = self._normalize_spaces(self._get_one(form, "ru_org"))
         inn_input = self._extract_inn(self._get_one(form, "inn") or ru_org_raw)
         ru_org_input = ru_org_raw
@@ -5118,6 +5130,26 @@ class CompanyWebApp:
         missing_required = self._missing_required_fields(profile)
         if missing_required:
             errors.append(f"Заполните обязательные поля: {', '.join(missing_required)}")
+
+        search_type = self._normalize_spaces(self._get_one(form, "search_type")).lower()
+        en_org_raw = self._normalize_spaces(self._get_one(form, "en_org"))
+        required_checks = [
+            ("ru_org", ru_org_raw, "Заполните обязательное поле: ru_org"),
+            ("en_org", en_org_raw, "Заполните обязательное поле: en_org"),
+        ]
+        if search_type == "company":
+            required_checks.append(("inn", self._normalize_spaces(self._get_one(form, "inn")), "Заполните обязательное поле: inn"))
+        for field, value, message in required_checks:
+            if self._normalize_spaces(str(value)):
+                continue
+            if wants_json:
+                body = json.dumps({"error": message, "field": field}, ensure_ascii=False)
+                return body, "400 Bad Request", [("Content-Type", "application/json; charset=utf-8")]
+            params = {"error": message}
+            for key, value_raw in profile.items():
+                params[f"profile_{key}"] = value_raw
+            return "", "302 Found", [("Location", f"/create/manual?{urlencode(params)}")]
+
         notes = ru_notes + en_notes + autofill_notes + errors
         status = self._status(notes, bool(ru_org and en_org))
         if errors:
@@ -5283,20 +5315,54 @@ class CompanyWebApp:
         if not card:
             return "Not found", "404 Not Found", [("Content-Type", "text/plain; charset=utf-8")]
 
+        payload = json.loads(card["data_json"] or "{}")
+        profile = payload.get("profile", {}) if isinstance(payload, dict) else {}
+        csv_fields = [
+            "id",
+            "surname_ru",
+            "name_ru",
+            "middle_name_ru",
+            "family_name",
+            "first_name",
+            "middle_name_en",
+            "gender",
+            "inn",
+            "ru_position",
+            "en_position",
+            "ru_org",
+            "en_org",
+            "status",
+            "source",
+            "created_at",
+        ]
         buffer = io.StringIO()
-        writer = csv.DictWriter(buffer, fieldnames=["id", "ru_org", "en_org", "status", "source", "created_at"])
+        writer = csv.DictWriter(buffer, fieldnames=csv_fields)
         writer.writeheader()
         writer.writerow(
             {
                 "id": card["id"],
-                "ru_org": card["ru_org"],
-                "en_org": card["en_org"],
+                "surname_ru": profile.get("surname_ru", ""),
+                "name_ru": profile.get("name_ru", ""),
+                "middle_name_ru": profile.get("middle_name_ru", ""),
+                "family_name": profile.get("family_name", ""),
+                "first_name": profile.get("first_name", ""),
+                "middle_name_en": profile.get("middle_name_en", ""),
+                "gender": profile.get("gender", ""),
+                "inn": profile.get("inn", ""),
+                "ru_position": profile.get("ru_position", ""),
+                "en_position": profile.get("en_position", profile.get("position", "")),
+                "ru_org": profile.get("ru_org", card["ru_org"]),
+                "en_org": profile.get("en_org", card["en_org"]),
                 "status": card["status"],
                 "source": card["source"],
                 "created_at": card["created_at"],
             }
         )
-        return buffer.getvalue(), "200 OK", [("Content-Type", "text/csv; charset=utf-8")]
+        headers = [
+            ("Content-Type", "text/csv; charset=utf-8"),
+            ("Content-Disposition", f'attachment; filename="card_{card_id}.csv"'),
+        ]
+        return buffer.getvalue(), "200 OK", headers
 
 
 def _startup_diagnostics(app: CompanyWebApp) -> None:
@@ -5307,7 +5373,24 @@ def _startup_diagnostics(app: CompanyWebApp) -> None:
             proc = subprocess.run([playwright_cli, "install", "--list"], capture_output=True, text=True, timeout=10, check=False)
             details = (proc.stdout or proc.stderr or "").strip().splitlines()
             browsers_info = details[0] if details else f"playwright CLI found (exit={proc.returncode})"
+
+            list_output = f"{proc.stdout or ''}\n{proc.stderr or ''}".lower()
+            has_chromium = "chromium" in list_output and "not installed" not in list_output
+            if not has_chromium:
+                def _install_chromium() -> None:
+                    logger.info("Playwright: auto-install chromium started")
+                    try:
+                        install_proc = subprocess.run([playwright_cli, "install", "chromium"], capture_output=True, text=True, timeout=300, check=False)
+                        if install_proc.returncode == 0:
+                            logger.info("Playwright: auto-install done (exit=0)")
+                        else:
+                            logger.warning("Playwright: auto-install failed (exit=%s)", install_proc.returncode)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Playwright: auto-install failed: %s", exc)
+
+                threading.Thread(target=_install_chromium, daemon=True).start()
         except Exception as exc:  # noqa: BLE001
+            logger.warning("Playwright browsers check failed: %s", exc)
             browsers_info = f"playwright CLI found, browser list failed: {exc}"
 
     logger.info("=== Startup diagnostics ===")
