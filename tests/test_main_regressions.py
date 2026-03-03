@@ -135,3 +135,72 @@ def test_manual_post_redirect_on_validation_error_html(app):
     location = dict(headers)["Location"]
     query = parse_qs(urlparse(location).query)
     assert query.get("error", [""])[0].startswith("Заполните обязательное поле")
+import re
+
+
+def test_family_name_first_name_in_card(app, monkeypatch):
+    hits = [
+        {
+            "source": "ФНС ЕГРЮЛ",
+            "type": "company",
+            "data": {
+                "inn": "7707083893",
+                "ru_org": "Сбербанк ПАО",
+                "ru_position": "Председатель правления",
+                "gender": "М",
+                "surname_ru": "",
+                "name_ru": "",
+            },
+        },
+        {
+            "source": "zachestnyibiznes.ru",
+            "type": "company",
+            "data": {
+                "surname_ru": "Греф",
+                "name_ru": "Герман",
+                "middle_name_ru": "Оскарович",
+                "ru_org": "ПАО СБЕРБАНК",
+                "inn": "7707083893",
+            },
+        },
+    ]
+
+    monkeypatch.setattr(app, "_search_external_sources", lambda *_a, **_k: (hits, []))
+
+    body, status, headers = app.autofill_review(
+        {"company_name": ["7707083893"], "search_type": ["company"], "hit_type": ["company"]},
+        wants_json=False,
+    )
+
+    assert body == ""
+    assert status == "302 Found"
+    card_id = int(dict(headers)["Location"].rsplit("/", 1)[-1])
+
+    with app._connect() as db:
+        card = db.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
+    profile = json.loads(card["data_json"])["profile"]
+    assert profile["surname_ru"] == "Греф"
+    assert profile["family_name"] != ""
+    assert profile["first_name"] != ""
+    assert not re.search(r"[А-Яа-яЁё]", profile.get("middle_name_en", ""))
+
+
+def test_export_xlsx_has_expected_headers(app):
+    profile = {"ru_org": "ПАО СБЕРБАНК", "en_org": "SBERBANK PJSC"}
+    with app._connect() as db:
+        cur = db.execute(
+            "INSERT INTO cards(ru_org,en_org,status,source,created_at,updated_at,data_json) VALUES(?,?,?,?,?,?,?)",
+            ("ПАО СБЕРБАНК", "SBERBANK PJSC", "Найдено", "manual", app._now(), app._now(), json.dumps({"profile": profile}, ensure_ascii=False)),
+        )
+        card_id = cur.lastrowid
+        db.commit()
+
+    body, status, headers = app.export_xlsx(card_id)
+    assert status == "200 OK"
+    disposition = dict(headers)["Content-Disposition"]
+    if disposition.endswith('.xlsx"'):
+        assert disposition == f'attachment; filename="card_{card_id}.xlsx"'
+        assert isinstance(body, (bytes, bytearray))
+    else:
+        assert disposition == f'attachment; filename="card_{card_id}.csv"'
+        assert isinstance(body, str)
