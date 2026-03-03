@@ -237,10 +237,10 @@ SOURCE_PROVIDERS: list[dict[str, Any]] = [
     {"name": "Wikipedia", "kind": "wikipedia_html", "supports_inn": False, "supports_name": True, "supports_url": True, "is_person_source": False, "priority": 3},
     {"name": "DuckDuckGo HTML", "kind": "duckduckgo_html", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 4},
     {"name": "rusprofile.ru", "kind": "rusprofile", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True, "priority": 5},
-    {"name": "zachestnyibiznes.ru", "kind": "zachestnyibiznes_scrape", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 6},
-    {"name": "checko.ru", "kind": "checko", "url_template": "https://checko.ru/search/quick?query={query}", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": False, "priority": 6},
+    {"name": "zachestnyibiznes.ru", "kind": "zachestnyibiznes_scrape", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": True, "priority": 6},
+    {"name": "checko.ru", "kind": "checko", "url_template": "https://checko.ru/search/quick?query={query}", "supports_inn": True, "supports_name": True, "supports_url": True, "is_person_source": True, "priority": 6},
     {"name": "focus.kontur.ru", "kind": "kontur", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 6},
-    {"name": "companies.rbc.ru", "kind": "rbc_companies_scrape", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 7},
+    {"name": "companies.rbc.ru", "kind": "rbc_companies_scrape", "supports_inn": True, "supports_name": True, "supports_url": False, "is_person_source": True, "priority": 7},
     {"name": "tbank/tinkoff", "kind": "tbank_leadership_scrape", "supports_inn": False, "supports_name": True, "supports_url": False, "is_person_source": False, "priority": 8},
 ]
 
@@ -778,6 +778,32 @@ class CompanyWebApp:
             return True
         return False
 
+    def _score_org_relevance(self, profile: dict[str, Any], query: str) -> float:
+        score = 0.0
+        query_lower = self._normalize_spaces(query.lower())
+        org_name = self._normalize_spaces(str(profile.get("ru_org", "")).lower())
+
+        if query_lower and (query_lower in org_name or org_name.startswith(query_lower)):
+            score += 50
+
+        revenue = int(profile.get("revenue", 0) or 0)
+        if revenue > 1_000_000_000_000:
+            score += 100
+        elif revenue > 100_000_000_000:
+            score += 80
+        elif revenue > 10_000_000_000:
+            score += 60
+        elif revenue > 1_000_000_000:
+            score += 40
+        else:
+            score += min(revenue / 1e8, 20)
+
+        org_upper = org_name.upper()
+        if "ПАО" in org_upper or "PAO" in org_upper:
+            score += 20
+
+        return score
+
     def _extract_inn(self, raw: str) -> str:
         value = self._normalize_spaces(raw)
         if re.fullmatch(r"\d{10}|\d{12}", value):
@@ -1287,13 +1313,13 @@ class CompanyWebApp:
                 notes.append("RU организация: ОПФ должна быть в конце")
 
         name = " ".join(tokens)
-        result = self._normalize_spaces(f"{name} {opf}" if opf else name)
+        result = self._normalize_spaces(f"{opf} {name}" if opf else name)
         result = self._preserve_abbreviations_case(result)
         if re.search(r"тюменский\s+государственный\s+университет", result, flags=re.IGNORECASE):
-            suffix = " ФГАОУ ВО" if "ФГАОУ ВО" in result.upper() else ""
-            result = f"Тюменский государственный университет{suffix}"
+            prefix = "ФГАОУ ВО " if "ФГАОУ ВО" in result.upper() else ""
+            result = f"{prefix}Тюменский государственный университет"
         if "Сбербанк" in result and "ПАО" not in result:
-            result = self._normalize_spaces(f"{result} ПАО")
+            result = self._normalize_spaces(f"ПАО {result}")
             notes.append("RU организация: добавлено ПАО для Сбербанка")
         return result, notes
 
@@ -3219,23 +3245,46 @@ class CompanyWebApp:
         soup = BeautifulSoup(html, "lxml")
         links = [a.get("href") for a in soup.select("a[href*='/company/ul/']") if a.get("href")]
         if not links and "/company/ul/" in html:
-            raw_match = re.search(r"(/company/ul/[\w\-_/]+)", html)
-            if raw_match:
-                links = [raw_match.group(1)]
-        if not links:
-            return {}
-        card_url = str(links[0])
-        if card_url.startswith("/"):
-            card_url = f"https://zachestnyibiznes.ru{card_url}"
-        profile = self._parse_generic_osint(card_url, "zachestnyibiznes.ru")
-        ru_position = self._normalize_spaces(str(profile.get("ru_position", "")))
-        if ru_position:
-            tokens = [token.lower() for token in re.findall(r"[А-Яа-яЁёA-Za-z-]+", ru_position)]
-            if any(token in FIO_STOP_TOKENS for token in tokens):
-                profile["ru_position"] = ""
-        if self._is_garbage_org_title(str(profile.get("ru_org", "")), query):
-            return {}
-        return profile
+            raw_matches = re.findall(r"(/company/ul/[\w\-_/]+)", html)
+            if raw_matches:
+                links = raw_matches
+
+        best_profile: dict[str, Any] = {}
+        best_score = -1.0
+        for link in links[:5]:
+            card_url = str(link)
+            if card_url.startswith("/"):
+                card_url = f"https://zachestnyibiznes.ru{card_url}"
+            profile = self._parse_generic_osint(card_url, "zachestnyibiznes.ru")
+            if not profile:
+                continue
+            ru_position = self._normalize_spaces(str(profile.get("ru_position", "")))
+            if ru_position:
+                tokens = [token.lower() for token in re.findall(r"[А-Яа-яЁёA-Za-z-]+", ru_position)]
+                if any(token in FIO_STOP_TOKENS for token in tokens):
+                    profile["ru_position"] = ""
+            if self._is_garbage_org_title(str(profile.get("ru_org", "")), query):
+                continue
+            score = self._score_org_relevance(profile, query)
+            if score > best_score:
+                best_score = score
+                best_profile = profile
+
+        if best_profile:
+            return best_profile
+
+        person_links = [a.get("href") for a in soup.select("a[href*='/person/']") if a.get("href")]
+        if not person_links and "/person/" in html:
+            raw_person_matches = re.findall(r"(/person/[\w\-_/]+)", html)
+            if raw_person_matches:
+                person_links = raw_person_matches
+        if person_links:
+            card_url = str(person_links[0])
+            if card_url.startswith("/"):
+                card_url = f"https://zachestnyibiznes.ru{card_url}"
+            return self._parse_generic_osint(card_url, "zachestnyibiznes.ru")
+
+        return {}
 
     def _parse_rbc_companies_direct(self, raw_query: str) -> dict[str, Any]:
         query = self._normalize_spaces(raw_query)
@@ -3246,16 +3295,29 @@ class CompanyWebApp:
         if not html:
             return {}
         soup = BeautifulSoup(html, "lxml")
-        link = soup.select_one("a[href*='/id/'], a[href*='/company/']")
-        if not isinstance(link, Tag):
+        links = [
+            str(a.get("href") or "")
+            for a in soup.select("a[href*='/id/'], a[href*='/company/']")
+            if isinstance(a, Tag) and a.get("href")
+        ]
+        if not links:
             return {}
-        href = str(link.get("href") or "")
-        if href.startswith("/"):
-            href = f"https://companies.rbc.ru{href}"
-        profile = self._parse_generic_osint(href, "companies.rbc.ru")
-        if self._is_garbage_org_title(str(profile.get("ru_org", "")), query):
-            return {}
-        return profile
+
+        best_profile: dict[str, Any] = {}
+        best_score = -1.0
+        for href in links[:5]:
+            if href.startswith("/"):
+                href = f"https://companies.rbc.ru{href}"
+            profile = self._parse_generic_osint(href, "companies.rbc.ru")
+            if not profile:
+                continue
+            if self._is_garbage_org_title(str(profile.get("ru_org", "")), query):
+                continue
+            score = self._score_org_relevance(profile, query)
+            if score > best_score:
+                best_score = score
+                best_profile = profile
+        return best_profile
 
     def _ddg_site_search(self, raw_query: str, domains: list[str], max_urls: int = 3) -> list[str]:
         query_text = self._normalize_spaces(raw_query)
@@ -4497,8 +4559,12 @@ class CompanyWebApp:
             )
             not_found = f"<h3>Варианты по '{escape(q)}':</h3>{blocks}"
         elif q:
+            surname_only_hint = ""
+            if search_type == "person" and surname and not name:
+                surname_only_hint = "<p><i>Подсказка: укажите имя или отчество для уточнения поиска.</i></p>"
             not_found = (
                 f"<p>Нет данных. Создать вручную?</p>"
+                f"{surname_only_hint}"
                 f"<form method='post' action='/autofill/review'><input type='hidden' name='company_name' value='{escape(q)}' /><input type='hidden' name='search_type' value='{escape(search_type)}' /><button>Автозаполнить из открытых источников</button></form>"
                 f"<a href='/create/manual?q={escape(q)}'>Создать вручную</a>"
             )
@@ -4651,6 +4717,8 @@ class CompanyWebApp:
                 queried_providers.update(hit.get("source", "") for hit in source_hits)
         elif search_type == "person":
             trace.append("Режим: ТОЛЬКО ФИЗ. ЛИЦА")
+            if params.get("surname") and not params.get("name"):
+                trace.append("ВНИМАНИЕ: поиск только по фамилии — результаты могут содержать однофамильцев")
             if params.get("surname") or params.get("name") or params.get("middle_name"):
                 full_name = " ".join(filter(None, [params.get("surname", ""), params.get("name", ""), params.get("middle_name", "")]))
                 trace.append(f"Поиск по персоне: {full_name}")
@@ -4658,6 +4726,13 @@ class CompanyWebApp:
                 trace.extend(source_trace)
                 queried_providers.update(hit.get("source", "") for hit in source_hits)
                 candidates = self._build_person_candidates(source_hits, full_name, search_type=search_type)
+            elif params.get("company"):
+                trace.append(f"Поиск руководителя компании: {params['company']}")
+                company_hits, source_trace = self._search_by_company(params["company"], search_type="")
+                trace.extend(source_trace)
+                queried_providers.update(hit.get("source", "") for hit in company_hits)
+                source_hits.extend(company_hits)
+                candidates = self._build_person_candidates(source_hits, params["company"], search_type=search_type)
         else:
             trace.append("Режим: АВТО (физ. + юр. лица)")
             if params.get("surname") or params.get("name") or params.get("middle_name"):
