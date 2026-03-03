@@ -1031,13 +1031,26 @@ class CompanyWebApp:
         whitelist = (
             ("председатель правления", "Председатель правления"),
             ("генеральный директор", "Генеральный директор"),
+            ("исполняющий обязанности генерального директора", "Исполняющий обязанности генерального директора"),
+            ("исполняющий обязанности директора", "Исполняющий обязанности директора"),
+            ("исполняющий обязанности ректора", "Исполняющий обязанности ректора"),
+            ("исполняющий обязанности", "Исполняющий обязанности"),
             ("директор", "Директор"),
             ("ректор", "Ректор"),
             ("президент", "Президент"),
             ("управляющий", "Управляющий"),
+            ("главный врач", "Главный врач"),
+            ("заместитель генерального директора", "Заместитель генерального директора"),
+            ("заместитель директора", "Заместитель директора"),
+            ("председатель", "Председатель"),
+            ("проректор", "Проректор"),
+            ("декан", "Декан"),
+            ("начальник", "Начальник"),
+            ("руководитель", "Руководитель"),
         )
+        cleaned_key = self._normalize_ru_position_key(cleaned)
         for needle, canonical in whitelist:
-            if re.search(rf"\b{re.escape(needle)}\b", lowered):
+            if cleaned_key == needle:
                 return canonical
 
         if re.search(r"\d", cleaned):
@@ -1230,9 +1243,7 @@ class CompanyWebApp:
                 token_upper = token.upper()
                 if token_upper in RU_TO_EN_OPF:
                     result_tokens.append(token_upper)
-                elif len(token) <= 6 and token.isupper() and (
-                    re.search(r"[A-Z0-9]", token_upper) or not re.search(r"[АЕЁИОУЫЭЮЯ]", token_upper)
-                ):
+                elif len(token) <= 6 and token.isupper():
                     result_tokens.append(token_upper)
                 else:
                     result_tokens.append(token.capitalize())
@@ -3330,13 +3341,10 @@ class CompanyWebApp:
 
     def _infer_gender(self, middle_name_ru: str, ru_position: str) -> str:
         token = self._normalize_spaces(middle_name_ru).lower()
-        position = self._normalize_spaces(ru_position).lower()
         if token.endswith(("ич", "оглы")):
             return "М"
         if token.endswith(("вна", "кызы")):
             return "Ж"
-        if "директор" in position or "председатель" in position:
-            return "М"
         return ""
 
     def _enrich_provider_payload(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -3758,7 +3766,7 @@ class CompanyWebApp:
     def _normalize_card_data(self, profile: dict[str, str], field_sources: dict[str, str]) -> dict[str, str]:
         """Универсальная нормализация данных карточки."""
         if profile.get("ru_position") and not profile.get("en_position"):
-            profile["en_position"], _ = self._normalize_positions_en(profile["ru_position"])
+            profile["en_position"] = self._generate_en_position(profile["ru_position"])
             if profile.get("en_position"):
                 field_sources.setdefault("en_position", "Автогенерация из RU")
         if not profile.get("middle_name_en"):
@@ -4114,6 +4122,15 @@ class CompanyWebApp:
             profile["inn"] = input_inn
         if profile.get("inn"):
             field_sources["inn"] = "Ввод пользователя/ФНС" if input_inn else field_sources.get("inn", "ФНС")
+
+        if (
+            profile.get("middle_name_ru")
+            and field_sources.get("gender") in ("Автоопределение", "ФНС ЕГРЮЛ")
+        ):
+            recomputed_gender = self._infer_gender(profile.get("middle_name_ru", ""), profile.get("ru_position", ""))
+            if recomputed_gender:
+                profile["gender"] = recomputed_gender
+                field_sources["gender"] = "Автоопределение"
 
         if not profile.get("gender"):
             inferred_gender = self._infer_gender(profile.get("middle_name_ru", ""), profile.get("ru_position", ""))
