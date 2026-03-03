@@ -16,8 +16,8 @@ if exist "%VENV%\Scripts\python.exe" set "PYTHON_EXE=\"%VENV%\Scripts\python.exe
 
 if not exist "%ENTRY%" call :die "entrypoint not found: %ENTRY%"
 
-set "CONSOLE_FLAG=--noconsole"
-if /I "%MODE%"=="debug" set "CONSOLE_FLAG=--console"
+set "CONSOLE_FLAG=--console"
+if /I "%MODE%"=="release" set "CONSOLE_FLAG=--noconsole"
 
 echo Using entrypoint: "%ENTRY%"
 echo Build mode: %MODE%
@@ -61,13 +61,6 @@ if errorlevel 1 call :die "failed to copy dist to release"
 if not exist "%FINAL_DIR%\_internal" call :die "_internal missing in release"
 dir "%FINAL_DIR%\_internal" | findstr /i ".dll" >nul || call :die "_internal seems empty (dll not found)"
 
-(
-  echo @echo off
-  echo setlocal
-  echo cd /d "%%~dp0"
-  echo start "" "%%~dp0%APP_NAME%.exe"
-) > "%FINAL_DIR%\Start.bat"
-
 REM cleanup intermediate artifacts
 if exist "%ROOT%build" rmdir /s /q "%ROOT%build"
 if exist "%ROOT%dist"  rmdir /s /q "%ROOT%dist"
@@ -77,7 +70,7 @@ echo.
 echo BUILD SUCCESS
 echo Portable folder:
 echo %FINAL_DIR%
-echo Run application from this folder or via Start.bat.
+echo Run application from this folder.
 pause
 exit /b 0
 
