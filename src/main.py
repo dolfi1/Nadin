@@ -249,9 +249,9 @@ FETCH_STATUS_RATE_LIMIT_202 = "RATE_LIMIT_202"
 FETCH_STATUS_NETWORK_ERROR = "NETWORK_ERROR"
 
 FIELD_PRIORITIES: dict[str, list[str]] = {
-    "surname_ru": ["zachestnyibiznes.ru", "companies.rbc.ru", "ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
-    "name_ru": ["zachestnyibiznes.ru", "companies.rbc.ru", "ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
-    "middle_name_ru": ["zachestnyibiznes.ru", "companies.rbc.ru", "ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru"],
+    "surname_ru": ["ФНС ЕГРЮЛ", "companies.rbc.ru", "zachestnyibiznes.ru", "rusprofile.ru", "focus.kontur.ru"],
+    "name_ru": ["ФНС ЕГРЮЛ", "companies.rbc.ru", "zachestnyibiznes.ru", "rusprofile.ru", "focus.kontur.ru"],
+    "middle_name_ru": ["ФНС ЕГРЮЛ", "companies.rbc.ru", "zachestnyibiznes.ru", "rusprofile.ru", "focus.kontur.ru"],
     "gender": ["rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru"],
     "ru_position": ["ФНС ЕГРЮЛ", "rusprofile.ru", "focus.kontur.ru", "zachestnyibiznes.ru"],
     "position": ["ФНС ЕГРЮЛ"],
@@ -2142,6 +2142,16 @@ class CompanyWebApp:
             if not isinstance(sv_yul, dict):
                 sv_yul = {}
 
+            dol_candidates = []
+            for k in ("СведДолжнФЛ", "СвДолжнФЛ", "СведДолжнФЛЮЛ", "СвРуководитель", "СведРуководитель"):
+                v = sv_yul.get(k)
+                if v is not None:
+                    dol_candidates.append(v)
+            dol_candidates += self._deep_values_for_keys(
+                data,
+                {"СведДолжнФЛ", "СвДолжнФЛ", "СведДолжнФЛЮЛ", "СвРуководитель", "СведРуководитель", "СвРукЮЛ", "Руководитель", "РукЮЛ"},
+            )
+
             ru_org_raw = (
                 data.get("НаимПолн")
                 or data.get("НаимСокр")
@@ -2192,7 +2202,6 @@ class CompanyWebApp:
             position = str(director.get("Должность") or director.get("position") or data.get("ru_position") or "")
 
             if not surname_ru or not name_ru or not middle_name_ru or not position:
-                dol_candidates = self._deep_values_for_keys(data, {"СведДолжнФЛ", "СвДолжнФЛ", "СведДолжнФЛЮЛ", "СвРуководитель", "СведРуководитель", "СвРукЮЛ", "Руководитель", "РукЮЛ"})
                 dol_list: list[dict[str, Any]] = []
                 for candidate in dol_candidates:
                     if isinstance(candidate, list):
@@ -2200,7 +2209,30 @@ class CompanyWebApp:
                     elif isinstance(candidate, dict):
                         dol_list.append(candidate)
                 if dol_list:
-                    head = dol_list[0]
+                    def _is_leader_position(pos: str) -> bool:
+                        p = (pos or "").lower()
+                        return any(
+                            x in p
+                            for x in (
+                                "генеральн",
+                                "директор",
+                                "президент",
+                                "председатель правления",
+                                "руководител",
+                                "управляющ",
+                                "chief executive",
+                                "ceo",
+                            )
+                        )
+
+                    head = None
+                    for item in dol_list:
+                        pos = self._first_non_empty_deep_value(item, {"НаимДолжн", "Должность", "НаимДолжнРук", "ru_position", "position"})
+                        if _is_leader_position(str(pos or "")):
+                            head = item
+                            break
+                    if head is None:
+                        head = dol_list[0]
                     fio_str = str(head.get("ФИО") or head.get("ФИОПолн") or "")
                     if not fio_str:
                         fio_str = self._first_non_empty_deep_value(head, {"ФИО", "ФИОПолн", "head_ru"})
@@ -2235,6 +2267,9 @@ class CompanyWebApp:
 
             if not position:
                 position = self._first_non_empty_deep_value(data, {"НаимДолжн", "Должность", "НаимДолжнРук", "ru_position", "position"})
+
+            if surname_ru or name_ru or middle_name_ru or position:
+                logger.info("ФНС leader parsed: %s %s %s / %s", surname_ru, name_ru, middle_name_ru, position)
 
             if not surname_ru:
                 keywords = str(data.get("keywords") or data.get("meta_keywords") or "")
@@ -3619,6 +3654,13 @@ class CompanyWebApp:
             skip_person_noise = field in {"surname_ru", "name_ru", "middle_name_ru", "gender", "ru_position", "position"}
             value, source_name = self._pick_field_by_priority(field, source_hits, skip_person_noise=skip_person_noise)
             if value:
+                if (
+                    field in {"surname_ru", "name_ru", "middle_name_ru"}
+                    and profile.get(field)
+                    and field_sources.get(field) == "ФНС ЕГРЮЛ"
+                    and source_name != "ФНС ЕГРЮЛ"
+                ):
+                    continue
                 profile[field] = value
                 field_sources[field] = source_name
 
