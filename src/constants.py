@@ -56,6 +56,23 @@ POSITION_TRANSLATIONS: Dict[str, str] = {
     "председатель совета директоров": "Chairman of the Board of Directors",
     "заместитель генерального директора": "Deputy General Director",
     "первый заместитель генерального директора": "First Deputy General Director",
+    # Исполняющие обязанности
+    "исполняющий обязанности директора": "Acting Director",
+    "исполняющий обязанности генерального директора": "Acting General Director",
+    "исполняющий обязанности ректора": "Acting Rector",
+    "исполняющий обязанности": "Acting",
+    # Врачи и медицина
+    "главный врач": "Chief Medical Officer",
+    "заместитель главного врача": "Deputy Chief Medical Officer",
+    # Заместители
+    "заместитель директора": "Deputy Director",
+    "заместитель председателя": "Deputy Chairman",
+    "заместитель руководителя": "Deputy Head",
+    # Академические
+    "проректор": "Vice-Rector",
+    "декан": "Dean",
+    # Общие
+    "председатель": "Chairman",
     "вице-президент": "Vice President",
     "руководитель": "Head",
     "начальник": "Head",
