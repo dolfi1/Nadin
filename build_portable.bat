@@ -20,9 +20,18 @@ echo ======================================
 
 set "LOG=%ROOT%\release\build_log.txt"
 
+echo ---- Searching for ".." in bat ----
+findstr /n /c:".." "%~f0"
+echo -----------------------------------
+
 REM --- self-check: forbid dot-only lines like ".." / "..."
 for /f "delims=" %%A in ('findstr /n /r "^[.][.][.]*$" "%~f0"') do (
   call :die "Invalid line (dot-only) found in bat: %%A"
+)
+
+REM forbid suspicious dot-dot tokens near parentheses
+for /f "delims=" %%A in ('findstr /n /r /c:"[(][.][.]" /c:"[)][.][.]" "%~f0"') do (
+  call :die "Suspicious token near parentheses: %%A"
 )
 
 if not exist "%ROOT%\release" mkdir "%ROOT%\release"
@@ -70,20 +79,14 @@ if not exist "%ROOT%\%ENTRY%" (
 )
 
 REM ===== SAFETY =====
-if /I "%ROOT%"=="C:" (
-  echo ERROR: ROOT points to C:\ (drive root). Abort.
-  call :die "ROOT points to C:\\ (drive root)"
-)
+if /I "%ROOT%"=="C:" call :die "ROOT points to C:\ (drive root)"
 
 if not exist "%MARKER%" (
   echo Creating marker "%MARKER%"
   >"%MARKER%" echo nadin-root
 )
 
-if not exist "%ROOT%\build_portable.bat" (
-  echo ERROR: build_portable.bat missing in ROOT. Abort.
-  call :die "build_portable.bat missing in ROOT"
-)
+if not exist "%ROOT%\build_portable.bat" call :die "build_portable.bat missing in ROOT"
 
 if not exist "%ROOT%\%RELEASE_BASE%" mkdir "%ROOT%\%RELEASE_BASE%"
 if errorlevel 1 call :die "failed to create release base directory"
@@ -200,7 +203,7 @@ REM стартовый бат для пользователя
 
 REM ================== CLEAN .py INSIDE PORTABLE ONLY ==================
 if "%CLEAN_PY_IN_PORTABLE%"=="1" (
-  echo Cleaning *.py in portable (safe)...
+  echo Cleaning *.py in portable - safe...
   for /r "%RELEASE_ROOT%" %%F in (*.py *.pyc *.pyo *.spec) do del /f /q "%%F" >nul 2>&1
   for /d /r "%RELEASE_ROOT%" %%D in (__pycache__) do rmdir /s /q "%%D" >nul 2>&1
 )
