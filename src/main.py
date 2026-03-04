@@ -271,15 +271,6 @@ def is_person_query(raw: str) -> bool:
     return False
 
 
-def normalize_gender(patronymic: str) -> str:
-    """Автоопределение пола по отчеству."""
-    token = patronymic.lower().strip()
-    if token.endswith("вич") or token.endswith("ич"):
-        return "М"
-    if token.endswith("вна"):
-        return "Ж"
-    return ""
-
 INPUT_TYPE_INN = "INN"
 INPUT_TYPE_URL = "URL"
 INPUT_TYPE_ORG_TEXT = "ORG_TEXT"
@@ -1956,9 +1947,38 @@ class CompanyWebApp:
                 self.SOURCE_PROVIDERS.append(provider)
         self.SOURCE_PROVIDERS.sort(key=lambda p: int(p.get("priority", 10)))
 
-    def _extract_revenue(self, text: str) -> int:
-        digits = re.sub(r"[^\d]", "", text or "")
-        return int(digits) if digits else 0
+    def _extract_revenue(self, raw: str) -> int:
+        if not raw:
+            return 0
+
+        lowered = raw.lower()
+        compact = raw.replace(" ", " ").replace(" ", "")
+        number_match = re.search(r"\d+(?:[.,]\d+)?", compact)
+        if not number_match:
+            return 0
+
+        number_token = number_match.group(0)
+        has_decimal = "." in number_token or "," in number_token
+        normalized = number_token.replace(",", ".")
+        try:
+            value = float(normalized)
+        except ValueError:
+            return 0
+
+        if "трлн" in lowered:
+            value *= 1_000_000_000_000
+        elif "млрд" in lowered:
+            value *= 1_000_000_000
+        elif "млн" in lowered:
+            value *= 1_000_000
+        elif "тыс" in lowered:
+            value *= 1_000
+        elif not has_decimal:
+            digits = re.sub(r"[^\d]", "", compact)
+            if digits:
+                value = float(digits)
+
+        return int(value)
 
     def _deep_values_for_keys(self, payload: Any, keys: set[str]) -> list[Any]:
         matches: list[Any] = []
@@ -3292,7 +3312,7 @@ class CompanyWebApp:
 
         best_profile: dict[str, Any] = {}
         best_score = -1.0
-        for link in links[:5]:
+        for link in links[:10]:
             card_url = str(link)
             if card_url.startswith("/"):
                 card_url = f"https://zachestnyibiznes.ru{card_url}"
@@ -3447,7 +3467,7 @@ class CompanyWebApp:
             revenue = self._extract_revenue_from_soup(soup_for_revenue)
         if not revenue:
             rev_match = re.search(
-                r"(?:Выручка|Доход|Revenue|Оборот)[^\d]{0,30}([\d\s.,]+)\s*(?:млрд|млн|тыс)?",
+                r"((?:Выручка|Доход|Revenue|Оборот)[^\d]{0,30}[\d\s.,]+(?:\s*(?:трлн|млрд|млн|тыс))?)",
                 page_text,
                 flags=re.IGNORECASE,
             )
