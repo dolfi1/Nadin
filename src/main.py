@@ -348,6 +348,16 @@ POSITION_NOISE_MARKERS = {
     "подробнее",
 }
 
+POSITION_GARBAGE_TOKENS = {
+    "кызы",
+    "оглы",
+    "кizi",
+    "ogly",
+    "qizi",
+    "кизи",
+    "гызы",
+}
+
 POSITION_NOISE_PHRASES_RE = re.compile(
     r"\b(?:история|проверить|юридического\s+лица|физлиц|действует|обновлено|сведения|инн|огрн)\b",
     flags=re.IGNORECASE,
@@ -359,6 +369,17 @@ def _clean_fio_part(s: str) -> str:
         return ""
     tokens = re.findall(r"[А-Яа-яЁё-]+", s)
     return tokens[0] if tokens else ""
+
+
+def _clean_middle_name_part(s: str) -> str:
+    if not s:
+        return ""
+    tokens = re.findall(r"[А-Яа-яЁё-]+", s)
+    if not tokens:
+        return ""
+    if len(tokens) >= 2 and tokens[1].lower() in {"кызы", "кизи", "гызы", "оглы", "огли", "улы", "уулу"}:
+        return f"{tokens[0]} {tokens[1].lower()}"
+    return tokens[0]
 
 
 class CompanyWebApp:
@@ -800,7 +821,18 @@ class CompanyWebApp:
 
         org_upper = org_name.upper()
         if "ПАО" in org_upper or "PAO" in org_upper:
-            score += 20
+            score += 30
+        elif "АО" in org_upper:
+            score += 15
+        if "ООО" in org_upper and revenue == 0:
+            score -= 10
+
+        inn = str(profile.get("inn", ""))
+        if len(inn) == 10:
+            if inn[:2] in {"77", "99"}:
+                score += 15
+            elif inn[:2] in {"78", "47"}:
+                score += 10
 
         return score
 
@@ -1087,6 +1119,8 @@ class CompanyWebApp:
             return None
         lowered = cleaned.lower()
         if any(marker in lowered for marker in POSITION_NOISE_MARKERS):
+            return None
+        if self._normalize_spaces(lowered) in POSITION_GARBAGE_TOKENS:
             return None
 
         whitelist = (
@@ -1420,8 +1454,15 @@ class CompanyWebApp:
                 opf_ru = "ФГАОУ ВО"
                 name_tokens = ru_parts[:-2]
             else:
-                opf_ru = ru_parts[-1] if ru_parts and ru_parts[-1] in RU_TO_EN_OPF_EXTENDED else ""
-                name_tokens = ru_parts[:-1] if opf_ru else ru_parts
+                if ru_parts and ru_parts[-1] in RU_TO_EN_OPF_EXTENDED:
+                    opf_ru = ru_parts[-1]
+                    name_tokens = ru_parts[:-1]
+                elif ru_parts and ru_parts[0] in RU_TO_EN_OPF_EXTENDED:
+                    opf_ru = ru_parts[0]
+                    name_tokens = ru_parts[1:]
+                else:
+                    opf_ru = ""
+                    name_tokens = ru_parts
             name = " ".join(self._translit(tok) for tok in name_tokens)
             cleaned = self._normalize_spaces(f"{name} {RU_TO_EN_OPF_EXTENDED.get(opf_ru, '')}")
             if cleaned:
@@ -2618,7 +2659,7 @@ class CompanyWebApp:
                 or (sv_yul.get("ФинПоказ") or {}).get("Выручка")
                 or 0
             )
-            gender = self._infer_gender(middle_name_ru, position)
+            gender = self._infer_gender(middle_name_ru, position, name_ru)
 
             return {
                 "url": url,
@@ -2934,7 +2975,7 @@ class CompanyWebApp:
                 surname_ru, name_ru, middle_name_ru = self._split_fio_ru(fio_match.group(1))
                 profile.update({"surname_ru": surname_ru, "name_ru": name_ru, "middle_name_ru": middle_name_ru})
             if profile.get("middle_name_ru") and not profile.get("gender"):
-                profile["gender"] = self._infer_gender(profile["middle_name_ru"], profile.get("ru_position", ""))
+                profile["gender"] = self._infer_gender(profile["middle_name_ru"], profile.get("ru_position", ""), profile.get("name_ru", ""))
         return profile
 
     def _detect_page_structure(self, soup: BeautifulSoup) -> str:
@@ -3399,6 +3440,19 @@ class CompanyWebApp:
         inn_match = re.search(r"ИНН[:\s]*(\d{10,12})", text)
         if inn_match:
             inn = inn_match.group(1)
+
+        soup_for_revenue = BeautifulSoup(page_text, "lxml") if "<" in page_text else None
+        revenue = 0
+        if soup_for_revenue:
+            revenue = self._extract_revenue_from_soup(soup_for_revenue)
+        if not revenue:
+            rev_match = re.search(
+                r"(?:Выручка|Доход|Revenue|Оборот)[^\d]{0,30}([\d\s.,]+)\s*(?:млрд|млн|тыс)?",
+                page_text,
+                flags=re.IGNORECASE,
+            )
+            if rev_match:
+                revenue = self._extract_revenue(rev_match.group(1))
         return {
             "url": url,
             "source": source,
@@ -3408,6 +3462,7 @@ class CompanyWebApp:
             "middle_name_ru": middle_name_ru,
             "ru_position": self._normalize_positions_ru(position)[0] if position else "",
             "inn": inn,
+            "revenue": revenue,
         }
 
     def _parse_url_detail(self, raw_url: str) -> dict[str, Any] | None:
@@ -3452,12 +3507,39 @@ class CompanyWebApp:
             return self._provider_fallback_from_catalog(provider_name, normalized, inn)
         return self._provider_fallback_from_catalog(provider_name, normalized, inn)
 
-    def _infer_gender(self, middle_name_ru: str, ru_position: str) -> str:
+    def _infer_gender(self, middle_name_ru: str, ru_position: str = "", first_name_ru: str = "") -> str:
         token = self._normalize_spaces(middle_name_ru).lower()
-        if token.endswith(("ич", "оглы")):
+        if token.endswith(("ич", "оглы", "улы", "уулу", "огли")):
             return "М"
-        if token.endswith(("вна", "кызы")):
+        if token.endswith(("вна", "кызы", "кизи", "гызы", "овна", "евна")):
             return "Ж"
+
+        parts = token.split()
+        if len(parts) >= 2:
+            if parts[-1] in {"кызы", "кизи", "гызы"}:
+                return "Ж"
+            if parts[-1] in {"оглы", "огли", "улы", "уулу"}:
+                return "М"
+
+        fname = self._normalize_spaces(first_name_ru).lower()
+        if fname:
+            known_female_names = {
+                "зульфия", "гульнара", "зарина", "лейла", "айгуль", "айгерим",
+                "наталья", "ольга", "татьяна", "елена", "анна", "мария", "юлия",
+                "светлана", "ирина", "екатерина", "нина", "галина", "людмила",
+                "надежда", "валентина", "вера", "любовь", "тамара", "раиса",
+            }
+            known_male_names = {
+                "александр", "алексей", "андрей", "дмитрий", "иван", "михаил",
+                "сергей", "владимир", "николай", "евгений", "антон", "денис",
+                "максим", "роман", "артем", "артём", "игорь", "виктор", "олег", "павел",
+            }
+            if fname in known_female_names:
+                return "Ж"
+            if fname in known_male_names:
+                return "М"
+            if fname.endswith(("а", "я", "ия")) and not fname.endswith(("уя", "оя")):
+                return "Ж"
         return ""
 
     def _enrich_provider_payload(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -3471,7 +3553,11 @@ class CompanyWebApp:
             data["name_ru"] = nam
             data["middle_name_ru"] = patr
         if not data.get("gender"):
-            data["gender"] = self._infer_gender(str(data.get("middle_name_ru", "")), str(data.get("ru_position", "")))
+            data["gender"] = self._infer_gender(
+                str(data.get("middle_name_ru", "")),
+                str(data.get("ru_position", "")),
+                str(data.get("name_ru", "")),
+            )
         return payload
 
     def _throttle_acquire(self, domain: str) -> bool:
@@ -4217,9 +4303,16 @@ class CompanyWebApp:
                     profile["name"] = profile["name_ru"]
                     profile["first_name"] = self._translit(profile["name_ru"])
 
+        ru_position_token = self._normalize_spaces(str(profile.get("ru_position", "")).lower())
+        if ru_position_token in {"кызы", "оглы", "кизи", "гызы", "огли", "улы", "уулу", "qizi", "ogly"}:
+            middle = self._normalize_spaces(str(profile.get("middle_name_ru", "")))
+            if middle:
+                profile["middle_name_ru"] = self._normalize_spaces(f"{middle} {ru_position_token}")
+            profile["ru_position"] = ""
+
         profile["surname_ru"] = _clean_fio_part(profile.get("surname_ru", ""))
         profile["name_ru"] = _clean_fio_part(profile.get("name_ru", ""))
-        profile["middle_name_ru"] = _clean_fio_part(profile.get("middle_name_ru", ""))
+        profile["middle_name_ru"] = _clean_middle_name_part(profile.get("middle_name_ru", ""))
         candidate_source = field_sources.get("surname_ru", field_sources.get("name_ru", ""))
         candidate_fio = " ".join(part for part in (profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")) if part)
         accepted, reason = self._validate_leader_fio_candidate(profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", ""))
@@ -4240,13 +4333,21 @@ class CompanyWebApp:
             profile.get("middle_name_ru")
             and field_sources.get("gender") in ("Автоопределение", "ФНС ЕГРЮЛ")
         ):
-            recomputed_gender = self._infer_gender(profile.get("middle_name_ru", ""), profile.get("ru_position", ""))
+            recomputed_gender = self._infer_gender(
+                profile.get("middle_name_ru", ""),
+                profile.get("ru_position", ""),
+                profile.get("name_ru", ""),
+            )
             if recomputed_gender:
                 profile["gender"] = recomputed_gender
                 field_sources["gender"] = "Автоопределение"
 
         if not profile.get("gender"):
-            inferred_gender = self._infer_gender(profile.get("middle_name_ru", ""), profile.get("ru_position", ""))
+            inferred_gender = self._infer_gender(
+                profile.get("middle_name_ru", ""),
+                profile.get("ru_position", ""),
+                profile.get("name_ru", ""),
+            )
             if inferred_gender:
                 profile["gender"] = inferred_gender
                 field_sources["gender"] = field_sources.get("gender", "Автоопределение")
@@ -5356,7 +5457,7 @@ class CompanyWebApp:
         if not en_position and ru_position:
             en_position = self._generate_en_position(ru_position)
         if not gender and (middle_name_ru or ru_position):
-            gender = self._infer_gender(middle_name_ru, ru_position)
+            gender = self._infer_gender(middle_name_ru, ru_position, name_ru)
         if (surname_ru or name_ru) and gender not in {"М", "Ж"}:
             errors.append("Пол обязателен: М/Ж")
         profile = {
