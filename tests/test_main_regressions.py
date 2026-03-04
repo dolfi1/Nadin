@@ -204,3 +204,50 @@ def test_export_xlsx_has_expected_headers(app):
     else:
         assert disposition == f'attachment; filename="card_{card_id}.csv"'
         assert isinstance(body, str)
+
+
+def test_sanitize_ru_position_rejects_azerbaijani_suffixes(app):
+    assert app.sanitize_ru_position("кызы") is None
+    assert app.sanitize_ru_position("оглы") is None
+    assert app.sanitize_ru_position("Директор") == "Директор"
+
+
+def test_infer_gender_handles_suffixes_and_first_name(app):
+    assert app._infer_gender("Эльман кызы") == "Ж"
+    assert app._infer_gender("Сергеевна") == "Ж"
+    assert app._infer_gender("Александрович") == "М"
+    assert app._infer_gender("Эльман", first_name_ru="Зульфия") == "Ж"
+    assert app._infer_gender("") == ""
+
+
+def test_normalize_en_org_reads_opf_from_prefix(app):
+    en, _ = app.normalize_en_org("", "ООО ПЯТЕРОЧКА")
+    assert en == "Pyaterochka LLC"
+
+
+
+def test_score_org_relevance_prefers_public_company_over_small_llc(app):
+    query = "ВТБ"
+    llc_profile = {"ru_org": "ООО ВТБ", "inn": "9715498800", "revenue": 0}
+    pjsc_profile = {"ru_org": "ПАО ВТБ", "inn": "7702070139", "revenue": 0}
+    assert app._score_org_relevance(pjsc_profile, query) > app._score_org_relevance(llc_profile, query)
+
+
+
+def test_apply_card_rules_normalizes_ru_org_opf_position(app):
+    profile = {"ru_org": "ВТБ ООО", "inn": "7702070139", "en_org": "", "ru_position": ""}
+    normalized, _ = app.apply_card_rules(profile, "company")
+    assert normalized["ru_org"] == "ООО ВТБ"
+
+
+
+def test_build_osint_profile_extracts_revenue_from_text(app):
+    profile = app._build_osint_profile(
+        url="https://example.com",
+        source="zachestnyibiznes.ru",
+        org_name="ПАО ВТБ",
+        director="",
+        position="",
+        page_text="Выручка 1 234 567 890 руб.",
+    )
+    assert profile["revenue"] == 1234567890
