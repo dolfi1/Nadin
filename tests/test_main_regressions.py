@@ -251,3 +251,102 @@ def test_build_osint_profile_extracts_revenue_from_text(app):
         page_text="Выручка 1 234 567 890 руб.",
     )
     assert profile["revenue"] == 1234567890
+
+
+def test_score_org_relevance_prefers_bank_over_subsidiary_for_short_brand(app):
+    query = "ВТБ"
+    subsidiary_profile = {"ru_org": "АО ВТБ ЛИЗИНГ", "inn": "7709378229", "revenue": 9_000_000_000_000}
+    bank_profile = {"ru_org": "ПАО БАНК ВТБ", "inn": "7702070139", "revenue": 0}
+    assert app._score_org_relevance(bank_profile, query) > app._score_org_relevance(subsidiary_profile, query)
+
+
+def test_search_by_criteria_company_prefers_bank_candidate(app, monkeypatch):
+    hits = [
+        {
+            "source": "zachestnyibiznes.ru",
+            "type": "company",
+            "data": {"ru_org": "АО ВТБ ЛИЗИНГ", "inn": "7709378229", "revenue": 9_000_000_000_000},
+        },
+        {
+            "source": "ФНС ЕГРЮЛ",
+            "type": "company",
+            "data": {"ru_org": "ПАО БАНК ВТБ", "inn": "7702070139", "revenue": 0},
+        },
+    ]
+
+    monkeypatch.setattr(app, "_search_by_company", lambda *_a, **_k: (hits, ["company-search"]))
+
+    _source_hits, candidates, _trace = app._search_by_criteria({"company": "ВТБ", "search_type": "company"})
+
+    assert candidates
+    assert candidates[0]["org_ru"] == "ПАО БАНК ВТБ"
+
+
+def test_validate_leader_fio_candidate_rejects_noise_stems(app):
+    accepted, reason = app._validate_leader_fio_candidate("Сведениям", "Ограничен", "Учредители")
+    assert not accepted
+    assert reason.startswith("token_matches_noise_stem")
+
+
+def test_provider_cache_key_uses_version_prefix(app, monkeypatch):
+    captured = {}
+
+    def fake_get_cache(cache_key):
+        captured["key"] = cache_key
+        return []
+
+    monkeypatch.setattr(app, "_get_cache", fake_get_cache)
+
+    provider = {
+        "name": "checko.ru",
+        "kind": "checko",
+        "supports_inn": True,
+        "supports_name": True,
+        "supports_url": True,
+    }
+
+    app._call_provider(provider, "ВТБ", "ORG_TEXT", no_cache=False, search_type="company", allow_fallback=False)
+
+    assert captured["key"].startswith("provider:v2:")
+
+
+def test_search_by_company_short_brand_expands_queries_and_prefers_bank(app, monkeypatch):
+    calls = []
+
+    leasing_hit = {
+        "source": "zachestnyibiznes.ru",
+        "type": "company",
+        "data": {"ru_org": "АО ВТБ ЛИЗИНГ", "inn": "7709378229", "revenue": 9_000_000_000_000},
+    }
+    bank_hit = {
+        "source": "ФНС ЕГРЮЛ",
+        "type": "company",
+        "data": {"ru_org": "ПАО БАНК ВТБ", "inn": "7702070139", "revenue": 0},
+    }
+
+    def fake_search_external_sources(raw, no_cache=False, search_type="", provider_names=None):
+        calls.append(raw)
+        if raw == "ВТБ":
+            return [leasing_hit], ["base"]
+        if "Банк ВТБ" in raw:
+            return [bank_hit], ["bank_variant"]
+        return [], ["empty"]
+
+    monkeypatch.setattr(app, "_search_external_sources", fake_search_external_sources)
+
+    hits, _trace = app._search_by_company("ВТБ", search_type="company")
+
+    assert hits
+    assert hits[0]["data"]["ru_org"] == "ПАО БАНК ВТБ"
+    assert any("Банк ВТБ" in query for query in calls)
+
+
+def test_detect_input_type_bank_brand_is_org_text(app):
+    assert app.detect_input_type("Банк ВТБ") == "ORG_TEXT"
+
+
+def test_score_org_relevance_prefers_core_bank_over_union_structure(app):
+    query = "ВТБ"
+    union_profile = {"ru_org": "ППО БАНКА ВТБ (ПАО) МГО ПРГУ РФ", "inn": "7704259073", "revenue": 0}
+    bank_profile = {"ru_org": "БАНК ВТБ (ПАО)", "inn": "7702070139", "revenue": 0}
+    assert app._score_org_relevance(bank_profile, query) > app._score_org_relevance(union_profile, query)

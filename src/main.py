@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import hashlib
@@ -249,6 +249,45 @@ RUSPROFILE_NOISE_RE = re.compile(
     flags=re.IGNORECASE,
 )
 GARBAGE_ORG_TITLES = {"результаты поиска", "поиск", "search results"}
+
+PROVIDER_CACHE_KEY_VERSION = "v2"
+COMPANY_OPF_TOKENS = {"ооо", "ао", "пао", "оао", "зао", "ип", "нко"}
+SHORT_BRAND_BANK_HINTS = {
+    "втб",
+    "сбер",
+    "сбербанк",
+    "альфа",
+    "тинькофф",
+    "тбанк",
+    "т-банк",
+    "росбанк",
+    "газпромбанк",
+    "рсхб",
+}
+SHORT_BRAND_SUBSIDIARY_MARKERS = (
+    "лизинг",
+    "девелоп",
+    "страхов",
+    "фактор",
+    "капитал",
+    "инвест",
+    "брокер",
+    "управлен",
+    "asset",
+    "leasing",
+    "development",
+    "insurance",
+)
+SHORT_BRAND_NOISE_MARKERS = (
+    "ппо",
+    "профсоюз",
+    "первичн",
+    "мго",
+    "пргу",
+    "территориальн",
+    "объединенн",
+)
+LEADER_FIO_NOISE_STEMS = ("сведен", "огранич", "учредит", "истор", "проверк")
 
 
 def is_person_query(raw: str) -> bool:
@@ -753,6 +792,18 @@ class CompanyWebApp:
         parts = norm.split()
         if not (1 <= len(parts) <= 3):
             return False
+
+        lower_parts = [part.lower() for part in parts]
+        company_hints = {
+            "банк", "холдинг", "group", "лизинг", "страхование", "капитал", "факторинг", "девелопмент", "development",
+        }
+        if any(part in COMPANY_OPF_TOKENS for part in lower_parts):
+            return False
+        if any(part in company_hints for part in lower_parts):
+            return False
+        if len(parts) >= 2 and any(part in SHORT_BRAND_BANK_HINTS for part in lower_parts):
+            return False
+
         if len(parts) == 1:
             token = parts[0]
             # Однословные запросы вроде "ВТБ" обычно означают организацию.
@@ -761,7 +812,6 @@ class CompanyWebApp:
             if not re.fullmatch(r"[А-Яа-яЁё-]+", token):
                 return False
         return all(re.fullmatch(r"[А-Яа-яЁё]+", part) for part in parts)
-
     def _clean_ru_org_name(self, value: str) -> str:
         return re.sub(r"^Организация\s+", "", self._normalize_spaces(value), flags=re.IGNORECASE).strip()
 
@@ -836,43 +886,85 @@ class CompanyWebApp:
             return True
         return False
 
-    def _score_org_relevance(self, profile: dict[str, Any], query: str) -> float:
-        score = 0.0
-        query_lower = self._normalize_spaces(query.lower())
-        org_name = self._normalize_spaces(str(profile.get("ru_org", "")).lower())
+    def _company_tokens_without_opf(self, value: str) -> list[str]:
+        cleaned = re.sub(r"[^\w]+", " ", value.lower(), flags=re.UNICODE)
+        tokens = [token for token in cleaned.split() if token]
+        if not tokens:
+            return []
+        tokens_wo_opf = [token for token in tokens if token not in COMPANY_OPF_TOKENS]
+        return tokens_wo_opf or tokens
 
-        if query_lower and (query_lower in org_name or org_name.startswith(query_lower)):
-            score += 50
+    def _short_brand_token(self, value: str) -> str:
+        tokens = self._company_tokens_without_opf(value)
+        if len(tokens) == 1 and len(tokens[0]) <= 5:
+            return tokens[0]
+        return ""
+
+    def _score_org_relevance(self, profile: dict[str, Any], query: str) -> float:
+        query_text = self._normalize_spaces(str(query))
+        org_name = self._normalize_spaces(str(profile.get("ru_org", "")))
+        if not query_text or not org_name:
+            return 0.0
+
+        query_tokens = self._company_tokens_without_opf(query_text)
+        org_tokens = self._company_tokens_without_opf(org_name)
+        if not query_tokens:
+            return 0.0
+
+        query_core = " ".join(query_tokens)
+        org_core = " ".join(org_tokens)
+
+        score = 0.0
+        if query_core and org_core:
+            if org_core == query_core:
+                score += 260
+            elif org_core.startswith(f"{query_core} "):
+                score += 230
+            elif f" {query_core} " in f" {org_core} ":
+                score += 180
+            else:
+                similarity = SequenceMatcher(None, query_core, org_core).ratio()
+                if similarity >= 0.92:
+                    score += 150
+                elif similarity >= 0.80:
+                    score += 90
+                elif similarity >= 0.65:
+                    score += 40
+
+        org_token_set = set(org_tokens)
+        overlap = sum(1 for token in query_tokens if token in org_token_set)
+        score += (overlap / max(len(query_tokens), 1)) * 60.0
+
+        brand_token = self._short_brand_token(query_text)
+        short_brand_query = bool(brand_token)
+        bank_context = "банк" in query_text.lower() or brand_token in SHORT_BRAND_BANK_HINTS
+        has_bank_marker = any(token.startswith("банк") for token in org_tokens)
+        if bank_context and has_bank_marker:
+            score += 95
+
+        if short_brand_query and brand_token in org_token_set:
+            score += 25
+            org_core_lower = org_core or org_name.lower()
+            if any(marker in org_core_lower for marker in SHORT_BRAND_SUBSIDIARY_MARKERS):
+                score -= 120
+            if any(marker in org_core_lower for marker in SHORT_BRAND_NOISE_MARKERS):
+                score -= 170
+            if f"банк {brand_token}" in org_core_lower:
+                score += 130
+            elif f"банка {brand_token}" in org_core_lower:
+                score += 30
 
         revenue = int(profile.get("revenue", 0) or 0)
-        if revenue > 1_000_000_000_000:
-            score += 100
-        elif revenue > 100_000_000_000:
-            score += 80
-        elif revenue > 10_000_000_000:
-            score += 60
-        elif revenue > 1_000_000_000:
-            score += 40
-        else:
-            score += min(revenue / 1e8, 20)
+        if revenue > 0:
+            score += min((revenue / 1_000_000_000_000) * 20.0, 20.0)
 
         org_upper = org_name.upper()
         if "ПАО" in org_upper or "PAO" in org_upper:
-            score += 30
+            score += 12
         elif "АО" in org_upper:
-            score += 15
-        if "ООО" in org_upper and revenue == 0:
-            score -= 10
-
-        inn = str(profile.get("inn", ""))
-        if len(inn) == 10:
-            if inn[:2] in {"77", "99"}:
-                score += 15
-            elif inn[:2] in {"78", "47"}:
-                score += 10
+            score += 6
 
         return score
-
     def _extract_inn(self, raw: str) -> str:
         value = self._normalize_spaces(raw)
         if re.fullmatch(r"\d{10}|\d{12}", value):
@@ -950,7 +1042,6 @@ class CompanyWebApp:
     def _is_valid_leader_fio(self, surname_ru: str, name_ru: str, middle_name_ru: str = "") -> bool:
         accepted, _ = self._validate_leader_fio_candidate(surname_ru, name_ru, middle_name_ru)
         return accepted
-
     def _validate_leader_fio_candidate(self, surname_ru: str, name_ru: str, middle_name_ru: str = "") -> tuple[bool, str]:
         surname = self._clean_fio_part(surname_ru)
         name = self._clean_fio_part(name_ru)
@@ -966,13 +1057,14 @@ class CompanyWebApp:
             lowered = token.lower()
             if lowered in FIO_STOP_TOKENS:
                 return False, f"token_in_stoplist:{lowered}"
+            if any(lowered.startswith(stem) for stem in LEADER_FIO_NOISE_STEMS):
+                return False, f"token_matches_noise_stem:{lowered}"
             if FIO_FORBIDDEN_TOKEN_RE.search(lowered):
                 return False, f"token_contains_forbidden_marker:{lowered}"
             min_len = 2 if idx == 1 else 3
             if not self._valid_fio_part(token, min_len=min_len):
                 return False, f"invalid_token:{lowered}"
         return True, "ok"
-
     def _extract_fio_from_leader_obj(self, obj: dict[str, Any]) -> tuple[str, str, str]:
         if not isinstance(obj, dict):
             return "", "", ""
@@ -1737,7 +1829,7 @@ class CompanyWebApp:
         self._thread_state.last_fetch_status = FETCH_STATUS_EMPTY_OK
         normalized = self._normalize_spaces(raw)
         inn = self._extract_inn(raw) if input_type == INPUT_TYPE_INN else None
-        cache_key = f"provider:{provider.get('name', '')}:{input_type}:{normalized.lower()}:{search_type}"
+        cache_key = f"provider:{PROVIDER_CACHE_KEY_VERSION}:{provider.get('name', '')}:{input_type}:{normalized.lower()}:{search_type}"
         if not no_cache:
             cached_hits = self._get_cache(cache_key)
             if cached_hits is not None:
@@ -1906,7 +1998,7 @@ class CompanyWebApp:
             if fallback_id in seen_fallbacks:
                 continue
             seen_fallbacks.add(fallback_id)
-            fallback_cache_key = f"provider:{fallback.get('name', '')}:{input_type}:{normalized_query}:{search_type}"
+            fallback_cache_key = f"provider:{PROVIDER_CACHE_KEY_VERSION}:{fallback.get('name', '')}:{input_type}:{normalized_query}:{search_type}"
             try:
                 cached_hits = self._get_cache(fallback_cache_key)
                 if cached_hits is not None:
@@ -2175,15 +2267,25 @@ class CompanyWebApp:
         text = soup.get_text(" ", strip=True)
         rev_match = re.search(r"(?:Выручка|Доход|Revenue)[^\d]{0,30}([\d\s.,]+)", text, flags=re.IGNORECASE)
         return self._extract_revenue(rev_match.group(1) if rev_match else "")
-
     def _score_hit(self, hit: dict[str, Any], query: str) -> float:
         data = hit.get("data", hit)
+        if not isinstance(data, dict):
+            return 0.0
+        input_type = self.detect_input_type(query)
         q_lower = self._normalize_spaces(query.lower())
         fio = " ".join(x for x in [data.get("surname_ru", ""), data.get("name_ru", ""), data.get("middle_name_ru", "")] if x)
         fio_lower = self._normalize_spaces(fio.lower())
 
         score = 0.0
-        if self.detect_input_type(query) == INPUT_TYPE_PERSON_TEXT and q_lower and fio_lower:
+        if input_type == INPUT_TYPE_ORG_TEXT:
+            score += self._score_org_relevance(data, query)
+            if hit.get("source") == "ФНС ЕГРЮЛ":
+                score += 15
+            if self._normalize_spaces(str(data.get("inn", ""))):
+                score += 5
+            return score
+
+        if input_type == INPUT_TYPE_PERSON_TEXT and q_lower and fio_lower:
             q_words = sorted(q_lower.split())
             fio_words = sorted(fio_lower.split())
             if q_words == fio_words:
@@ -2206,12 +2308,11 @@ class CompanyWebApp:
         if hit.get("source") == "ФНС ЕГРЮЛ":
             score += 25
 
-        if self.detect_input_type(query) == INPUT_TYPE_INN:
+        if input_type == INPUT_TYPE_INN:
             inn = self._extract_inn(query)
             if inn and str(data.get("inn", "")) == inn:
                 score += 100
         return score
-
     def _search_external_sources(
         self,
         raw: str,
@@ -3175,19 +3276,37 @@ class CompanyWebApp:
         return []
 
     def _generate_company_name_variants(self, company_name: str) -> list[str]:
-        variants = [company_name]
+        normalized_company = self._normalize_spaces(company_name)
+        if not normalized_company:
+            return []
+
+        variants = [normalized_company]
         opf_patterns = [r"\bПАО\b", r"\bАО\b", r"\bООО\b", r"\bОАО\b", r"\bЗАО\b", r"\bИП\b", r"\bФГУП\b", r"\bФГБУ\b"]
         for pattern in opf_patterns:
-            if re.search(pattern, company_name, re.IGNORECASE):
-                variant = re.sub(pattern, "", company_name, flags=re.IGNORECASE).strip()
-                if variant and variant != company_name:
+            if re.search(pattern, normalized_company, re.IGNORECASE):
+                variant = re.sub(pattern, "", normalized_company, flags=re.IGNORECASE).strip()
+                if variant and variant != normalized_company:
                     variants.append(variant)
 
-        if "сбер" in company_name.lower():
+        company_lower = normalized_company.lower()
+        if "сбер" in company_lower:
             variants.extend(["Сбербанк ПАО", "ПАО Сбербанк"])
 
-        return list(dict.fromkeys(variants))
+        short_brand_token = self._short_brand_token(normalized_company)
+        if short_brand_token:
+            brand_upper = short_brand_token.upper()
+            variants.extend([f"АО {brand_upper}", f"ПАО {brand_upper}"])
+            if short_brand_token in SHORT_BRAND_BANK_HINTS or "банк" in company_lower:
+                variants.extend(
+                    [
+                        f"Банк {brand_upper}",
+                        f"ПАО Банк {brand_upper}",
+                        f"{brand_upper} Банк",
+                        f"Банк {brand_upper} ПАО",
+                    ]
+                )
 
+        return list(dict.fromkeys(variants))
     def _select_first_text(self, soup: BeautifulSoup, selectors: list[str]) -> str:
         for selector in selectors:
             node = soup.select_one(selector)
@@ -4818,69 +4937,48 @@ class CompanyWebApp:
         hits, source_trace = self._search_external_sources(full_name, no_cache=False, search_type=search_type)
         trace.extend(source_trace)
         return hits, trace
-
     def _search_by_company(self, company_name: str, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
         trace = [f"Поиск по компании: {company_name}"]
-        hits: list[dict[str, Any]] = []
-        input_type = INPUT_TYPE_ORG_TEXT
         normalized_name, _ = self.normalize_ru_org(company_name)
-        trace.append(f"Нормализовано: {normalized_name}")
-        providers = self._provider_chain(input_type, normalized_name)
+        query_value = self._normalize_spaces(normalized_name or company_name)
+        trace.append(f"Нормализовано: {query_value}")
+        if not query_value:
+            trace.append("Пустой запрос после нормализации")
+            return [], trace
 
-        for provider in providers:
-            if not self._should_call_provider(provider, input_type):
-                continue
-            trace.append(f"Запрос к источнику: {provider['name']}")
-            data = self._call_provider_with_retry(provider, normalized_name, input_type, max_retries=0, search_type=search_type)
-            if data:
-                for item in data:
-                    hit = {
-                        "source": provider["name"],
-                        "url": item.get("url", ""),
-                        "data": item,
-                        "type": item.get("type", "unknown"),
-                    }
-                    logger.debug(
-                        "Хит от %s: data keys=%s, ru_org=%s",
-                        provider["name"],
-                        list(item.keys()) if isinstance(item, dict) else "N/A",
-                        item.get("ru_org") if isinstance(item, dict) else "N/A",
-                    )
-                    hits.append(hit)
-                trace.append(f"Найдено {len(data)} записей в {provider['name']}")
-                break
+        hits: list[dict[str, Any]] = []
+        source_hits, source_trace = self._search_external_sources(query_value, no_cache=False, search_type=search_type)
+        trace.extend(source_trace)
+        hits.extend(source_hits)
 
-        if not hits:
+        alt_queries: list[str] = []
+        for alt_name in self._generate_company_name_variants(company_name):
+            alt_normalized, _ = self.normalize_ru_org(alt_name)
+            alt_query = self._normalize_spaces(alt_normalized or alt_name)
+            if alt_query and alt_query.lower() != query_value.lower():
+                alt_queries.append(alt_query)
+
+        short_brand_query = bool(self._short_brand_token(query_value))
+        if short_brand_query and alt_queries:
+            trace.append("Короткий брендовый запрос: расширяем поиск по вариантам названия")
+            for alt_query in alt_queries:
+                trace.append(f"Попытка: {alt_query}")
+                alt_hits, alt_trace = self._search_external_sources(alt_query, no_cache=False, search_type=search_type)
+                trace.extend(alt_trace)
+                hits.extend(alt_hits)
+        elif not hits and alt_queries:
             trace.append("Ничего не найдено, пробуем альтернативные написания")
-            for alt_name in self._generate_company_name_variants(company_name):
-                if alt_name == company_name:
-                    continue
-                trace.append(f"Попытка: {alt_name}")
-                for provider in providers:
-                    if not self._should_call_provider(provider, input_type):
-                        continue
-                    data = self._call_provider_with_retry(provider, alt_name, input_type, max_retries=0, search_type=search_type)
-                    if data:
-                        for item in data:
-                            hit = {
-                                "source": provider["name"],
-                                "url": item.get("url", ""),
-                                "data": item,
-                                "type": item.get("type", "unknown"),
-                            }
-                            logger.debug(
-                                "Хит от %s: data keys=%s, ru_org=%s",
-                                provider["name"],
-                                list(item.keys()) if isinstance(item, dict) else "N/A",
-                                item.get("ru_org") if isinstance(item, dict) else "N/A",
-                            )
-                            hits.append(hit)
-                        trace.append(f"Найдено {len(data)} записей по '{alt_name}'")
-                        break
-                if hits:
+            for alt_query in alt_queries:
+                trace.append(f"Попытка: {alt_query}")
+                alt_hits, alt_trace = self._search_external_sources(alt_query, no_cache=False, search_type=search_type)
+                trace.extend(alt_trace)
+                if alt_hits:
+                    hits.extend(alt_hits)
                     break
-        return hits, trace
 
+        hits = self._dedup_source_hits(hits)
+        hits.sort(key=lambda item: self._score_hit(item, query_value), reverse=True)
+        return hits, trace
     def _search_by_criteria(self, params: dict[str, str]) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[str]]:
         trace: list[str] = []
         source_hits: list[dict[str, Any]] = []
@@ -4963,7 +5061,14 @@ class CompanyWebApp:
             primary_query = params.get("inn") or params.get("company") or " ".join(
                 filter(None, [params.get("surname", ""), params.get("name", ""), params.get("middle_name", "")])
             )
-            best_hit = max(source_hits, key=lambda h: self._score_hit(h, primary_query))
+            if search_type == "company":
+                def _company_rank(item: dict[str, Any]) -> tuple[float, float]:
+                    item_data = item.get("data", {}) if isinstance(item.get("data"), dict) else {}
+                    return self._score_org_relevance(item_data, primary_query), self._score_hit(item, primary_query)
+
+                best_hit = max(source_hits, key=_company_rank)
+            else:
+                best_hit = max(source_hits, key=lambda h: self._score_hit(h, primary_query))
             profile = dict(best_hit.get("data", {}))
             candidates = [{
                 "fio_ru": " ".join(x for x in [profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")] if x).strip(),
@@ -5918,3 +6023,4 @@ def run_server(db_path: str = "cards.db", host: str = "127.0.0.1", port: int = 8
 
 if __name__ == "__main__":
     run_server()
+
