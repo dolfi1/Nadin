@@ -3,7 +3,7 @@ setlocal
 
 set "ROOT=%~dp0"
 set "APP_NAME=Nadin"
-set "ENTRY=%ROOT%src\web_app.py"
+set "ENTRY=%ROOT%src\\main.py"
 set "FINAL_DIR=%ROOT%release\Nadin"
 set "MODE=release"
 REM если хочешь дебаг — меняй на debug

@@ -1,4 +1,4 @@
-import csv
+﻿import csv
 import io
 import json
 from urllib.parse import parse_qs, urlparse
@@ -69,7 +69,7 @@ def test_autofill_review_dedup_by_source_and_inn(app, monkeypatch):
 
     def fake_build(source_hits, *_args, **_kwargs):
         calls.append(source_hits)
-        return {"ru_org": "ПАО СБЕРБАНК", "en_org": "SBERBANK PJSC", "inn": "7707083893"}, {}
+        return {"en_org": "SBERBANK PJSC", "inn": "7707083893"}, {}
 
     def fake_search(*_args, provider_names=None, **_kwargs):
         if provider_names == ["ФНС ЕГРЮЛ"]:
@@ -83,7 +83,6 @@ def test_autofill_review_dedup_by_source_and_inn(app, monkeypatch):
         )
 
     monkeypatch.setattr(app, "_build_profile_from_sources", fake_build)
-    monkeypatch.setattr(app, "_is_profile_complete", lambda *_a, **_k: False)
     monkeypatch.setattr(app, "_search_external_sources", fake_search)
     monkeypatch.setattr(app, "apply_card_rules", lambda profile, card_type="": (profile, []))
     monkeypatch.setattr(app, "_missing_required_fields", lambda *_a, **_k: ["ru_org"])
@@ -350,3 +349,113 @@ def test_score_org_relevance_prefers_core_bank_over_union_structure(app):
     union_profile = {"ru_org": "ППО БАНКА ВТБ (ПАО) МГО ПРГУ РФ", "inn": "7704259073", "revenue": 0}
     bank_profile = {"ru_org": "БАНК ВТБ (ПАО)", "inn": "7702070139", "revenue": 0}
     assert app._score_org_relevance(bank_profile, query) > app._score_org_relevance(union_profile, query)
+
+
+def test_normalize_ru_org_bank_places_opf_at_end(app):
+    normalized, _ = app.normalize_ru_org("БАНК ВТБ (ПАО)")
+    assert normalized == "Банк ВТБ ПАО"
+
+
+def test_autofill_review_fast_inn_company_skips_extended_search(app, monkeypatch):
+    calls = []
+
+    def fake_search_external_sources(raw, no_cache=False, search_type="", provider_names=None):
+        calls.append(tuple(provider_names) if provider_names is not None else None)
+        return (
+            [
+                {
+                    "source": "ФНС ЕГРЮЛ",
+                    "type": "company",
+                    "data": {
+                        "inn": "7702070139",
+                        "ru_org": "БАНК ВТБ (ПАО)",
+                        "en_org": "VTB Bank PJSC",
+                        "revenue": 1_000_000,
+                    },
+                }
+            ],
+            ["fast"],
+        )
+
+    monkeypatch.setattr(app, "_search_external_sources", fake_search_external_sources)
+    monkeypatch.setattr(app, "_create_autofill_card", lambda *_a, **_k: 77)
+
+    body, status, _headers = app.autofill_review(
+        {"company_name": ["7702070139"], "search_type": ["company"]},
+        wants_json=True,
+    )
+
+    payload = json.loads(body)
+    assert status == "200 OK"
+    assert payload["ok"] is True
+    assert payload["card_id"] == 77
+    assert calls == [("ФНС ЕГРЮЛ",)]
+
+
+def test_card_view_financial_lines_format(app):
+    profile = {
+        "ru_org": "Банк ВТБ ПАО",
+        "en_org": "VTB Bank PJSC",
+        "inn": "7702070139",
+        "revenue": "1000000",
+        "financial_year": "2024",
+    }
+
+    with app._connect() as db:
+        cur = db.execute(
+            "INSERT INTO cards(ru_org,en_org,status,source,created_at,updated_at,data_json) VALUES(?,?,?,?,?,?,?)",
+            (
+                profile["ru_org"],
+                profile["en_org"],
+                "Найдено",
+                "autofill",
+                app._now(),
+                app._now(),
+                json.dumps({"profile": profile}, ensure_ascii=False),
+            ),
+        )
+        card_id = cur.lastrowid
+        db.commit()
+
+    body, status, _headers = app.card_view(card_id)
+
+    assert status == "200 OK"
+    assert "Выручка:</b> 1 млн руб. (2024)" in body
+    assert "Прибыль:</b> Данных нет (2024)" in body
+
+
+def test_search_by_company_short_brand_stops_after_confident_bank_hit(app, monkeypatch):
+    calls = []
+
+    leasing_hit = {
+        "source": "zachestnyibiznes.ru",
+        "type": "company",
+        "data": {"ru_org": "АО ВТБ ЛИЗИНГ", "inn": "7709378229", "revenue": 9_000_000_000_000},
+    }
+    bank_hit = {
+        "source": "ФНС ЕГРЮЛ",
+        "type": "company",
+        "data": {"ru_org": "БАНК ВТБ (ПАО)", "inn": "7702070139", "revenue": 1_000_000},
+    }
+
+    monkeypatch.setattr(
+        app,
+        "_generate_company_name_variants",
+        lambda _name: ["ВТБ", "Банк ВТБ", "ПАО ВТБ", "АО ВТБ ЛИЗИНГ"],
+    )
+
+    def fake_search_external_sources(raw, no_cache=False, search_type="", provider_names=None):
+        calls.append(raw)
+        if raw == "ВТБ":
+            return [leasing_hit], ["base"]
+        if raw == "Банк ВТБ":
+            return [bank_hit], ["bank"]
+        return [], ["empty"]
+
+    monkeypatch.setattr(app, "_search_external_sources", fake_search_external_sources)
+
+    hits, _trace = app._search_by_company("ВТБ", search_type="company")
+
+    assert hits
+    assert hits[0]["data"]["ru_org"] == "БАНК ВТБ (ПАО)"
+    assert "АО ВТБ ЛИЗИНГ" not in calls

@@ -435,6 +435,13 @@ class CompanyWebApp:
         self._autofill_result_cache: dict[str, dict[str, Any]] = {}
         self._autofill_result_cache_max = 256
         self._autofill_result_cache_ttl_seconds = 20
+        self._ui_sessions: dict[str, float] = {}
+        self._ui_session_lock = threading.Lock()
+        self._ui_session_ttl_seconds = max(20, int(os.getenv("NADIN_UI_SESSION_TTL_SECONDS", "45")))
+        self._ui_idle_shutdown_seconds = max(30, int(os.getenv("NADIN_IDLE_SHUTDOWN_SECONDS", "90")))
+        self._ui_shutdown_grace_seconds = max(10, int(os.getenv("NADIN_UI_SHUTDOWN_GRACE_SECONDS", "20")))
+        self._ui_started_at = time.time()
+        self._ui_last_activity = self._ui_started_at
         self._last_search_time: dict[str, float] = {}
         self._endpoint_rate_limit: dict[str, list[float]] = defaultdict(list)
         self._endpoint_rate_limit_max_keys = 2048
@@ -668,9 +675,16 @@ class CompanyWebApp:
         path = environ.get("PATH_INFO", "/")
         query = parse_qs(environ.get("QUERY_STRING", ""))
         form = self._parse_form(environ) if method == "POST" else {}
+        self._touch_ui_activity()
 
         try:
-            if path == "/" and method == "GET":
+            if path == "/ui/session/open" and method == "POST":
+                body, status, headers = self.ui_session_open(form)
+            elif path == "/ui/session/ping" and method == "POST":
+                body, status, headers = self.ui_session_ping(form)
+            elif path == "/ui/session/close" and method == "POST":
+                body, status, headers = self.ui_session_close(form)
+            elif path == "/" and method == "GET":
                 body, status, headers = self.search_page(query)
             elif path == "/autofill/review" and method == "POST":
                 if self._rate_limited(environ, "autofill_review", limit=1, window_seconds=10):
@@ -724,6 +738,62 @@ class CompanyWebApp:
         content_type = (environ.get("CONTENT_TYPE") or "").lower()
         return "application/json" in accept or requested_with == "xmlhttprequest" or "application/json" in content_type
 
+    def _touch_ui_activity(self) -> None:
+        self._ui_last_activity = time.time()
+
+    def _prune_ui_sessions_locked(self, now: float) -> None:
+        stale_before = now - self._ui_session_ttl_seconds
+        stale_ids = [tab_id for tab_id, stamp in self._ui_sessions.items() if stamp < stale_before]
+        for tab_id in stale_ids:
+            self._ui_sessions.pop(tab_id, None)
+
+    def _update_ui_session(self, tab_id: str) -> None:
+        token = self._normalize_spaces(tab_id)[:128]
+        now = time.time()
+        with self._ui_session_lock:
+            self._prune_ui_sessions_locked(now)
+            if token:
+                self._ui_sessions[token] = now
+        self._touch_ui_activity()
+
+    def _remove_ui_session(self, tab_id: str) -> None:
+        token = self._normalize_spaces(tab_id)[:128]
+        now = time.time()
+        with self._ui_session_lock:
+            self._prune_ui_sessions_locked(now)
+            if token:
+                self._ui_sessions.pop(token, None)
+        self._touch_ui_activity()
+
+    def _ui_keepalive_response(self) -> tuple[str, str, list[tuple[str, str]]]:
+        return "", "204 No Content", [
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("Cache-Control", "no-store"),
+        ]
+
+    def ui_session_open(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
+        self._update_ui_session(self._get_one(form, "tab_id"))
+        return self._ui_keepalive_response()
+
+    def ui_session_ping(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
+        self._update_ui_session(self._get_one(form, "tab_id"))
+        return self._ui_keepalive_response()
+
+    def ui_session_close(self, form: dict[str, list[str]]) -> tuple[str, str, list[tuple[str, str]]]:
+        self._remove_ui_session(self._get_one(form, "tab_id"))
+        return self._ui_keepalive_response()
+
+    def _ui_should_auto_shutdown(self) -> bool:
+        now = time.time()
+        if now - self._ui_started_at < self._ui_shutdown_grace_seconds:
+            return False
+        with self._ui_session_lock:
+            self._prune_ui_sessions_locked(now)
+            has_active_sessions = bool(self._ui_sessions)
+        if has_active_sessions:
+            return False
+        return (now - self._ui_last_activity) >= self._ui_idle_shutdown_seconds
+
     def _autofill_redirect_response(self, location: str, *, wants_json: bool) -> tuple[str, str, list[tuple[str, str]]]:
         if not wants_json:
             return "", "302 Found", [("Location", location)]
@@ -749,7 +819,27 @@ class CompanyWebApp:
             "</form>"
             "</nav>"
         )
-        return f"<html><head><meta charset='utf-8'><title>{escape(title)}</title></head><body>{nav}{content}</body></html>"
+        ui_script = (
+            "<script>(function(){"
+            "try{"
+            "var key='nadin_tab_id';"
+            "var tabId=sessionStorage.getItem(key);"
+            "if(!tabId){tabId=(Date.now().toString(36)+Math.random().toString(36).slice(2));sessionStorage.setItem(key,tabId);}"
+            "var payload=function(){return 'tab_id='+encodeURIComponent(tabId);};"
+            "var send=function(path){"
+            "if(navigator.sendBeacon){"
+            "try{var blob=new Blob([payload()],{type:'application/x-www-form-urlencoded'});if(navigator.sendBeacon(path,blob)){return;}}catch(e){}"
+            "}"
+            "fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:payload(),keepalive:true}).catch(function(){});"
+            "};"
+            "send('/ui/session/open');"
+            "var timer=setInterval(function(){send('/ui/session/ping');},15000);"
+            "window.addEventListener('beforeunload',function(){clearInterval(timer);send('/ui/session/close');});"
+            "document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'){send('/ui/session/ping');}});"
+            "}catch(e){}"
+            "})();</script>"
+        )
+        return f"<html><head><meta charset='utf-8'><title>{escape(title)}</title></head><body>{nav}{content}{ui_script}</body></html>"
 
     def shutdown(self) -> tuple[str, str, list[tuple[str, str]]]:
         logger.info("Shutdown requested from UI")
@@ -965,6 +1055,31 @@ class CompanyWebApp:
             score += 6
 
         return score
+
+    def _has_confident_short_brand_bank_hit(self, hits: list[dict[str, Any]], query: str) -> bool:
+        brand_token = self._short_brand_token(query)
+        if not brand_token:
+            return False
+
+        for hit in hits:
+            data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+            org_name = self._normalize_spaces(str(data.get("ru_org", "")))
+            if not org_name:
+                continue
+            org_tokens = self._company_tokens_without_opf(org_name)
+            org_token_set = set(org_tokens)
+            if brand_token not in org_token_set:
+                continue
+
+            org_core_lower = " ".join(org_tokens)
+            if any(marker in org_core_lower for marker in SHORT_BRAND_SUBSIDIARY_MARKERS):
+                continue
+            if any(marker in org_core_lower for marker in SHORT_BRAND_NOISE_MARKERS):
+                continue
+            if f"банк {brand_token}" in org_core_lower or f"{brand_token} банк" in org_core_lower:
+                return True
+        return False
+
     def _extract_inn(self, raw: str) -> str:
         value = self._normalize_spaces(raw)
         if re.fullmatch(r"\d{10}|\d{12}", value):
@@ -1476,8 +1591,13 @@ class CompanyWebApp:
                 notes.append("RU организация: ОПФ должна быть в конце")
 
         name = " ".join(tokens)
-        result = self._normalize_spaces(f"{opf} {name}" if opf else name)
+        if opf and re.search(r"^\s*банк\b", name, flags=re.IGNORECASE):
+            result = self._normalize_spaces(f"{name} {opf}")
+        else:
+            result = self._normalize_spaces(f"{opf} {name}" if opf else name)
         result = self._preserve_abbreviations_case(result)
+        if re.match(r"^БАНК\b", result):
+            result = re.sub(r"^БАНК\b", "Банк", result)
         if re.search(r"тюменский\s+государственный\s+университет", result, flags=re.IGNORECASE):
             prefix = "ФГАОУ ВО " if "ФГАОУ ВО" in result.upper() else ""
             result = f"{prefix}Тюменский государственный университет"
@@ -4444,13 +4564,35 @@ class CompanyWebApp:
                     profile[key] = str(merged_profile[key])
 
         if source_hits:
-            best_revenue_hit = max(source_hits, key=lambda item: int(item.get("data", {}).get("revenue", 0) or 0))
-            revenue_value = int(best_revenue_hit.get("data", {}).get("revenue", 0) or 0)
+            financial_year = self._resolve_financial_year(source_hits, profile)
+            if financial_year > 0:
+                profile["financial_year"] = str(financial_year)
+                field_sources.setdefault("financial_year", "Источники")
+
+            best_revenue_hit = max(source_hits, key=lambda item: self._parse_money_amount(item.get("data", {}).get("revenue", 0)))
+            revenue_value = self._parse_money_amount(best_revenue_hit.get("data", {}).get("revenue", 0))
             if revenue_value:
                 profile["revenue"] = str(revenue_value)
                 profile["revenue_mln"] = f"{(revenue_value / 1_000_000):.2f}"
                 field_sources["revenue"] = best_revenue_hit.get("source", "")
                 field_sources["revenue_mln"] = best_revenue_hit.get("source", "")
+
+            best_profit = 0
+            best_profit_source = ""
+            profit_keys = ("profit", "net_profit", "clean_profit", "profit_clean", "чистая_прибыль", "чистая_прибыль_убыток")
+            for hit in source_hits:
+                data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+                for key in profit_keys:
+                    profit_amount = self._parse_money_amount(data.get(key, 0))
+                    if abs(profit_amount) > abs(best_profit):
+                        best_profit = profit_amount
+                        best_profit_source = str(hit.get("source", ""))
+
+            if best_profit != 0:
+                profile["profit"] = str(best_profit)
+                profile["profit_mln"] = f"{(best_profit / 1_000_000):.2f}"
+                field_sources["profit"] = best_profit_source
+                field_sources["profit_mln"] = best_profit_source
 
         if not profile["ru_org"] and source_hits:
             for item in source_hits:
@@ -4712,7 +4854,8 @@ class CompanyWebApp:
                 continue
 
             if normalized_data.get("ru_org"):
-                normalized_data["ru_org"] = self._clean_ru_org_name(str(normalized_data["ru_org"]))
+                cleaned_org = self._clean_ru_org_name(str(normalized_data["ru_org"]))
+                normalized_data["ru_org"], _ = self.normalize_ru_org(cleaned_org)
             if normalized_data.get("ru_org") and not normalized_data.get("en_org"):
                 normalized_data["en_org"], _ = self.normalize_en_org(str(normalized_data["ru_org"]), str(normalized_data["ru_org"]))
             elif normalized_data.get("en_org"):
@@ -4764,12 +4907,12 @@ class CompanyWebApp:
                 "url": str(hit.get("url", "")),
                 "score": score,
                 "fio_ru": fio_ru,
-                "org_ru": self._clean_ru_org_name(str(normalized_data.get("ru_org", ""))),
+                "org_ru": self._normalize_spaces(str(normalized_data.get("ru_org", ""))),
                 "position_ru": self._normalize_spaces(str(normalized_data.get("ru_position", ""))),
                 "leader_ru": fio_ru,
                 "inn": self._normalize_spaces(str(normalized_data.get("inn", ""))),
                 "query_for_autofill": self._normalize_spaces(str(normalized_data.get("inn", "")))
-                or (fio_ru if hit_type == "person" else self._clean_ru_org_name(str(normalized_data.get("ru_org", ""))))
+                or (fio_ru if hit_type == "person" else self._normalize_spaces(str(normalized_data.get("ru_org", ""))))
                 or fio_ru,
                 "revenue": str(int(normalized_data.get("revenue", 0) or 0)),
             })
@@ -4824,6 +4967,89 @@ class CompanyWebApp:
         if revenue <= 0:
             return "—"
         return f"{revenue / 1000:.2f}"
+
+    def _default_financial_year(self) -> int:
+        return max(2000, datetime.now(timezone.utc).year - 1)
+
+    def _parse_financial_year(self, value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, int):
+            year = value
+        else:
+            text = self._normalize_spaces(str(value))
+            match = re.search(r"\b(19\d{2}|20\d{2})\b", text)
+            if not match:
+                return 0
+            year = int(match.group(1))
+        current_year = datetime.now(timezone.utc).year
+        if 1990 <= year <= current_year:
+            return year
+        return 0
+
+    def _parse_money_amount(self, value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, (int, float)):
+            return int(value)
+
+        text = self._normalize_spaces(str(value))
+        if not text:
+            return 0
+
+        sign = -1 if re.search(r"(^-|\s-)", text) else 1
+        unsigned = text.replace("-", " ")
+        parsed = self._extract_revenue(unsigned)
+        if parsed:
+            return sign * parsed
+
+        digits = re.sub(r"[^\d]", "", text)
+        if not digits:
+            return 0
+        return sign * int(digits)
+
+    def _resolve_financial_year(self, source_hits: list[dict[str, Any]], profile: dict[str, Any] | None = None) -> int:
+        year_candidates: list[int] = []
+
+        if isinstance(profile, dict):
+            for key in ("financial_year", "revenue_year", "profit_year", "year"):
+                parsed_year = self._parse_financial_year(profile.get(key, ""))
+                if parsed_year:
+                    year_candidates.append(parsed_year)
+
+        for hit in source_hits:
+            data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+            for key in ("financial_year", "revenue_year", "profit_year", "year", "report_year"):
+                parsed_year = self._parse_financial_year(data.get(key, ""))
+                if parsed_year:
+                    year_candidates.append(parsed_year)
+
+        if year_candidates:
+            return max(year_candidates)
+        return self._default_financial_year()
+
+    def _format_financial_amount_mln(self, amount: int) -> str:
+        mln = amount / 1_000_000
+        abs_mln = abs(mln)
+        if abs_mln >= 100:
+            amount_str = f"{mln:,.0f}"
+        elif abs_mln >= 10:
+            amount_str = f"{mln:,.1f}"
+        else:
+            amount_str = f"{mln:,.2f}"
+        amount_str = amount_str.replace(",", " ")
+        amount_str = re.sub(r"\.0+$", "", amount_str)
+        amount_str = re.sub(r"(\.\d*?)0+$", r"\1", amount_str)
+        amount_str = amount_str.replace(".", ",")
+        return f"{amount_str} млн руб."
+
+    def _format_financial_line(self, amount_value: Any, year: int) -> str:
+        amount = self._parse_money_amount(amount_value)
+        if amount == 0:
+            return f"Данных нет ({year})"
+        return f"{self._format_financial_amount_mln(amount)} ({year})"
 
     def _render_search_results(
         self,
@@ -4957,15 +5183,24 @@ class CompanyWebApp:
             alt_query = self._normalize_spaces(alt_normalized or alt_name)
             if alt_query and alt_query.lower() != query_value.lower():
                 alt_queries.append(alt_query)
+        alt_queries = list(dict.fromkeys(alt_queries))
 
         short_brand_query = bool(self._short_brand_token(query_value))
         if short_brand_query and alt_queries:
-            trace.append("Короткий брендовый запрос: расширяем поиск по вариантам названия")
-            for alt_query in alt_queries:
-                trace.append(f"Попытка: {alt_query}")
-                alt_hits, alt_trace = self._search_external_sources(alt_query, no_cache=False, search_type=search_type)
-                trace.extend(alt_trace)
-                hits.extend(alt_hits)
+            if self._has_confident_short_brand_bank_hit(hits, query_value):
+                trace.append("Короткий брендовый запрос: найден уверенный банк-кандидат в базовой выдаче")
+            else:
+                trace.append("Короткий брендовый запрос: расширяем поиск по вариантам названия")
+                for alt_query in alt_queries:
+                    trace.append(f"Попытка: {alt_query}")
+                    alt_hits, alt_trace = self._search_external_sources(alt_query, no_cache=False, search_type=search_type)
+                    trace.extend(alt_trace)
+                    hits.extend(alt_hits)
+                    preview_hits = self._dedup_source_hits(hits)
+                    if self._has_confident_short_brand_bank_hit(preview_hits, query_value):
+                        trace.append("Остановлено: найден уверенный банк-кандидат")
+                        hits = preview_hits
+                        break
         elif not hits and alt_queries:
             trace.append("Ничего не найдено, пробуем альтернативные написания")
             for alt_query in alt_queries:
@@ -5196,9 +5431,9 @@ class CompanyWebApp:
         forced_search_type = self._normalize_spaces(self._get_one(form, "search_type")).lower()
         no_cache = self._get_one(form, "no_cache") == "1"
         input_type = self.detect_input_type(raw)
-        if hit_type in {"company", "person"}:
+        if hit_type in {"company", "person"} and input_type not in {INPUT_TYPE_INN, INPUT_TYPE_URL}:
             input_type = INPUT_TYPE_ORG_TEXT if hit_type == "company" else INPUT_TYPE_PERSON_TEXT
-        elif forced_search_type in {"company", "person"}:
+        elif forced_search_type in {"company", "person"} and input_type not in {INPUT_TYPE_INN, INPUT_TYPE_URL}:
             input_type = INPUT_TYPE_ORG_TEXT if forced_search_type == "company" else INPUT_TYPE_PERSON_TEXT
         normalized_raw = self._normalize_spaces(raw).lower()
         cache_key = f"search:{input_type}:{hit_type}:{forced_search_type}:{normalized_raw}"
@@ -5289,13 +5524,23 @@ class CompanyWebApp:
             extracted_data = extract_data(source_hits)
             profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type, forced_type=effective_hit_type)
 
-            if fast_mode_used and not self._is_profile_complete(profile):
-                search_trace.append("🔍 AUTOCOMPLETE MODE: FAST profile incomplete, enabling extended providers")
-                extended_hits, extended_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
-                search_trace.extend(extended_trace)
-                source_hits = self._dedup_source_hits(source_hits + extended_hits)
-                extracted_data = extract_data(source_hits)
-                profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type, forced_type=effective_hit_type)
+            if fast_mode_used:
+                fast_required_fields = PERSON_REQUIRED_FIELDS if forced_search_type == "person" else COMPANY_REQUIRED_FIELDS
+                fast_missing = [
+                    field for field in fast_required_fields
+                    if not self._normalize_spaces(str(profile.get(field, "")))
+                ]
+                if fast_missing:
+                    search_trace.append(
+                        "🔍 AUTOCOMPLETE MODE: FAST profile incomplete for "
+                        + ", ".join(fast_missing)
+                        + ", enabling extended providers"
+                    )
+                    extended_hits, extended_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
+                    search_trace.extend(extended_trace)
+                    source_hits = self._dedup_source_hits(source_hits + extended_hits)
+                    extracted_data = extract_data(source_hits)
+                    profile, field_sources = self._build_profile_from_sources(source_hits, raw, input_type, forced_type=effective_hit_type)
             if effective_hit_type in {"company", "person"}:
                 profile["type"] = effective_hit_type
             if forced_search_type in {"company", "person"}:
@@ -5743,11 +5988,19 @@ class CompanyWebApp:
             profile = {field: "" for field, _ in CARD_FIELDS}
             profile["ru_org"] = card["ru_org"]
             profile["en_org"] = card["en_org"]
+
+        source_hits = payload.get("source_hits", []) if isinstance(payload.get("source_hits", []), list) else []
+        financial_year = self._resolve_financial_year(source_hits, profile if isinstance(profile, dict) else None)
+        revenue_line = self._format_financial_line(profile.get("revenue", ""), financial_year)
+        profit_line = self._format_financial_line(profile.get("profit", ""), financial_year)
+
         lines = "".join(f"<tr><td>{escape(label)}</td><td>{escape(self._profile_value(profile, field))}</td></tr>" for field, label in CARD_FIELDS)
         content = (
             f"<h2>Карточка #{card['id']}</h2>"
             "<table border='1' cellpadding='6' cellspacing='0'>"
             f"{lines}</table>"
+            f"<p><b>Выручка:</b> {escape(revenue_line)}</p>"
+            f"<p><b>Прибыль:</b> {escape(profit_line)}</p>"
             f"<p>Статус: {escape(card['status'])}</p>"
             f"<p>Источник: {escape(card['source'])}</p>"
             f"<p><a href='/card/{card['id']}/edit'>Редактировать карточку</a></p>"
@@ -5980,17 +6233,79 @@ def _pick_free_port(host: str, start: int = 8000, end: int = 8050) -> int:
     raise RuntimeError("No free port available")
 
 
-def _open_browser(url: str) -> None:
+def _open_browser(url: str) -> subprocess.Popen[str] | None:
+    browser_pref = os.getenv("NADIN_BROWSER", "app").strip().lower()
+    mode_value = os.getenv("NADIN_BROWSER_MODE", "tab").strip().lower()
+    app_mode = mode_value in {"1", "true", "yes", "app"}
+
+    program_files = os.getenv("PROGRAMFILES", r"C:\Program Files")
+    program_files_x86 = os.getenv("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+    local_app_data = os.getenv("LOCALAPPDATA", "")
+
+    chrome_candidates = [
+        os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(program_files_x86, "Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"),
+    ]
+    edge_candidates = [
+        os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(program_files_x86, "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(local_app_data, "Microsoft", "Edge", "Application", "msedge.exe"),
+    ]
+
+    pref_order: list[str]
+    if browser_pref in {"chrome", "google", "google-chrome", "chrome-app"}:
+        pref_order = ["chrome", "edge"]
+    elif browser_pref in {"edge", "msedge", "edge-app"}:
+        pref_order = ["edge", "chrome"]
+    elif browser_pref in {"system", "default"}:
+        pref_order = []
+    else:
+        pref_order = ["chrome", "edge"]
+
+    if browser_pref == "chrome-app":
+        is_app_mode = True
+    elif browser_pref == "edge-app":
+        is_app_mode = True
+    elif browser_pref in {"system", "default"}:
+        is_app_mode = False
+    else:
+        is_app_mode = app_mode
+
+    def _launch(executable: str, *, is_app: bool) -> subprocess.Popen[str] | None:
+        if not executable or not os.path.isfile(executable):
+            return None
+        args = [executable]
+        if is_app:
+            args.append(f"--app={url}")
+            args.append("--new-window")
+        else:
+            args.append(url)
+        try:
+            return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            return None
+
+    for browser_name in pref_order:
+        candidates = chrome_candidates if browser_name == "chrome" else edge_candidates
+        for browser_path in candidates:
+            launched = _launch(browser_path, is_app=is_app_mode)
+            if launched is not None:
+                return launched
+
     try:
         webbrowser.open(url, new=1)
     except Exception:
-        pass
+        return None
+    return None
 
 
 def run_server(db_path: str = "cards.db", host: str = "127.0.0.1", port: int = 8000) -> None:
     resolved_db_path = os.getenv("NADIN_DB_PATH", db_path)
     host = os.getenv("NADIN_HOST", host)
     port = int(os.getenv("NADIN_PORT", str(port)))
+    open_browser = os.getenv("NADIN_OPEN_BROWSER", "1").strip().lower() in {"1", "true", "yes"}
+    auto_shutdown = os.getenv("NADIN_AUTO_SHUTDOWN", "1").strip().lower() in {"1", "true", "yes"}
 
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -6000,15 +6315,22 @@ def run_server(db_path: str = "cards.db", host: str = "127.0.0.1", port: int = 8
         pass
 
     with make_server(host, port, lambda _environ, start_response: (start_response("503 Starting", []), [b""])[1], server_class=ThreadingWSGIServer) as httpd:
+        shutdown_started = threading.Event()
+
         def _shutdown_callback() -> None:
-            logger.info("Shutdown initiated from UI — stopping server")
+            if shutdown_started.is_set():
+                return
+            shutdown_started.set()
+            logger.info("Shutdown initiated from UI/watchdog - stopping server")
 
             def _stop() -> None:
                 import time as _t
 
                 _t.sleep(0.4)
-                httpd.shutdown()
-                os._exit(0)
+                try:
+                    httpd.shutdown()
+                finally:
+                    os._exit(0)
 
             threading.Thread(target=_stop, daemon=True).start()
 
@@ -6016,11 +6338,29 @@ def run_server(db_path: str = "cards.db", host: str = "127.0.0.1", port: int = 8
         httpd.set_app(app)
         _startup_diagnostics(app)
 
+        def _auto_shutdown_watchdog() -> None:
+            while not shutdown_started.is_set():
+                time.sleep(3)
+                try:
+                    if app._ui_should_auto_shutdown():
+                        logger.info("UI inactivity detected with no active tabs; auto-shutdown requested")
+                        _shutdown_callback()
+                        return
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Auto-shutdown watchdog error: %s", exc)
+
         url = f"http://{host}:{port}/"
-        threading.Thread(target=_open_browser, args=(url,), daemon=True).start()
+        logger.info("Web UI URL: %s", url)
+        if open_browser:
+            threading.Thread(target=_open_browser, args=(url,), daemon=True).start()
+        if auto_shutdown:
+            threading.Thread(target=_auto_shutdown_watchdog, daemon=True).start()
         httpd.serve_forever()
 
 
 if __name__ == "__main__":
     run_server()
+
+
+
 
