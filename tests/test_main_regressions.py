@@ -459,3 +459,82 @@ def test_search_by_company_short_brand_stops_after_confident_bank_hit(app, monke
     assert hits
     assert hits[0]["data"]["ru_org"] == "БАНК ВТБ (ПАО)"
     assert "АО ВТБ ЛИЗИНГ" not in calls
+
+def test_search_by_company_filters_person_hits_for_company_mode(app, monkeypatch):
+    mixed_hits = [
+        {
+            "source": "zachestnyibiznes.ru",
+            "type": "person",
+            "data": {
+                "surname_ru": "Иванов",
+                "name_ru": "Иван",
+                "ru_org": "БАНК ВТБ (ПАО)",
+                "inn": "3662140164",
+            },
+        },
+        {
+            "source": "ФНС ЕГРЮЛ",
+            "type": "company",
+            "data": {
+                "ru_org": "БАНК ВТБ (ПАО)",
+                "inn": "7702070139",
+                "en_org": "VTB Bank PJSC",
+            },
+        },
+    ]
+
+    monkeypatch.setattr(app, "_search_external_sources", lambda *_a, **_k: (mixed_hits, ["mixed"]))
+    hits, _trace = app._search_by_company("ВТБ", search_type="company")
+
+    assert hits
+    assert all(hit.get("type") != "person" for hit in hits)
+    assert hits[0]["data"]["inn"] == "7702070139"
+
+
+def test_autofill_review_company_clears_mismatched_leader_by_inn(app, monkeypatch):
+    captured = {}
+
+    hits = [
+        {
+            "source": "ФНС ЕГРЮЛ",
+            "type": "company",
+            "data": {
+                "ru_org": "БАНК ВТБ (ПАО)",
+                "en_org": "VTB Bank PJSC",
+                "inn": "7702070139",
+            },
+        },
+        {
+            "source": "zachestnyibiznes.ru",
+            "type": "person",
+            "data": {
+                "surname_ru": "Нечаев",
+                "name_ru": "Сергей",
+                "middle_name_ru": "Юрьевич",
+                "ru_position": "Председатель",
+                "ru_org": "БАНК ВТБ (ПАО)",
+                "inn": "3662140164",
+            },
+        },
+    ]
+
+    monkeypatch.setattr(app, "_search_by_company", lambda *_a, **_k: (hits, ["company-search"]))
+
+    def fake_create(profile_data, notes, source_hits, search_trace, field_provenance):
+        captured["profile"] = profile_data
+        return 123
+
+    monkeypatch.setattr(app, "_create_autofill_card", fake_create)
+
+    body, status, _headers = app.autofill_review(
+        {"company_name": ["ВТБ"], "search_type": ["company"], "hit_type": ["company"]},
+        wants_json=True,
+    )
+
+    payload = json.loads(body)
+    assert status == "200 OK"
+    assert payload["ok"] is True
+    assert payload["card_id"] == 123
+    assert captured["profile"]["inn"] == "7702070139"
+    assert captured["profile"].get("surname_ru", "") == ""
+    assert captured["profile"].get("name_ru", "") == ""

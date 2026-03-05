@@ -1,12 +1,12 @@
-@echo off
+﻿@echo off
 setlocal
 
 set "ROOT=%~dp0"
 set "APP_NAME=Nadin"
-set "ENTRY=%ROOT%src\\main.py"
+set "ENTRY=%ROOT%src\native_app.py"
 set "FINAL_DIR=%ROOT%release\Nadin"
 set "MODE=release"
-REM если хочешь дебаг — меняй на debug
+REM РµСЃР»Рё С…РѕС‡РµС€СЊ РґРµР±Р°Рі вЂ” РјРµРЅСЏР№ РЅР° debug
 REM set "MODE=debug"
 
 set "LOG=%ROOT%release\build_portable.log"

@@ -477,7 +477,12 @@ class CompanyWebApp:
             allowed_kinds = set(EXTENDED_MODE_PROVIDER_KINDS)
         else:
             allowed_kinds = set(BASE_MODE_PROVIDER_KINDS)
-        return [provider for provider in providers if provider.get("kind") in allowed_kinds]
+        selected = [provider for provider in providers if provider.get("kind") in allowed_kinds]
+        if not any(provider.get("kind") == "egrul" for provider in selected):
+            fallback_fns = next((provider for provider in providers if provider.get("kind") == "egrul"), None)
+            if fallback_fns:
+                selected.insert(0, fallback_fns)
+        return selected
 
     def _ensure_scrape_client(self) -> ScrapeClient | None:
         client = getattr(self, "scrape_client", None)
@@ -2311,6 +2316,113 @@ class CompanyWebApp:
         if surname_ru and name_ru:
             return True
         return bool(ru_org)
+
+    def _hit_looks_like_company(self, hit: dict[str, Any]) -> bool:
+        data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+        hit_type = self._normalize_spaces(str(hit.get("type") or data.get("type") or "")).lower()
+        if hit_type == "company":
+            return True
+        if hit_type == "person":
+            return False
+
+        ru_org = self._normalize_spaces(str(data.get("ru_org", "")))
+        has_org = bool(ru_org and not self._looks_like_person_text(ru_org))
+        has_person_names = bool(
+            self._normalize_spaces(str(data.get("surname_ru", "")))
+            and self._normalize_spaces(str(data.get("name_ru", "")))
+        )
+        if has_org and not has_person_names:
+            return True
+        if has_org and self._normalize_spaces(str(data.get("inn", ""))):
+            return True
+        return False
+
+    def _clear_profile_leader_fields(self, profile: dict[str, str], field_sources: dict[str, str]) -> None:
+        for field in (
+            "surname_ru",
+            "name_ru",
+            "middle_name_ru",
+            "surname",
+            "name",
+            "family_name",
+            "first_name",
+            "middle_name",
+            "middle_name_en",
+            "gender",
+            "appeal",
+            "salutation",
+        ):
+            profile[field] = ""
+            field_sources.pop(field, None)
+
+    def _leader_matches_company_profile(
+        self,
+        profile: dict[str, str],
+        field_sources: dict[str, str],
+        source_hits: list[dict[str, Any]],
+    ) -> bool:
+        target_surname = self._clean_fio_part(str(profile.get("surname_ru", "")))
+        target_name = self._clean_fio_part(str(profile.get("name_ru", "")))
+        if not (target_surname and target_name):
+            return False
+
+        profile_inn = self._normalize_spaces(str(profile.get("inn", "")))
+        leader_source = self._normalize_spaces(
+            str(field_sources.get("surname_ru") or field_sources.get("name_ru") or "")
+        ).lower()
+
+        for hit in source_hits:
+            hit_source = self._normalize_spaces(str(hit.get("source", ""))).lower()
+            if leader_source and hit_source != leader_source:
+                continue
+            data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+            hit_surname = self._clean_fio_part(str(data.get("surname_ru", "")))
+            hit_name = self._clean_fio_part(str(data.get("name_ru", "")))
+            if not (hit_surname and hit_name):
+                continue
+            if hit_surname != target_surname or hit_name != target_name:
+                continue
+            hit_inn = self._normalize_spaces(str(data.get("inn", "")))
+            if profile_inn and hit_inn and hit_inn != profile_inn:
+                continue
+            return True
+        return False
+
+    def _extract_valid_inn_from_hits(self, hits: list[dict[str, Any]]) -> str:
+        for hit in hits:
+            data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+            inn = self._normalize_spaces(str(data.get("inn", "")))
+            if re.fullmatch(r"\d{10}|\d{12}", inn):
+                return inn
+        return ""
+
+    def _enrich_company_hits_with_fns(
+        self,
+        hits: list[dict[str, Any]],
+        trace: list[str],
+        *,
+        no_cache: bool = False,
+    ) -> list[dict[str, Any]]:
+        if not hits:
+            return hits
+        if any(self._normalize_spaces(str(hit.get("source", ""))) == "ФНС ЕГРЮЛ" for hit in hits):
+            return hits
+
+        inn = self._extract_valid_inn_from_hits(hits)
+        if not inn:
+            return hits
+
+        trace.append(f"FNS enrichment by INN: {inn}")
+        fns_hits, fns_trace = self._search_external_sources(
+            inn,
+            no_cache=no_cache,
+            search_type="company",
+            provider_names=["ФНС ЕГРЮЛ"],
+        )
+        trace.extend(fns_trace)
+        if fns_hits:
+            hits = self._dedup_source_hits(hits + fns_hits)
+        return hits
 
     def _can_stop_provider_search(self, hits: list[dict[str, Any]], search_type: str, input_type: str) -> bool:
         merged: dict[str, str] = {}
@@ -4778,6 +4890,23 @@ class CompanyWebApp:
 
         return profile, field_sources
 
+    def _pick_primary_card_source(
+        self,
+        source_hits: list[dict[str, Any]],
+        field_provenance: dict[str, str],
+    ) -> str:
+        ignored_markers = ("fallback", "source", "user_input", "manual", "translit")
+        for key in ("ru_org", "inn", "surname_ru", "name_ru"):
+            source_name = self._normalize_spaces(str(field_provenance.get(key, "")))
+            lowered = source_name.lower()
+            if source_name and not any(marker in lowered for marker in ignored_markers):
+                return source_name
+        for hit in source_hits:
+            source_name = self._normalize_spaces(str(hit.get("source", "")))
+            if source_name:
+                return source_name
+        return "autofill"
+
     def _create_autofill_card(
         self,
         profile_data: dict[str, Any],
@@ -4797,7 +4926,7 @@ class CompanyWebApp:
                     ru_org,
                     en_org,
                     status,
-                    "autofill",
+                    self._pick_primary_card_source(source_hits, field_provenance),
                     self._now(),
                     self._now(),
                     json.dumps(
@@ -5212,6 +5341,16 @@ class CompanyWebApp:
                     break
 
         hits = self._dedup_source_hits(hits)
+        if search_type == "company":
+            company_hits = [item for item in hits if self._hit_looks_like_company(item)]
+            if company_hits:
+                trace.append(f"company-mode filter: {len(hits)} -> {len(company_hits)}")
+                hits = company_hits
+            hits = self._enrich_company_hits_with_fns(hits, trace, no_cache=False)
+            hits = self._dedup_source_hits(hits)
+            company_hits = [item for item in hits if self._hit_looks_like_company(item)]
+            if company_hits:
+                hits = company_hits
         hits.sort(key=lambda item: self._score_hit(item, query_value), reverse=True)
         return hits, trace
     def _search_by_criteria(self, params: dict[str, str]) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[str]]:
@@ -5297,6 +5436,10 @@ class CompanyWebApp:
                 filter(None, [params.get("surname", ""), params.get("name", ""), params.get("middle_name", "")])
             )
             if search_type == "company":
+                company_hits = [item for item in source_hits if self._hit_looks_like_company(item)]
+                if company_hits:
+                    source_hits = company_hits
+
                 def _company_rank(item: dict[str, Any]) -> tuple[float, float]:
                     item_data = item.get("data", {}) if isinstance(item.get("data"), dict) else {}
                     return self._score_org_relevance(item_data, primary_query), self._score_hit(item, primary_query)
@@ -5478,18 +5621,32 @@ class CompanyWebApp:
 
             fast_mode_used = input_type == INPUT_TYPE_INN
             if fast_mode_used:
-                search_trace = ["⚡ FAST INN MODE: only ФНС ЕГРЮЛ"]
+                search_trace = ["FAST INN MODE: only FNS EGRUL"]
                 source_hits, fast_trace = self._search_external_sources(
                     raw,
                     no_cache=no_cache,
                     search_type=forced_search_type,
-                    provider_names=["ФНС ЕГРЮЛ"],
+                    provider_names=["\u0424\u041d\u0421 \u0415\u0413\u0420\u042e\u041b"],
                 )
                 search_trace.extend(fast_trace)
+            elif forced_search_type == "company" and input_type == INPUT_TYPE_ORG_TEXT:
+                search_trace = ["COMPANY MODE: ranked company search"]
+                source_hits, company_trace = self._search_by_company(raw, search_type="company")
+                search_trace.extend(company_trace)
             else:
                 source_hits, search_trace = self._search_external_sources(raw, no_cache=no_cache, search_type=forced_search_type)
 
             source_hits = self._dedup_source_hits(source_hits)
+            if forced_search_type == "company":
+                company_hits = [item for item in source_hits if self._hit_looks_like_company(item)]
+                if company_hits:
+                    search_trace.append(f"Company hits filtered: {len(source_hits)} -> {len(company_hits)}")
+                    source_hits = company_hits
+                source_hits = self._enrich_company_hits_with_fns(source_hits, search_trace, no_cache=no_cache)
+                source_hits = self._dedup_source_hits(source_hits)
+                company_hits = [item for item in source_hits if self._hit_looks_like_company(item)]
+                if company_hits:
+                    source_hits = company_hits
 
             if not effective_hit_type and source_hits:
                 first_hit_type = self._normalize_spaces(str(source_hits[0].get("type", ""))).lower()
@@ -5585,6 +5742,15 @@ class CompanyWebApp:
                 for field in ("surname_ru", "name_ru", "middle_name_ru", "surname", "name", "family_name", "first_name"):
                     profile[field] = ""
                     field_sources.pop(field, None)
+
+            if forced_search_type == "company":
+                leader_valid_for_company = self._leader_matches_company_profile(profile, field_sources, source_hits)
+                if not leader_valid_for_company:
+                    self._clear_profile_leader_fields(profile, field_sources)
+                    profile["ru_position"] = ""
+                    profile["en_position"] = ""
+                    profile["position"] = ""
+                    logger.info("company_leader_clear: removed mismatched leader fields")
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("=== AUTOFILL REVIEW ===")
@@ -6360,6 +6526,11 @@ def run_server(db_path: str = "cards.db", host: str = "127.0.0.1", port: int = 8
 
 if __name__ == "__main__":
     run_server()
+
+
+
+
+
 
 
 
