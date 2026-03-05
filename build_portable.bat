@@ -48,6 +48,7 @@ call %PYTHON_EXE% -m PyInstaller ^
   --collect-submodules=starlette ^
   --collect-submodules=jinja2 ^
   --collect-submodules=charset_normalizer ^
+  --collect-submodules=nadin_scrapy ^
   --name "%APP_NAME%" ^
   "%ENTRY%" >> "%LOG%" 2>&1
 
@@ -82,3 +83,5 @@ echo ERROR: %~1
 echo See log: "%LOG%"
 pause
 exit /b 1
+
+

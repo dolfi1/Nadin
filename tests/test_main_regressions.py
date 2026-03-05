@@ -538,3 +538,132 @@ def test_autofill_review_company_clears_mismatched_leader_by_inn(app, monkeypatc
     assert captured["profile"]["inn"] == "7702070139"
     assert captured["profile"].get("surname_ru", "") == ""
     assert captured["profile"].get("name_ru", "") == ""
+
+def test_scrapy_pipeline_merge_available_and_extracts_leader(app):
+    hits = [
+        {
+            "source": "ФНС ЕГРЮЛ",
+            "type": "company",
+            "data": {
+                "ru_org": "Банк ВТБ ПАО",
+                "inn": "7702070139",
+                "ru_position": "Президент-председатель правления",
+            },
+        },
+        {
+            "source": "companies.rbc.ru",
+            "type": "company",
+            "data": {
+                "ru_org": "Банк ВТБ ПАО",
+                "inn": "7702070139",
+                "surname_ru": "Костин",
+                "name_ru": "Андрей",
+                "middle_name_ru": "Леонидович",
+            },
+        },
+    ]
+
+    merged = app._merge_hits_with_scrapy_pipeline(hits)
+
+    assert merged
+    assert merged["company_inn"] == "7702070139"
+    assert merged["leader_surname_ru"] == "Костин"
+    assert merged["leader_name_ru"] == "Андрей"
+
+
+def test_search_external_sources_adds_scrapy_merged_hit(app, monkeypatch):
+    provider = {
+        "name": "dummy-provider",
+        "kind": "dummy",
+        "supports_inn": True,
+        "supports_name": True,
+        "supports_url": True,
+        "is_person_source": True,
+    }
+
+    monkeypatch.setattr(app, "_provider_chain", lambda *_a, **_k: [provider])
+    monkeypatch.setattr(app, "_should_call_provider", lambda *_a, **_k: True)
+    monkeypatch.setattr(app, "_can_stop_provider_search", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        app,
+        "_call_provider",
+        lambda *_a, **_k: {
+            "ru_org": "Банк ВТБ ПАО",
+            "inn": "7702070139",
+            "type": "company",
+        },
+    )
+    monkeypatch.setattr(
+        app,
+        "_merge_hits_with_scrapy_pipeline",
+        lambda _hits: {
+            "ru_org": "Банк ВТБ ПАО",
+            "en_org": "VTB Bank PJSC",
+            "company_inn": "7702070139",
+            "leader_surname_ru": "Костин",
+            "leader_name_ru": "Андрей",
+            "leader_middle_ru": "Леонидович",
+            "leader_position_ru": "Президент",
+        },
+    )
+
+    hits, trace = app._search_external_sources("ВТБ", no_cache=True, search_type="company", provider_names=["dummy-provider"])
+
+    merged_hits = [hit for hit in hits if hit.get("source") == "Scrapy Merge"]
+    assert merged_hits
+    assert merged_hits[0]["data"]["surname_ru"] == "Костин"
+    assert any("Scrapy pipeline: merged profile added" in line for line in trace)
+
+def test_pick_best_leader_fio_prefers_target_inn(app):
+    hits = [
+        {
+            "source": "companies.rbc.ru",
+            "data": {
+                "inn": "3662140164",
+                "surname_ru": "Муха",
+                "name_ru": "Антон",
+                "middle_name_ru": "Юрьевич",
+            },
+        },
+        {
+            "source": "zachestnyibiznes.ru",
+            "data": {
+                "inn": "7702070139",
+                "surname_ru": "Костин",
+                "name_ru": "Андрей",
+                "middle_name_ru": "Леонидович",
+            },
+        },
+    ]
+
+    surname, name, middle, source = app._pick_best_leader_fio(hits, target_inn="7702070139")
+
+    assert surname == "Костин"
+    assert name == "Андрей"
+    assert middle == "Леонидович"
+    assert source == "zachestnyibiznes.ru"
+
+
+def test_has_valid_leader_for_inn_checks_inn_match(app):
+    hits = [
+        {
+            "source": "companies.rbc.ru",
+            "data": {
+                "inn": "3662140164",
+                "surname_ru": "Муха",
+                "name_ru": "Антон",
+            },
+        },
+        {
+            "source": "zachestnyibiznes.ru",
+            "data": {
+                "inn": "7702070139",
+                "surname_ru": "Костин",
+                "name_ru": "Андрей",
+            },
+        },
+    ]
+
+    assert app._has_valid_leader_for_inn(hits, "7702070139") is True
+    assert app._has_valid_leader_for_inn(hits, "3662140164") is True
+    assert app._has_valid_leader_for_inn(hits, "7728168971") is False

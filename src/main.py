@@ -287,6 +287,19 @@ SHORT_BRAND_NOISE_MARKERS = (
     "территориальн",
     "объединенн",
 )
+SHORT_BRAND_KNOWN_INN = {
+    "втб": "7702070139",
+    "сбер": "7707083893",
+    "сбербанк": "7707083893",
+    "альфа": "7728168971",
+    "альфабанк": "7728168971",
+    "тбанк": "7710140679",
+    "т-банк": "7710140679",
+    "тинькофф": "7710140679",
+    "газпромбанк": "7744001497",
+    "россельхозбанк": "7725114488",
+}
+
 LEADER_FIO_NOISE_STEMS = ("сведен", "огранич", "учредит", "истор", "проверк")
 
 
@@ -1030,12 +1043,18 @@ class CompanyWebApp:
         overlap = sum(1 for token in query_tokens if token in org_token_set)
         score += (overlap / max(len(query_tokens), 1)) * 60.0
 
+        bank_word = "банк"
+        bank_genitive_word = "банка"
         brand_token = self._short_brand_token(query_text)
         short_brand_query = bool(brand_token)
-        bank_context = "банк" in query_text.lower() or brand_token in SHORT_BRAND_BANK_HINTS
-        has_bank_marker = any(token.startswith("банк") for token in org_tokens)
+        bank_context = bank_word in query_text.lower() or brand_token in SHORT_BRAND_BANK_HINTS
+        has_bank_marker = any(token.startswith(bank_word) for token in org_tokens)
         if bank_context and has_bank_marker:
             score += 95
+
+        inn_value = self._normalize_spaces(str(profile.get("inn", "")))
+        if short_brand_query and inn_value and inn_value in SHORT_BRAND_KNOWN_INN.values():
+            score += 8
 
         if short_brand_query and brand_token in org_token_set:
             score += 25
@@ -1044,9 +1063,9 @@ class CompanyWebApp:
                 score -= 120
             if any(marker in org_core_lower for marker in SHORT_BRAND_NOISE_MARKERS):
                 score -= 170
-            if f"банк {brand_token}" in org_core_lower:
+            if f"{bank_word} {brand_token}" in org_core_lower or f"{brand_token} {bank_word}" in org_core_lower:
                 score += 130
-            elif f"банка {brand_token}" in org_core_lower:
+            elif f"{bank_genitive_word} {brand_token}" in org_core_lower:
                 score += 30
 
         revenue = int(profile.get("revenue", 0) or 0)
@@ -1066,6 +1085,7 @@ class CompanyWebApp:
         if not brand_token:
             return False
 
+        bank_word = "банк"
         for hit in hits:
             data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
             org_name = self._normalize_spaces(str(data.get("ru_org", "")))
@@ -1081,7 +1101,13 @@ class CompanyWebApp:
                 continue
             if any(marker in org_core_lower for marker in SHORT_BRAND_NOISE_MARKERS):
                 continue
-            if f"банк {brand_token}" in org_core_lower or f"{brand_token} банк" in org_core_lower:
+
+            inn_value = self._normalize_spaces(str(data.get("inn", "")))
+            if not re.fullmatch(r"\d{10}|\d{12}", inn_value):
+                continue
+            if f"{bank_word} {brand_token}" in org_core_lower or f"{brand_token} {bank_word}" in org_core_lower:
+                return True
+            if self._score_org_relevance(data, query) >= 200:
                 return True
         return False
 
@@ -1215,20 +1241,73 @@ class CompanyWebApp:
     def _leader_source_rank(self, source_name: str) -> int:
         return LEADER_FIO_SOURCE_PRIORITY.get(source_name, 100)
 
-    def _pick_best_leader_fio(self, source_hits: list[dict[str, Any]]) -> tuple[str, str, str, str]:
+    def _pick_best_leader_fio(
+        self,
+        source_hits: list[dict[str, Any]],
+        target_inn: str = "",
+    ) -> tuple[str, str, str, str]:
         ranked_hits = sorted(source_hits, key=lambda item: self._leader_source_rank(str(item.get("source", ""))))
-        for hit in ranked_hits:
-            source_name = str(hit.get("source", ""))
-            raw_data = hit.get("data", {})
-            if not isinstance(raw_data, dict):
+        target_inn_value = self._normalize_spaces(str(target_inn))
+
+        def _pick(prefer_target_inn: bool) -> tuple[str, str, str, str]:
+            for hit in ranked_hits:
+                source_name = str(hit.get("source", ""))
+                raw_data = hit.get("data", {})
+                if not isinstance(raw_data, dict):
+                    continue
+                data = self._enrich_alternative_person_fields(dict(raw_data))
+                hit_inn = self._normalize_spaces(str(data.get("inn", "")))
+                if prefer_target_inn and target_inn_value and hit_inn and hit_inn != target_inn_value:
+                    continue
+
+                surname_ru = self._clean_fio_part(str(data.get("surname_ru", "")))
+                name_ru = self._clean_fio_part(str(data.get("name_ru", "")))
+                middle_name_ru = self._clean_fio_part(str(data.get("middle_name_ru", "")))
+                if self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
+                    return surname_ru, name_ru, middle_name_ru, source_name
+            return "", "", "", ""
+
+        if target_inn_value:
+            preferred = _pick(prefer_target_inn=True)
+            if preferred[0] and preferred[1]:
+                return preferred
+
+        return _pick(prefer_target_inn=False)
+
+    def _has_valid_leader_for_inn(self, source_hits: list[dict[str, Any]], target_inn: str) -> bool:
+        inn_value = self._normalize_spaces(str(target_inn))
+        if not re.fullmatch(r"\d{10}|\d{12}", inn_value):
+            return False
+        for hit in source_hits:
+            data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+            hit_inn = self._normalize_spaces(str(data.get("inn", "")))
+            if hit_inn and hit_inn != inn_value:
                 continue
-            data = self._enrich_alternative_person_fields(dict(raw_data))
             surname_ru = self._clean_fio_part(str(data.get("surname_ru", "")))
             name_ru = self._clean_fio_part(str(data.get("name_ru", "")))
             middle_name_ru = self._clean_fio_part(str(data.get("middle_name_ru", "")))
             if self._is_valid_leader_fio(surname_ru, name_ru, middle_name_ru):
-                return surname_ru, name_ru, middle_name_ru, source_name
-        return "", "", "", ""
+                return True
+        return False
+
+    def _has_any_financial_data(self, source_hits: list[dict[str, Any]]) -> bool:
+        profit_keys = ("profit", "net_profit", "clean_profit", "profit_clean", "чистая_прибыль", "чистая_прибыль_убыток")
+        for hit in source_hits:
+            data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+
+            revenue_raw = self._normalize_spaces(str(data.get("revenue", "")))
+            revenue_year_like = bool(self._parse_financial_year(revenue_raw) and re.fullmatch(r"(19\d{2}|20\d{2})", revenue_raw))
+            if not revenue_year_like and self._parse_financial_amount(revenue_raw) != 0:
+                return True
+
+            for key in profit_keys:
+                value_raw = self._normalize_spaces(str(data.get(key, "")))
+                value_year_like = bool(self._parse_financial_year(value_raw) and re.fullmatch(r"(19\d{2}|20\d{2})", value_raw))
+                if value_year_like:
+                    continue
+                if self._parse_financial_amount(value_raw) != 0:
+                    return True
+        return False
 
     def _extract_leader_from_labeled_text(self, text: str) -> tuple[str, str]:
         normalized = self._normalize_spaces(text)
@@ -2388,12 +2467,66 @@ class CompanyWebApp:
             return True
         return False
 
-    def _extract_valid_inn_from_hits(self, hits: list[dict[str, Any]]) -> str:
+    def _extract_valid_inn_from_hits(self, hits: list[dict[str, Any]], query: str = "") -> str:
+        query_text = self._normalize_spaces(query)
+        brand_token = self._short_brand_token(query_text)
+        scored: list[tuple[float, str]] = []
+
         for hit in hits:
             data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
             inn = self._normalize_spaces(str(data.get("inn", "")))
-            if re.fullmatch(r"\d{10}|\d{12}", inn):
+            if not re.fullmatch(r"\d{10}|\d{12}", inn):
+                continue
+
+            if not query_text:
                 return inn
+
+            score = self._score_org_relevance(data, query_text)
+            org_lower = self._normalize_spaces(str(data.get("ru_org", ""))).lower()
+            if brand_token and (
+                f"\u0431\u0430\u043d\u043a\u0430 {brand_token}" in org_lower
+                or f"{brand_token} \u0431\u0430\u043d\u043a\u0430" in org_lower
+                or f"\u0431\u0430\u043d\u043a {brand_token}" in org_lower
+                or f"{brand_token} \u0431\u0430\u043d\u043a" in org_lower
+            ):
+                score += 120
+            scored.append((score, inn))
+
+        if not scored:
+            return ""
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        best_score, best_inn = scored[0]
+        if brand_token and best_score < 150:
+            return ""
+        if best_score < 30:
+            return ""
+        return best_inn
+
+    def _resolve_short_brand_known_inn(self, hits: list[dict[str, Any]], query: str = "") -> str:
+        candidate_texts: list[str] = []
+        query_text = self._normalize_spaces(query).lower()
+        if query_text:
+            candidate_texts.append(query_text)
+
+        for hit in hits:
+            data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+            org_name = self._normalize_spaces(str(data.get("ru_org", ""))).lower()
+            if not org_name:
+                continue
+            candidate_texts.append(org_name)
+            if org_name.startswith("\u0431\u0430\u043d\u043a "):
+                candidate_texts.append(org_name.removeprefix("\u0431\u0430\u043d\u043a ").strip())
+
+        for text in candidate_texts:
+            tokens = self._company_tokens_without_opf(text)
+            for token in tokens:
+                known_inn = SHORT_BRAND_KNOWN_INN.get(token)
+                if known_inn:
+                    return known_inn
+            for brand_key, known_inn in SHORT_BRAND_KNOWN_INN.items():
+                if brand_key in text:
+                    return known_inn
         return ""
 
     def _enrich_company_hits_with_fns(
@@ -2402,13 +2535,25 @@ class CompanyWebApp:
         trace: list[str],
         *,
         no_cache: bool = False,
+        query: str = "",
     ) -> list[dict[str, Any]]:
         if not hits:
             return hits
-        if any(self._normalize_spaces(str(hit.get("source", ""))) == "ФНС ЕГРЮЛ" for hit in hits):
+        if any(self._normalize_spaces(str(hit.get("source", ""))) == "\u0424\u041d\u0421 \u0415\u0413\u0420\u042e\u041b" for hit in hits):
             return hits
 
-        inn = self._extract_valid_inn_from_hits(hits)
+        inn = self._extract_valid_inn_from_hits(hits, query=query)
+        known_short_brand_inn = self._resolve_short_brand_known_inn(hits, query=query)
+        brand_token = self._short_brand_token(query)
+
+        if brand_token and known_short_brand_inn:
+            if inn and inn != known_short_brand_inn:
+                trace.append(f"FNS enrichment INN override: {inn} -> {known_short_brand_inn}")
+            inn = known_short_brand_inn
+        elif not inn and known_short_brand_inn:
+            inn = known_short_brand_inn
+            trace.append(f"FNS enrichment by known short-brand INN: {inn}")
+
         if not inn:
             return hits
 
@@ -2417,7 +2562,7 @@ class CompanyWebApp:
             inn,
             no_cache=no_cache,
             search_type="company",
-            provider_names=["ФНС ЕГРЮЛ"],
+            provider_names=["\u0424\u041d\u0421 \u0415\u0413\u0420\u042e\u041b"],
         )
         trace.extend(fns_trace)
         if fns_hits:
@@ -2489,6 +2634,57 @@ class CompanyWebApp:
         if not payloads or scrapy_merge_provider_payloads is None:
             return {}
         return scrapy_merge_provider_payloads(payloads)
+
+    def _build_scrapy_merged_hit(
+        self,
+        merged: dict[str, Any],
+        *,
+        input_type: str,
+        search_type: str,
+        raw_query: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(merged, dict):
+            return None
+
+        data: dict[str, Any] = {
+            "ru_org": self._normalize_spaces(str(merged.get("ru_org", ""))),
+            "en_org": self._normalize_spaces(str(merged.get("en_org", ""))),
+            "inn": self._normalize_spaces(str(merged.get("company_inn", ""))),
+            "ogrn": self._normalize_spaces(str(merged.get("company_ogrn", ""))),
+            "surname_ru": self._clean_fio_part(str(merged.get("leader_surname_ru", ""))),
+            "name_ru": self._clean_fio_part(str(merged.get("leader_name_ru", ""))),
+            "middle_name_ru": self._clean_fio_part(str(merged.get("leader_middle_ru", ""))),
+            "ru_position": self._normalize_position_ru(str(merged.get("leader_position_ru", ""))),
+            "en_position": self._normalize_spaces(str(merged.get("leader_position_en", ""))),
+            "gender": self._normalize_spaces(str(merged.get("gender", ""))),
+            "appeal": self._normalize_spaces(str(merged.get("appeal", ""))),
+        }
+
+        if not any(self._normalize_spaces(str(value)) for value in data.values()):
+            return None
+
+        if data.get("ru_org") and not data.get("en_org"):
+            en_org, _ = self.normalize_en_org("", data["ru_org"])
+            data["en_org"] = self._normalize_spaces(en_org)
+
+        if data.get("ru_position") and not data.get("en_position"):
+            data["en_position"] = self._generate_en_position(data["ru_position"])
+
+        if not data.get("ru_org") and input_type == INPUT_TYPE_ORG_TEXT:
+            data["ru_org"] = self._normalize_spaces(raw_query)
+
+        hit_type = "company"
+        if search_type == "person" or input_type == INPUT_TYPE_PERSON_TEXT:
+            if data.get("surname_ru") and data.get("name_ru"):
+                hit_type = "person"
+
+        data["type"] = hit_type
+        return {
+            "source": "Scrapy Merge",
+            "url": "",
+            "data": data,
+            "type": hit_type,
+        }
 
     def _extract_revenue_from_soup(self, soup: BeautifulSoup) -> int:
         rev_tag = soup.find("td", string=re.compile(r"Выручка|Доход|Revenue", re.IGNORECASE))
@@ -2674,7 +2870,19 @@ class CompanyWebApp:
             if os.getenv("SCRAPY_PIPELINE_MERGE", "1").lower() in {"1", "true", "yes"} and hits:
                 merged = self._merge_hits_with_scrapy_pipeline(hits)
                 if merged:
-                    trace.append("🧪 Scrapy pipeline: merged profile assembled")
+                    merged_hit = self._build_scrapy_merged_hit(
+                        merged,
+                        input_type=input_type,
+                        search_type=search_type,
+                        raw_query=raw,
+                    )
+                    if merged_hit is not None:
+                        hits.append(merged_hit)
+                        hits = self._dedup_source_hits(hits)
+                        hits_by_provider["Scrapy Merge"] = 1
+                        trace.append("🧪 Scrapy pipeline: merged profile added")
+                    else:
+                        trace.append("🧪 Scrapy pipeline: merged profile assembled")
             hits.sort(key=lambda item: self._score_hit(item, raw), reverse=True)
             if not hits:
                 trace.append("Источники: не получено")
@@ -4681,8 +4889,8 @@ class CompanyWebApp:
                 profile["financial_year"] = str(financial_year)
                 field_sources.setdefault("financial_year", "Источники")
 
-            best_revenue_hit = max(source_hits, key=lambda item: self._parse_money_amount(item.get("data", {}).get("revenue", 0)))
-            revenue_value = self._parse_money_amount(best_revenue_hit.get("data", {}).get("revenue", 0))
+            best_revenue_hit = max(source_hits, key=lambda item: self._parse_financial_amount(item.get("data", {}).get("revenue", 0)))
+            revenue_value = self._parse_financial_amount(best_revenue_hit.get("data", {}).get("revenue", 0))
             if revenue_value:
                 profile["revenue"] = str(revenue_value)
                 profile["revenue_mln"] = f"{(revenue_value / 1_000_000):.2f}"
@@ -4695,7 +4903,7 @@ class CompanyWebApp:
             for hit in source_hits:
                 data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
                 for key in profit_keys:
-                    profit_amount = self._parse_money_amount(data.get(key, 0))
+                    profit_amount = self._parse_financial_amount(data.get(key, 0))
                     if abs(profit_amount) > abs(best_profit):
                         best_profit = profit_amount
                         best_profit_source = str(hit.get("source", ""))
@@ -5139,6 +5347,12 @@ class CompanyWebApp:
             return 0
         return sign * int(digits)
 
+    def _parse_financial_amount(self, value: Any) -> int:
+        text = self._normalize_spaces(str(value))
+        if text and self._parse_financial_year(text) and re.fullmatch(r"(19\d{2}|20\d{2})", text):
+            return 0
+        return self._parse_money_amount(value)
+
     def _resolve_financial_year(self, source_hits: list[dict[str, Any]], profile: dict[str, Any] | None = None) -> int:
         year_candidates: list[int] = []
 
@@ -5346,7 +5560,7 @@ class CompanyWebApp:
             if company_hits:
                 trace.append(f"company-mode filter: {len(hits)} -> {len(company_hits)}")
                 hits = company_hits
-            hits = self._enrich_company_hits_with_fns(hits, trace, no_cache=False)
+            hits = self._enrich_company_hits_with_fns(hits, trace, no_cache=False, query=query_value)
             hits = self._dedup_source_hits(hits)
             company_hits = [item for item in hits if self._hit_looks_like_company(item)]
             if company_hits:
@@ -5642,11 +5856,44 @@ class CompanyWebApp:
                 if company_hits:
                     search_trace.append(f"Company hits filtered: {len(source_hits)} -> {len(company_hits)}")
                     source_hits = company_hits
-                source_hits = self._enrich_company_hits_with_fns(source_hits, search_trace, no_cache=no_cache)
+                source_hits = self._enrich_company_hits_with_fns(source_hits, search_trace, no_cache=no_cache, query=raw)
                 source_hits = self._dedup_source_hits(source_hits)
                 company_hits = [item for item in source_hits if self._hit_looks_like_company(item)]
                 if company_hits:
                     source_hits = company_hits
+
+                inn_for_leader = self._extract_valid_inn_from_hits(source_hits, query=raw)
+                has_leader_for_inn = self._has_valid_leader_for_inn(source_hits, inn_for_leader)
+                if inn_for_leader and not has_leader_for_inn:
+                    search_trace.append(f"Leader enrichment by INN: {inn_for_leader}")
+                    leader_hits, leader_trace = self._search_external_sources(
+                        inn_for_leader,
+                        no_cache=no_cache,
+                        search_type="company",
+                        provider_names=["companies.rbc.ru", "zachestnyibiznes.ru", "rusprofile.ru", "focus.kontur.ru"],
+                    )
+                    search_trace.extend(leader_trace)
+                    if leader_hits:
+                        source_hits = self._dedup_source_hits(source_hits + leader_hits)
+                        company_hits = [item for item in source_hits if self._hit_looks_like_company(item)]
+                        if company_hits:
+                            source_hits = company_hits
+
+                inn_for_financial = self._extract_valid_inn_from_hits(source_hits, query=raw)
+                if inn_for_financial and not self._has_any_financial_data(source_hits):
+                    search_trace.append(f"Financial enrichment by INN: {inn_for_financial}")
+                    financial_hits, financial_trace = self._search_external_sources(
+                        inn_for_financial,
+                        no_cache=no_cache,
+                        search_type="company",
+                        provider_names=["zachestnyibiznes.ru", "checko.ru", "companies.rbc.ru"],
+                    )
+                    search_trace.extend(financial_trace)
+                    if financial_hits:
+                        source_hits = self._dedup_source_hits(source_hits + financial_hits)
+                        company_hits = [item for item in source_hits if self._hit_looks_like_company(item)]
+                        if company_hits:
+                            source_hits = company_hits
 
             if not effective_hit_type and source_hits:
                 first_hit_type = self._normalize_spaces(str(source_hits[0].get("type", ""))).lower()
@@ -5715,7 +5962,7 @@ class CompanyWebApp:
                 profile[key] = value
                 field_sources[key] = "Источник данных"
 
-            candidate_sur, candidate_nam, candidate_pat, candidate_source = self._pick_best_leader_fio(source_hits)
+            candidate_sur, candidate_nam, candidate_pat, candidate_source = self._pick_best_leader_fio(source_hits, target_inn=profile.get("inn", ""))
             self._sanitize_profile_fio(profile)
             current_sur = self._normalize_spaces(profile.get("surname_ru", ""))
             current_nam = self._normalize_spaces(profile.get("name_ru", ""))
@@ -6526,10 +6773,6 @@ def run_server(db_path: str = "cards.db", host: str = "127.0.0.1", port: int = 8
 
 if __name__ == "__main__":
     run_server()
-
-
-
-
 
 
 

@@ -1,4 +1,5 @@
-﻿from __future__ import annotations
+﻿
+from __future__ import annotations
 
 import json
 import logging
@@ -26,7 +27,7 @@ class NativeNadinApp(tk.Tk):
         ("Middle name (EN)", "middle_name_en"),
         ("Фамилия", "surname_ru"),
         ("Имя", "name_ru"),
-        ("Отчество", "middle_name_ru"),
+        ("Middle name. рус", "middle_name_ru"),
         ("Пол", "gender"),
         ("ИНН", "inn"),
         ("Организация", "ru_org"),
@@ -39,18 +40,20 @@ class NativeNadinApp(tk.Tk):
         super().__init__()
         self.engine = engine
         self.title("Nadin")
-        self.geometry("1220x820")
+        self.geometry("1260x840")
         self.minsize(1040, 680)
 
         self.candidates: list[dict[str, Any]] = []
         self._busy = False
+        self._suppress_variant_event = False
+        self._last_autofill_key = ""
+        self._current_card_rows: list[tuple[str, str]] = []
 
         self.surname_var = tk.StringVar()
         self.name_var = tk.StringVar()
         self.middle_var = tk.StringVar()
         self.inn_var = tk.StringVar()
         self.company_var = tk.StringVar()
-        self.search_type_var = tk.StringVar(value="company")
         self.status_var = tk.StringVar(value="Готово")
         self.card_title_var = tk.StringVar(value="Карточка")
 
@@ -73,18 +76,16 @@ class NativeNadinApp(tk.Tk):
             ttk.Entry(top, textvariable=var, width=22).grid(row=1, column=col, sticky="ew", padx=(0, 8))
             top.columnconfigure(col, weight=1)
 
-        mode_frame = ttk.Frame(self, padding=(10, 0, 10, 8))
-        mode_frame.pack(fill=tk.X)
-        ttk.Radiobutton(mode_frame, text="Авто", value="", variable=self.search_type_var).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Radiobutton(mode_frame, text="Только организации", value="company", variable=self.search_type_var).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Radiobutton(mode_frame, text="Только физлица", value="person", variable=self.search_type_var).pack(side=tk.LEFT)
-
         action_frame = ttk.Frame(self, padding=(10, 0, 10, 8))
         action_frame.pack(fill=tk.X)
         self.search_button = ttk.Button(action_frame, text="Найти", command=self._search)
         self.search_button.pack(side=tk.LEFT)
-        self.autofill_button = ttk.Button(action_frame, text="Создать карточку", command=self._autofill_selected)
-        self.autofill_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.copy_card_button = ttk.Button(action_frame, text="Скопировать карточку", command=self._copy_card_to_clipboard)
+        self.copy_card_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.copy_field_button = ttk.Button(action_frame, text="Скопировать поле", command=self._copy_selected_card_value)
+        self.copy_field_button.pack(side=tk.LEFT, padx=(8, 0))
 
         self.progress = ttk.Progressbar(action_frame, mode="indeterminate", length=220)
         self.progress.pack(side=tk.LEFT, padx=(16, 0), fill=tk.X)
@@ -102,13 +103,13 @@ class NativeNadinApp(tk.Tk):
             card_container,
             columns=("field", "value"),
             show="headings",
-            selectmode="none",
+            selectmode="browse",
             height=18,
         )
         self.card_tree.heading("field", text="Поле")
         self.card_tree.heading("value", text="Значение")
-        self.card_tree.column("field", width=190, anchor="w", stretch=False)
-        self.card_tree.column("value", width=430, anchor="w", stretch=True)
+        self.card_tree.column("field", width=200, anchor="w", stretch=False)
+        self.card_tree.column("value", width=470, anchor="w", stretch=True)
         card_scroll_y = ttk.Scrollbar(card_container, orient="vertical", command=self.card_tree.yview)
         card_scroll_x = ttk.Scrollbar(card_container, orient="horizontal", command=self.card_tree.xview)
         self.card_tree.configure(yscrollcommand=card_scroll_y.set, xscrollcommand=card_scroll_x.set)
@@ -116,6 +117,8 @@ class NativeNadinApp(tk.Tk):
         card_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
         card_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
         card_container.bind("<Configure>", self._on_card_container_resize)
+        self.card_tree.bind("<Control-c>", self._copy_selected_card_value)
+        self.card_tree.bind("<Double-1>", self._copy_selected_card_value)
 
         variants_frame = ttk.Frame(split)
         split.add(variants_frame, weight=8)
@@ -132,9 +135,9 @@ class NativeNadinApp(tk.Tk):
         self.result_tree.heading("org", text="Компания")
         self.result_tree.heading("inn", text="ИНН")
         self.result_tree.heading("source", text="Источник")
-        self.result_tree.column("org", width=420, anchor="w")
-        self.result_tree.column("inn", width=120, anchor="center", stretch=False)
-        self.result_tree.column("source", width=180, anchor="w", stretch=False)
+        self.result_tree.column("org", width=430, anchor="w")
+        self.result_tree.column("inn", width=130, anchor="center", stretch=False)
+        self.result_tree.column("source", width=220, anchor="w", stretch=False)
         variants_scroll_y = ttk.Scrollbar(variants_container, orient="vertical", command=self.result_tree.yview)
         variants_scroll_x = ttk.Scrollbar(variants_container, orient="horizontal", command=self.result_tree.xview)
         self.result_tree.configure(yscrollcommand=variants_scroll_y.set, xscrollcommand=variants_scroll_x.set)
@@ -156,16 +159,16 @@ class NativeNadinApp(tk.Tk):
         self._render_card_rows([], "Карточка")
 
     def _on_card_container_resize(self, event: tk.Event) -> None:
-        total_width = max(int(event.width) - 28, 320)
-        field_width = min(230, max(170, int(total_width * 0.33)))
-        value_width = max(220, total_width - field_width)
+        total_width = max(int(event.width) - 28, 340)
+        field_width = min(240, max(180, int(total_width * 0.34)))
+        value_width = max(230, total_width - field_width)
         self.card_tree.column("field", width=field_width, stretch=False)
         self.card_tree.column("value", width=value_width, stretch=True)
 
     def _on_variants_container_resize(self, event: tk.Event) -> None:
-        total_width = max(int(event.width) - 28, 420)
-        inn_width = 120
-        source_width = 190
+        total_width = max(int(event.width) - 28, 430)
+        inn_width = 130
+        source_width = 220
         org_width = max(220, total_width - inn_width - source_width)
         self.result_tree.column("org", width=org_width, stretch=True)
         self.result_tree.column("inn", width=inn_width, stretch=False)
@@ -175,7 +178,8 @@ class NativeNadinApp(tk.Tk):
         self._busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
         self.search_button.configure(state=state)
-        self.autofill_button.configure(state=state)
+        self.copy_card_button.configure(state=state)
+        self.copy_field_button.configure(state=state)
         if busy:
             self.progress.start(12)
             self.configure(cursor="watch")
@@ -192,7 +196,7 @@ class NativeNadinApp(tk.Tk):
             "middle_name": self.middle_var.get().strip(),
             "inn": self.inn_var.get().strip(),
             "company": self.company_var.get().strip(),
-            "search_type": self.search_type_var.get().strip(),
+            "search_type": "",
         }
 
     def _search(self) -> None:
@@ -204,17 +208,19 @@ class NativeNadinApp(tk.Tk):
             return
 
         self._set_busy(True, "Поиск...")
+        self._last_autofill_key = ""
 
         def worker() -> None:
             error = ""
-            candidates: list[dict[str, Any]] = []
+            source_hits: list[dict[str, Any]] = []
+            backend_candidates: list[dict[str, Any]] = []
             trace: list[str] = []
             try:
-                _hits, candidates, trace = self.engine._search_by_criteria(params)
+                source_hits, backend_candidates, trace = self.engine._search_by_criteria(params)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Search failed")
                 error = str(exc)
-            self.after(0, lambda: self._on_search_done(candidates, trace, error))
+            self.after(0, lambda: self._on_search_done(params, source_hits, backend_candidates, trace, error))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -223,24 +229,123 @@ class NativeNadinApp(tk.Tk):
         if hit_type == "person":
             return False
         org = self.engine._normalize_spaces(str(item.get("org_ru", "")))
-        if not org:
-            return False
-        return True
+        return bool(org)
 
-    def _on_search_done(self, candidates: list[dict[str, Any]], trace: list[str], error: str) -> None:
+    def _candidate_key(self, candidate: dict[str, Any]) -> str:
+        inn = self.engine._normalize_spaces(str(candidate.get("inn", "")))
+        org = self.engine._normalize_spaces(str(candidate.get("org_ru", ""))).lower()
+        src = self.engine._normalize_spaces(str(candidate.get("source", ""))).lower()
+        if inn:
+            return f"inn:{inn}"
+        return f"org:{org}|src:{src}"
+
+    def _build_company_candidates_from_hits(self, source_hits: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+        by_key: dict[str, dict[str, Any]] = {}
+        q_norm = self.engine._normalize_spaces(query)
+
+        for hit in source_hits:
+            if not isinstance(hit, dict):
+                continue
+            data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+            org = self._clean_org_for_list(str(data.get("ru_org", "")), str(data.get("inn", "")))
+            if not org:
+                continue
+            if self.engine._is_garbage_org_title(org, q_norm):
+                continue
+
+            inn = self.engine._normalize_spaces(str(data.get("inn", "")))
+            if inn and not re.fullmatch(r"\d{10}|\d{12}", inn):
+                inn = ""
+
+            source_name = self.engine._normalize_spaces(str(hit.get("source", ""))) or "—"
+            score = self.engine._score_org_relevance(data, q_norm) + self.engine._score_hit(hit, q_norm)
+            key = inn or f"org:{org.lower()}"
+
+            candidate = {
+                "data": data,
+                "source": source_name,
+                "type": "company",
+                "url": str(hit.get("url", "")),
+                "score": float(score),
+                "fio_ru": " ".join(
+                    x
+                    for x in [
+                        self.engine._normalize_spaces(str(data.get("surname_ru", ""))),
+                        self.engine._normalize_spaces(str(data.get("name_ru", ""))),
+                        self.engine._normalize_spaces(str(data.get("middle_name_ru", ""))),
+                    ]
+                    if x
+                ),
+                "org_ru": org,
+                "position_ru": self.engine._normalize_spaces(str(data.get("ru_position", ""))),
+                "inn": inn,
+                "query_for_autofill": inn or org,
+                "revenue": str(self.engine._parse_money_amount(data.get("revenue", 0))),
+                "source_names": [source_name],
+            }
+
+            existing = by_key.get(key)
+            if existing is None:
+                by_key[key] = candidate
+                continue
+
+            for src in candidate["source_names"]:
+                if src and src not in existing["source_names"]:
+                    existing["source_names"].append(src)
+
+            if float(candidate["score"]) > float(existing.get("score", 0)):
+                keep_sources = list(existing["source_names"])
+                by_key[key] = candidate
+                by_key[key]["source_names"] = keep_sources
+
+        candidates = list(by_key.values())
+        if not candidates:
+            return []
+
+        with_inn = [item for item in candidates if self.engine._normalize_spaces(str(item.get("inn", "")))]
+        if with_inn:
+            candidates = with_inn
+
+        candidates.sort(key=lambda item: float(item.get("score", 0)), reverse=True)
+        for item in candidates:
+            source_names = [self.engine._normalize_spaces(str(x)) for x in item.get("source_names", []) if self.engine._normalize_spaces(str(x))]
+            item["source"] = ", ".join(source_names) if source_names else self.engine._normalize_spaces(str(item.get("source", "")))
+            item["score"] = f"{float(item.get('score', 0)):.2f}"
+        return candidates[:20]
+
+    def _prepare_candidates(self, params: dict[str, str], source_hits: list[dict[str, Any]], backend_candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        company_only_query = bool(
+            params.get("company")
+            and not params.get("inn")
+            and not params.get("surname")
+            and not params.get("name")
+            and not params.get("middle_name")
+        )
+
+        if company_only_query:
+            company_candidates = self._build_company_candidates_from_hits(source_hits, params.get("company", ""))
+            if company_candidates:
+                return company_candidates
+
+        return backend_candidates
+
+    def _on_search_done(
+        self,
+        params: dict[str, str],
+        source_hits: list[dict[str, Any]],
+        backend_candidates: list[dict[str, Any]],
+        trace: list[str],
+        error: str,
+    ) -> None:
         self._set_busy(False)
         if error:
             self.status_var.set("Ошибка поиска")
             messagebox.showerror("Nadin", error)
             return
 
-        current_mode = self.search_type_var.get().strip()
-        if current_mode == "company":
-            candidates = [item for item in candidates if self._candidate_looks_like_company(item)]
-        elif current_mode == "person":
-            candidates = [item for item in candidates if self.engine._normalize_spaces(str(item.get("fio_ru", "")))]
-
+        candidates = self._prepare_candidates(params, source_hits, backend_candidates)
         self.candidates = candidates
+
         for iid in self.result_tree.get_children():
             self.result_tree.delete(iid)
 
@@ -259,15 +364,29 @@ class NativeNadinApp(tk.Tk):
                 ),
             )
 
-        if candidates:
-            self.result_tree.selection_set("0")
-            self.result_tree.focus("0")
-            self._on_variant_selected(None)
+        if not candidates:
+            self._render_card_rows([("Статус", "Ничего не найдено")], "Карточка")
+            self.status_var.set("Найдено вариантов: 0")
+        elif len(candidates) == 1:
+            self._suppress_variant_event = True
+            try:
+                self.result_tree.selection_set("0")
+                self.result_tree.focus("0")
+            finally:
+                self._suppress_variant_event = False
+            self._render_candidate_preview(candidates[0])
+            self._autofill_candidate(candidates[0], reason="single_match")
         else:
-            self._render_card_rows([], "Карточка")
+            self._render_card_rows(
+                [
+                    ("Статус", "Выберите вариант справа: карточка будет сформирована автоматически"),
+                    ("Вариантов", str(len(candidates))),
+                ],
+                "Предпросмотр карточки",
+            )
+            self.status_var.set(f"Найдено вариантов: {len(candidates)}. Выберите нужный вариант")
 
         self._write_trace(trace)
-        self.status_var.set(f"Найдено вариантов: {len(candidates)}")
 
     def _selected_candidate(self) -> dict[str, Any] | None:
         selected = self.result_tree.selection()
@@ -295,10 +414,13 @@ class NativeNadinApp(tk.Tk):
         return cleaned or org
 
     def _on_variant_selected(self, _event: object | None) -> None:
+        if self._suppress_variant_event or self._busy:
+            return
         candidate = self._selected_candidate()
         if candidate is None:
             return
         self._render_candidate_preview(candidate)
+        self._autofill_candidate(candidate, reason="selected_variant")
 
     def _profile_from_candidate(self, candidate: dict[str, Any]) -> dict[str, str]:
         profile: dict[str, str] = {key: "" for _, key in self.CARD_FIELDS}
@@ -337,77 +459,58 @@ class NativeNadinApp(tk.Tk):
         return profile
 
     def _render_candidate_preview(self, candidate: dict[str, Any]) -> None:
-        candidate_type = self.engine._normalize_spaces(str(candidate.get("type", ""))).lower()
         profile = self._profile_from_candidate(candidate)
-
-        if candidate_type == "company":
-            profile["surname_ru"] = ""
-            profile["name_ru"] = ""
-            profile["middle_name_ru"] = ""
-            profile["family_name"] = ""
-            profile["first_name"] = ""
-            profile["middle_name_en"] = ""
-
-        year = self.engine._default_financial_year()
-        revenue_line = self.engine._format_financial_line(candidate.get("revenue", ""), year)
-        profit_line = self.engine._format_financial_line("", year)
-
         source = self.engine._normalize_spaces(str(candidate.get("source", "")))
+
+        base_year = self.engine._default_financial_year()
+        revenue_line = self.engine._format_financial_line(candidate.get("revenue", ""), base_year)
+        profit_line = self.engine._format_financial_line("", base_year)
+
         rows = self._compose_card_rows(
             profile,
             status="Предпросмотр",
-            primary_source=source,
             source_names=[source] if source else [],
             revenue_line=revenue_line,
             profit_line=profit_line,
         )
         self._render_card_rows(rows, "Предпросмотр карточки")
 
-    def _autofill_selected(self) -> None:
+    def _autofill_candidate(self, candidate: dict[str, Any], reason: str = "") -> None:
         if self._busy:
             return
-
-        candidate = self._selected_candidate()
-        search_type = self.search_type_var.get().strip()
-        company = self.company_var.get().strip()
-        inn = self.inn_var.get().strip()
-
-        if candidate is None:
-            if inn:
-                candidate = {
-                    "query_for_autofill": inn,
-                    "inn": inn,
-                    "type": "company" if search_type == "company" else "",
-                }
-            elif company:
-                candidate = {
-                    "query_for_autofill": company,
-                    "type": "company" if search_type == "company" else "",
-                }
-            else:
-                messagebox.showwarning("Nadin", "Выберите вариант или заполните ИНН/компанию")
-                return
 
         query_for_autofill = self.engine._normalize_spaces(str(candidate.get("inn", "")))
         if not query_for_autofill:
             query_for_autofill = self.engine._normalize_spaces(str(candidate.get("query_for_autofill", "")))
         if not query_for_autofill:
-            query_for_autofill = company or inn
+            query_for_autofill = self.company_var.get().strip() or self.inn_var.get().strip()
 
-        if search_type == "company":
-            hit_type = "company"
-        elif search_type == "person":
-            hit_type = "person"
-        else:
-            hit_type = self.engine._normalize_spaces(str(candidate.get("type", "")))
+        if not query_for_autofill:
+            return
 
+        key = self._candidate_key(candidate)
+        if key and key == self._last_autofill_key:
+            return
+        self._last_autofill_key = key
+
+        hit_type = self.engine._normalize_spaces(str(candidate.get("type", ""))).lower()
+        if hit_type not in {"company", "person"}:
+            if self.engine._normalize_spaces(str(candidate.get("org_ru", ""))):
+                hit_type = "company"
+            elif self.engine._normalize_spaces(str(candidate.get("fio_ru", ""))):
+                hit_type = "person"
+            else:
+                hit_type = ""
+
+        forced_search_type = hit_type if hit_type in {"company", "person"} else ""
         form = {
             "company_name": [query_for_autofill],
             "hit_type": [hit_type],
-            "search_type": [search_type],
+            "search_type": [forced_search_type],
         }
 
-        self._set_busy(True, "Создание карточки...")
+        status_suffix = " (выбран вариант)" if reason == "selected_variant" else ""
+        self._set_busy(True, f"Формирование карточки{status_suffix}...")
 
         def worker() -> None:
             error = ""
@@ -421,8 +524,12 @@ class NativeNadinApp(tk.Tk):
                     if payload.get("ok") and payload.get("card_id"):
                         card_id = int(payload["card_id"])
                     else:
-                        redirect = payload.get("redirect", "")
-                        error = f"Автозаполнение не завершено: {redirect or 'нужно уточнение'}"
+                        redirect = self.engine._normalize_spaces(str(payload.get("redirect", "")))
+                        match = re.search(r"/card/(\d+)$", redirect)
+                        if match:
+                            card_id = int(match.group(1))
+                        else:
+                            error = f"Автоформирование не завершено: {redirect or 'нужно уточнение'}"
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Autofill failed")
                 error = str(exc)
@@ -433,19 +540,18 @@ class NativeNadinApp(tk.Tk):
     def _on_autofill_done(self, card_id: int, error: str) -> None:
         self._set_busy(False)
         if error:
-            self.status_var.set("Не удалось создать карточку")
-            messagebox.showwarning("Nadin", error)
+            self.status_var.set("Не удалось сформировать карточку")
+            self._render_card_rows([("Статус", error)], "Карточка")
             return
 
         self._show_card(card_id)
-        self.status_var.set(f"Карточка #{card_id} создана")
+        self.status_var.set(f"Карточка #{card_id} сформирована")
 
     def _compose_card_rows(
         self,
         profile: dict[str, str],
         *,
         status: str,
-        primary_source: str,
         source_names: list[str],
         revenue_line: str,
         profit_line: str,
@@ -458,22 +564,35 @@ class NativeNadinApp(tk.Tk):
         rows.append(("Прибыль", profit_line))
         rows.append(("Статус", self.engine._normalize_spaces(str(status))))
 
-        primary = self.engine._normalize_spaces(primary_source)
-        sources = [self.engine._normalize_spaces(src) for src in source_names if self.engine._normalize_spaces(src)]
-        if not primary and sources:
-            primary = sources[0]
+        cleaned_sources: list[str] = []
+        seen: set[str] = set()
+        for source in source_names:
+            src = self.engine._normalize_spaces(str(source))
+            if not src:
+                continue
+            key = src.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned_sources.append(src)
 
-        rows.append(("Источник", primary or "—"))
-        rows.append(("Источники данных", ", ".join(sources) if sources else (primary or "—")))
+        rows.append(("Источники", ", ".join(cleaned_sources) if cleaned_sources else "—"))
         return rows
 
-    def _extract_source_names(self, payload: dict[str, object]) -> list[str]:
+    def _extract_source_names(self, payload: dict[str, object], primary_source: str = "") -> list[str]:
         raw_hits = payload.get("source_hits", []) if isinstance(payload, dict) else []
-        if not isinstance(raw_hits, list):
-            return []
-
         names: list[str] = []
         seen: set[str] = set()
+
+        if primary_source:
+            src = self.engine._normalize_spaces(primary_source)
+            if src:
+                names.append(src)
+                seen.add(src.lower())
+
+        if not isinstance(raw_hits, list):
+            return names
+
         for hit in raw_hits:
             if not isinstance(hit, dict):
                 continue
@@ -490,7 +609,7 @@ class NativeNadinApp(tk.Tk):
     def _merge_profile_with_source_hits(self, profile: dict[str, Any], source_hits: list[dict[str, Any]]) -> dict[str, str]:
         merged = {key: self.engine._normalize_spaces(str(value)) for key, value in profile.items()}
         fill_keys = {key for _, key in self.CARD_FIELDS}
-        fill_keys.update({"revenue", "profit", "financial_year", "revenue_year", "profit_year", "year"})
+        fill_keys.update({"revenue", "profit", "financial_year", "revenue_year", "profit_year", "year", "report_year"})
 
         for hit in source_hits:
             if not isinstance(hit, dict):
@@ -521,6 +640,60 @@ class NativeNadinApp(tk.Tk):
 
         return merged
 
+    def _resolve_metric_line(
+        self,
+        profile: dict[str, Any],
+        source_hits: list[dict[str, Any]],
+        metric_keys: tuple[str, ...],
+        year_keys: tuple[str, ...],
+    ) -> str:
+        metric_candidates: list[tuple[int, int]] = []
+        year_candidates: list[int] = []
+
+        def append_value(amount_value: Any, year_value: Any) -> None:
+            raw_amount = self.engine._normalize_spaces(str(amount_value))
+            year_from_amount = self.engine._parse_financial_year(raw_amount)
+            if year_from_amount and re.fullmatch(r"(19\d{2}|20\d{2})", raw_amount):
+                year_candidates.append(year_from_amount)
+                return
+
+            amount = self.engine._parse_money_amount(amount_value)
+            year = self.engine._parse_financial_year(year_value)
+            if year:
+                year_candidates.append(year)
+            if amount != 0:
+                metric_candidates.append((year, amount))
+
+        for key in metric_keys:
+            if key in profile:
+                year_value = ""
+                for y_key in year_keys:
+                    if self.engine._normalize_spaces(str(profile.get(y_key, ""))):
+                        year_value = profile.get(y_key, "")
+                        break
+                append_value(profile.get(key, 0), year_value)
+
+        for hit in source_hits:
+            data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+            for key in metric_keys:
+                if key not in data:
+                    continue
+                year_value = ""
+                for y_key in year_keys:
+                    if self.engine._normalize_spaces(str(data.get(y_key, ""))):
+                        year_value = data.get(y_key, "")
+                        break
+                append_value(data.get(key, 0), year_value)
+
+        fallback_year = max(year_candidates) if year_candidates else self.engine._default_financial_year()
+        if not metric_candidates:
+            return f"Данных нет ({fallback_year})"
+
+        metric_candidates.sort(key=lambda item: (item[0], abs(item[1])), reverse=True)
+        best_year, best_amount = metric_candidates[0]
+        year = best_year if best_year > 0 else fallback_year
+        return self.engine._format_financial_line(best_amount, year)
+
     def _show_card(self, card_id: int) -> None:
         with self.engine._connect() as db:
             row = db.execute("SELECT id, status, source, data_json FROM cards WHERE id=?", (card_id,)).fetchone()
@@ -538,25 +711,25 @@ class NativeNadinApp(tk.Tk):
 
         profile = self._merge_profile_with_source_hits(profile, source_hits)
 
-        financial_year_text = self.engine._normalize_spaces(str(profile.get("financial_year", "")))
-        financial_year = self.engine._parse_financial_year(financial_year_text)
-        if not financial_year:
-            financial_year = self.engine._resolve_financial_year(source_hits, profile)
-        if not financial_year:
-            financial_year = datetime.now().year
+        revenue_line = self._resolve_metric_line(
+            profile,
+            source_hits,
+            metric_keys=("revenue", "revenue_mln", "income"),
+            year_keys=("revenue_year", "financial_year", "year", "report_year"),
+        )
+        profit_line = self._resolve_metric_line(
+            profile,
+            source_hits,
+            metric_keys=("profit", "net_profit", "clean_profit", "profit_clean", "чистая_прибыль", "чистая_прибыль_убыток"),
+            year_keys=("profit_year", "financial_year", "year", "report_year"),
+        )
 
-        revenue_line = self.engine._format_financial_line(profile.get("revenue"), int(financial_year))
-        profit_line = self.engine._format_financial_line(profile.get("profit"), int(financial_year))
-
-        source_names = self._extract_source_names(payload)
         primary_source = self.engine._normalize_spaces(str(row["source"] or ""))
-        if primary_source.lower() == "autofill" and source_names:
-            primary_source = source_names[0]
+        source_names = self._extract_source_names(payload, primary_source=primary_source)
 
         rows = self._compose_card_rows(
             {k: self.engine._normalize_spaces(str(v)) for k, v in profile.items()},
             status=str(row["status"] or ""),
-            primary_source=primary_source,
             source_names=source_names,
             revenue_line=revenue_line,
             profit_line=profit_line,
@@ -565,15 +738,42 @@ class NativeNadinApp(tk.Tk):
 
     def _render_card_rows(self, rows: list[tuple[str, str]], title: str) -> None:
         self.card_title_var.set(title)
+        self._current_card_rows = list(rows)
         for iid in self.card_tree.get_children():
             self.card_tree.delete(iid)
 
         if not rows:
             rows = [("Статус", "Нет данных для отображения")]
+            self._current_card_rows = list(rows)
 
         for label, value in rows:
             display = self.engine._normalize_spaces(str(value)) if value is not None else ""
             self.card_tree.insert("", tk.END, values=(label, display or "—"))
+
+    def _copy_selected_card_value(self, _event: object | None = None) -> None:
+        selected = self.card_tree.selection()
+        if not selected:
+            self.status_var.set("Выберите поле карточки для копирования")
+            return
+        values = self.card_tree.item(selected[0], "values")
+        if not values or len(values) < 2:
+            return
+        text = f"{values[0]}: {values[1]}"
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status_var.set("Поле скопировано в буфер обмена")
+
+    def _copy_card_to_clipboard(self) -> None:
+        if not self._current_card_rows:
+            self.status_var.set("Карточка пуста")
+            return
+        text = "\n".join(
+            f"{self.engine._normalize_spaces(str(label))}: {self.engine._normalize_spaces(str(value)) or '—'}"
+            for label, value in self._current_card_rows
+        )
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status_var.set("Карточка скопирована в буфер обмена")
 
     def _write_trace(self, trace: list[str]) -> None:
         self.trace_text.configure(state=tk.NORMAL)
