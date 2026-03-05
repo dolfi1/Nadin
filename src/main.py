@@ -394,8 +394,12 @@ class CompanyWebApp:
         self._rusprofile_throttle_range = (3, 7)
         self._active_searches: dict[str, float] = {}
         self._autofill_result_cache: dict[str, dict[str, Any]] = {}
+        self._autofill_result_cache_max = 256
+        self._autofill_result_cache_ttl_seconds = 20
         self._last_search_time: dict[str, float] = {}
         self._endpoint_rate_limit: dict[str, list[float]] = defaultdict(list)
+        self._endpoint_rate_limit_max_keys = 2048
+        self._endpoint_rate_limit_lock = threading.Lock()
         self._ddg_query_cache: dict[str, tuple[float, list[str]]] = {}
         self._thread_state = threading.local()
         self.search_timeout_seconds = 45
@@ -577,6 +581,48 @@ class CompanyWebApp:
                     db.commit()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Cache cleanup error: %s", exc)
+
+    def _prune_autofill_result_cache(self, now: float | None = None) -> None:
+        ts = time.time() if now is None else now
+        expired_keys = [
+            key
+            for key, payload in self._autofill_result_cache.items()
+            if ts >= float(payload.get("expires_at", 0))
+        ]
+        for key in expired_keys:
+            self._autofill_result_cache.pop(key, None)
+
+        overflow = len(self._autofill_result_cache) - self._autofill_result_cache_max
+        if overflow <= 0:
+            return
+        oldest_keys = sorted(
+            self._autofill_result_cache,
+            key=lambda key: float(self._autofill_result_cache[key].get("expires_at", 0)),
+        )[:overflow]
+        for key in oldest_keys:
+            self._autofill_result_cache.pop(key, None)
+
+    def _get_cached_autofill_response(self, cache_key: str) -> tuple[str, str, list[tuple[str, str]]] | None:
+        now = time.time()
+        with self._active_searches_lock:
+            self._prune_autofill_result_cache(now)
+            cached = self._autofill_result_cache.get(cache_key)
+            if not cached:
+                return None
+            return cached.get("response")
+
+    def _set_cached_autofill_response(
+        self,
+        cache_key: str,
+        response: tuple[str, str, list[tuple[str, str]]],
+        ttl_seconds: int | None = None,
+    ) -> None:
+        ttl = ttl_seconds if ttl_seconds is not None else self._autofill_result_cache_ttl_seconds
+        expires_at = time.time() + max(1, ttl)
+        with self._active_searches_lock:
+            self._prune_autofill_result_cache()
+            self._autofill_result_cache[cache_key] = {"response": response, "expires_at": expires_at}
+            self._prune_autofill_result_cache()
 
     def __call__(self, environ: dict[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
         method = environ.get("REQUEST_METHOD", "GET")
@@ -1541,12 +1587,32 @@ class CompanyWebApp:
         client = environ.get("REMOTE_ADDR", "unknown")
         key = f"{endpoint}:{client}"
         now = time.time()
-        samples = [stamp for stamp in self._endpoint_rate_limit[key] if now - stamp < window_seconds]
-        if len(samples) >= limit:
+        with self._endpoint_rate_limit_lock:
+            samples = [stamp for stamp in self._endpoint_rate_limit[key] if now - stamp < window_seconds]
+            if len(samples) >= limit:
+                self._endpoint_rate_limit[key] = samples
+                return True
+            samples.append(now)
             self._endpoint_rate_limit[key] = samples
-            return True
-        samples.append(now)
-        self._endpoint_rate_limit[key] = samples
+
+            if len(self._endpoint_rate_limit) > self._endpoint_rate_limit_max_keys:
+                stale_before = now - max(window_seconds * 3, 300)
+                stale_keys = [
+                    cache_key
+                    for cache_key, values in self._endpoint_rate_limit.items()
+                    if not values or values[-1] < stale_before
+                ]
+                for stale_key in stale_keys:
+                    self._endpoint_rate_limit.pop(stale_key, None)
+
+                overflow = len(self._endpoint_rate_limit) - self._endpoint_rate_limit_max_keys
+                if overflow > 0:
+                    oldest_keys = sorted(
+                        self._endpoint_rate_limit,
+                        key=lambda cache_key: self._endpoint_rate_limit[cache_key][-1] if self._endpoint_rate_limit[cache_key] else 0.0,
+                    )[:overflow]
+                    for oldest_key in oldest_keys:
+                        self._endpoint_rate_limit.pop(oldest_key, None)
         return False
 
     def _get_cache(self, cache_key: str) -> list[dict[str, Any]] | None:
@@ -1664,6 +1730,7 @@ class CompanyWebApp:
         input_type: str,
         no_cache: bool = False,
         search_type: str = "",
+        allow_fallback: bool = True,
     ) -> list[dict[str, Any]] | dict[str, Any] | None:
         self._init_thread_state()
         self._thread_state.blocked_fetch = False
@@ -1698,7 +1765,9 @@ class CompanyWebApp:
             self._mark_provider_failure(provider.get("name", ""))
             self._handle_provider_error(provider.get("name", "unknown"), exc)
 
-        fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn, search_type=search_type)
+        fallback_hits: list[dict[str, Any]] = []
+        if allow_fallback:
+            fallback_hits = self._try_fallback_providers(provider, normalized, input_type, inn, search_type=search_type)
         if provider.get("kind") == "duckduckgo_html":
             if not no_cache:
                 should_cache_negative, negative_ttl = self._negative_cache_policy(provider)
@@ -2181,7 +2250,7 @@ class CompanyWebApp:
         def load_provider(provider: dict[str, Any]) -> tuple[str, list[dict[str, Any]], str]:
             started = time.perf_counter()
             try:
-                data = self._call_provider(provider, raw, input_type, no_cache=no_cache, search_type=search_type)
+                data = self._call_provider(provider, raw, input_type, no_cache=no_cache, search_type=search_type, allow_fallback=False)
             except (requests.Timeout, TimeoutError) as exc:
                 logger.warning("Provider %s timeout for %s: %s", provider.get("name"), raw, exc)
                 return provider["name"], [], "provider_timeout_skipped"
@@ -5038,21 +5107,19 @@ class CompanyWebApp:
                 "error": "Ничего не найдено: укажите минимум имя и фамилию",
             }
             response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
-            with self._active_searches_lock:
-                    self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+            self._set_cached_autofill_response(cache_key, response)
             return response
 
-        with self._active_searches_lock:
-            cached_result = self._autofill_result_cache.get(cache_key)
-        if cached_result and time.time() < float(cached_result.get("expires_at", 0)):
+        cached_response = self._get_cached_autofill_response(cache_key)
+        if cached_response is not None:
             logger.info("Используем кэш результата autofill для %s", raw)
-            return cached_result["response"]
+            return cached_response
 
         with self._active_searches_lock:
             if cache_key in self._active_searches:
                 logger.info("Поиск уже выполняется для %s, используем последний кэш", raw)
-                if cached_result:
-                    return cached_result["response"]
+                if cached_response is not None:
+                    return cached_response
 
             self._active_searches[cache_key] = time.time()
         try:
@@ -5169,22 +5236,24 @@ class CompanyWebApp:
                     profile[field] = ""
                     field_sources.pop(field, None)
 
-            logger.info("=== AUTOFILL REVIEW ===")
-            logger.info("source_hits count: %d", len(source_hits))
-            for i, hit in enumerate(source_hits):
-                logger.info("Hit %d: source=%s, type=%s", i, hit.get("source"), hit.get("type"))
-                logger.info("  data keys: %s", list(hit.get("data", {}).keys()) if isinstance(hit.get("data"), dict) else "N/A")
-                logger.info("  ru_org: %s", hit.get("data", {}).get("ru_org") if isinstance(hit.get("data"), dict) else "N/A")
-                logger.info("  surname_ru: %s", hit.get("data", {}).get("surname_ru") if isinstance(hit.get("data"), dict) else "N/A")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("=== AUTOFILL REVIEW ===")
+                logger.debug("source_hits count: %d", len(source_hits))
+                for i, hit in enumerate(source_hits):
+                    logger.debug("Hit %d: source=%s, type=%s", i, hit.get("source"), hit.get("type"))
+                    logger.debug("  data keys: %s", list(hit.get("data", {}).keys()) if isinstance(hit.get("data"), dict) else "N/A")
+                    logger.debug("  ru_org: %s", hit.get("data", {}).get("ru_org") if isinstance(hit.get("data"), dict) else "N/A")
+                    logger.debug("  surname_ru: %s", hit.get("data", {}).get("surname_ru") if isinstance(hit.get("data"), dict) else "N/A")
 
-            logger.info("Profile after build:")
-            for field in self._required_fields_for_profile(profile):
-                logger.info("  required.%s: '%s' (from %s)", field, profile.get(field), field_sources.get(field))
+                logger.debug("Profile after build:")
+                for field in self._required_fields_for_profile(profile):
+                    logger.debug("  required.%s: '%s' (from %s)", field, profile.get(field), field_sources.get(field))
 
             if not profile.get("ru_org") and not profile.get("surname_ru") and not profile.get("name_ru"):
                 logger.error("Профиль пустой после построения из %d хитов!", len(source_hits))
             filled_fields = [k for k, v in profile.items() if v and k not in {"title", "appeal"}]
-            logger.info("Заполненные поля профиля: %s", filled_fields)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Заполненные поля профиля: %s", filled_fields)
 
             profile, notes = self.apply_card_rules(profile)
             if source_hits:
@@ -5213,24 +5282,21 @@ class CompanyWebApp:
                 logger.info("autocreate_skipped: reason=invalid_fields details=person_without_name")
                 manual_payload["error"] = "Ничего не найдено: укажите минимум имя и фамилию"
                 response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
-                with self._active_searches_lock:
-                    self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+                self._set_cached_autofill_response(cache_key, response)
                 return response
 
             if self._is_garbage_org_title(profile.get("ru_org", ""), raw):
                 logger.info("autocreate_skipped: reason=garbage_title")
                 manual_payload["error"] = "Нужно уточнить: добавьте ИНН или корректное название организации"
                 response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
-                with self._active_searches_lock:
-                    self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+                self._set_cached_autofill_response(cache_key, response)
                 return response
 
             if self._detect_profile_type(profile) == "company" and not self._normalize_spaces(profile.get("inn", "")):
                 logger.info("autocreate_skipped: reason=low_confidence details=company_without_inn")
                 manual_payload["error"] = "Нужно уточнить: добавьте ИНН или ОГРН"
                 response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
-                with self._active_searches_lock:
-                    self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+                self._set_cached_autofill_response(cache_key, response)
                 return response
             if forced_search_type == "company":
                 surname_ru = self._normalize_spaces(profile.get("surname_ru", ""))
@@ -5262,8 +5328,7 @@ class CompanyWebApp:
                     logger.info("autocreate_skipped: reason=invalid_fields details=company_without_leader")
                     manual_payload["error"] = "Не найден руководитель компании, уточните/выберите из списка"
                     response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
-                    with self._active_searches_lock:
-                        self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+                    self._set_cached_autofill_response(cache_key, response)
                     return response
 
             missing_fields = self._missing_required_fields(profile)
@@ -5296,8 +5361,7 @@ class CompanyWebApp:
                 card_id = self._create_autofill_card(profile, notes, source_hits, search_trace, field_sources)
                 logger.info("Карточка #%d создана автоматически", card_id)
                 response = self._autofill_redirect_response(f"/card/{card_id}", wants_json=wants_json)
-            with self._active_searches_lock:
-                self._autofill_result_cache[cache_key] = {"response": response, "expires_at": time.time() + 20}
+            self._set_cached_autofill_response(cache_key, response)
             return response
         finally:
             with self._active_searches_lock:
