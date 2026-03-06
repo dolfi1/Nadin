@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import csv
 import hashlib
@@ -913,12 +913,8 @@ class CompanyWebApp:
             return False
 
         if len(parts) == 1:
-            token = parts[0]
-            # Однословные запросы вроде "ВТБ" обычно означают организацию.
-            if token.isupper():
-                return False
-            if not re.fullmatch(r"[А-Яа-яЁё-]+", token):
-                return False
+            # Single-token text is ambiguous; treat it as organization in auto mode.
+            return False
         return all(re.fullmatch(r"[А-Яа-яЁё]+", part) for part in parts)
     def _clean_ru_org_name(self, value: str) -> str:
         return re.sub(r"^Организация\s+", "", self._normalize_spaces(value), flags=re.IGNORECASE).strip()
@@ -1051,6 +1047,9 @@ class CompanyWebApp:
         has_bank_marker = any(token.startswith(bank_word) for token in org_tokens)
         if bank_context and has_bank_marker:
             score += 95
+        elif short_brand_query and bank_context:
+            # For short bank-brand queries (e.g. "ВТБ"), deprioritize non-bank legal entities.
+            score -= 135
 
         inn_value = self._normalize_spaces(str(profile.get("inn", "")))
         if short_brand_query and inn_value and inn_value in SHORT_BRAND_KNOWN_INN.values():
@@ -1086,6 +1085,9 @@ class CompanyWebApp:
             return False
 
         bank_word = "банк"
+        known_bank_inn = SHORT_BRAND_KNOWN_INN.get(brand_token)
+        bank_brand_query = brand_token in SHORT_BRAND_BANK_HINTS
+
         for hit in hits:
             data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
             org_name = self._normalize_spaces(str(data.get("ru_org", "")))
@@ -1103,9 +1105,23 @@ class CompanyWebApp:
                 continue
 
             inn_value = self._normalize_spaces(str(data.get("inn", "")))
-            if not re.fullmatch(r"\d{10}|\d{12}", inn_value):
+            inn_is_valid = bool(re.fullmatch(r"\d{10}|\d{12}", inn_value))
+
+            has_bank_marker = any(token.startswith(bank_word) for token in org_tokens)
+            has_bank_phrase = f"{bank_word} {brand_token}" in org_core_lower or f"{brand_token} {bank_word}" in org_core_lower
+
+            if bank_brand_query:
+                if known_bank_inn and inn_value == known_bank_inn:
+                    return True
+                if known_bank_inn and has_bank_marker and has_bank_phrase:
+                    return True
+                if inn_is_valid and has_bank_marker and (has_bank_phrase or self._score_org_relevance(data, query) >= 220):
+                    return True
                 continue
-            if f"{bank_word} {brand_token}" in org_core_lower or f"{brand_token} {bank_word}" in org_core_lower:
+
+            if not inn_is_valid:
+                continue
+            if has_bank_phrase:
                 return True
             if self._score_org_relevance(data, query) >= 200:
                 return True
@@ -1217,12 +1233,13 @@ class CompanyWebApp:
 
         sv_fl = obj.get("СвФЛ")
         if isinstance(sv_fl, dict):
-            surname = self._clean_fio_part(str(sv_fl.get("Фамилия") or ""))
-            name = self._clean_fio_part(str(sv_fl.get("Имя") or ""))
-            middle = self._clean_fio_part(str(sv_fl.get("Отчество") or ""))
+            sv_fl_attrs = sv_fl.get("@attributes") if isinstance(sv_fl.get("@attributes"), dict) else {}
+            surname = self._clean_fio_part(str(sv_fl.get("Фамилия") or sv_fl_attrs.get("Фамилия") or ""))
+            name = self._clean_fio_part(str(sv_fl.get("Имя") or sv_fl_attrs.get("Имя") or ""))
+            middle = self._clean_fio_part(str(sv_fl.get("Отчество") or sv_fl_attrs.get("Отчество") or ""))
             if surname and name:
                 return surname, name, middle
-            fio_full = self._normalize_spaces(str(sv_fl.get("ФИОПолн") or ""))
+            fio_full = self._normalize_spaces(str(sv_fl.get("ФИОПолн") or sv_fl_attrs.get("ФИОПолн") or ""))
             if fio_full:
                 return self._split_fio_ru(fio_full)
 
@@ -1231,9 +1248,10 @@ class CompanyWebApp:
             if fio_str:
                 return self._split_fio_ru(fio_str)
 
-        surname = self._clean_fio_part(str(obj.get("Фамилия") or ""))
-        name = self._clean_fio_part(str(obj.get("Имя") or ""))
-        middle = self._clean_fio_part(str(obj.get("Отчество") or ""))
+        obj_attrs = obj.get("@attributes") if isinstance(obj.get("@attributes"), dict) else {}
+        surname = self._clean_fio_part(str(obj.get("Фамилия") or obj_attrs.get("Фамилия") or ""))
+        name = self._clean_fio_part(str(obj.get("Имя") or obj_attrs.get("Имя") or ""))
+        middle = self._clean_fio_part(str(obj.get("Отчество") or obj_attrs.get("Отчество") or ""))
         if surname and name:
             return surname, name, middle
         return "", "", ""
@@ -2569,7 +2587,12 @@ class CompanyWebApp:
             hits = self._dedup_source_hits(hits + fns_hits)
         return hits
 
-    def _can_stop_provider_search(self, hits: list[dict[str, Any]], search_type: str, input_type: str) -> bool:
+    def _can_stop_provider_search(self, hits: list[dict[str, Any]], search_type: str, input_type: str, query: str = "") -> bool:
+        query_text = self._normalize_spaces(query)
+        if search_type == "company" and input_type == INPUT_TYPE_ORG_TEXT and query_text:
+            if self._has_confident_short_brand_bank_hit(hits, query_text):
+                return True
+
         merged: dict[str, str] = {}
         for hit in hits:
             data = hit.get("data", {})
@@ -2854,7 +2877,7 @@ class CompanyWebApp:
                             hits_by_provider[provider_name] = len(provider_hits)
                             icon = "✅" if provider_hits else "❌"
                             trace.append(f"{icon} Источник: {provider_name} — {state}")
-                            if self._can_stop_provider_search(hits, search_type=search_type, input_type=input_type):
+                            if self._can_stop_provider_search(hits, search_type=search_type, input_type=input_type, query=raw):
                                 trace.append("⏹️ Ранняя остановка")
                                 for pending in futures:
                                     pending.cancel()
@@ -3206,11 +3229,35 @@ class CompanyWebApp:
                     logger.info("FNS nested %s: type=%s", nested_key, type(nested_value).__name__)
 
             director = data.get("director") or {}
-            surname_ru = str(director.get("Фамилия") or director.get("surname") or director.get("surname_ru") or "")
-            name_ru = str(director.get("Имя") or director.get("name") or director.get("name_ru") or "")
-            middle_name_ru = str(director.get("Отчество") or director.get("patronymic") or director.get("middle_name_ru") or "")
-            position = str(director.get("Должность") or director.get("position") or data.get("ru_position") or "")
-
+            director_attrs = director.get("@attributes") if isinstance(director, dict) and isinstance(director.get("@attributes"), dict) else {}
+            surname_ru = str(
+                (director.get("Фамилия") if isinstance(director, dict) else "")
+                or director_attrs.get("Фамилия")
+                or (director.get("surname") if isinstance(director, dict) else "")
+                or (director.get("surname_ru") if isinstance(director, dict) else "")
+                or ""
+            )
+            name_ru = str(
+                (director.get("Имя") if isinstance(director, dict) else "")
+                or director_attrs.get("Имя")
+                or (director.get("name") if isinstance(director, dict) else "")
+                or (director.get("name_ru") if isinstance(director, dict) else "")
+                or ""
+            )
+            middle_name_ru = str(
+                (director.get("Отчество") if isinstance(director, dict) else "")
+                or director_attrs.get("Отчество")
+                or (director.get("patronymic") if isinstance(director, dict) else "")
+                or (director.get("middle_name_ru") if isinstance(director, dict) else "")
+                or ""
+            )
+            position = str(
+                (director.get("Должность") if isinstance(director, dict) else "")
+                or director_attrs.get("Должность")
+                or (director.get("position") if isinstance(director, dict) else "")
+                or data.get("ru_position")
+                or ""
+            )
             if not surname_ru or not name_ru or not middle_name_ru or not position:
                 dol_list: list[dict[str, Any]] = []
                 for candidate in dol_candidates:
@@ -5515,8 +5562,24 @@ class CompanyWebApp:
             trace.append("Пустой запрос после нормализации")
             return [], trace
 
+        brand_token = self._short_brand_token(query_value)
+        short_brand_query = bool(brand_token)
+        quick_provider_names: list[str] | None = None
+        if short_brand_query:
+            if SHORT_BRAND_KNOWN_INN.get(brand_token, ""):
+                quick_provider_names = ["DuckDuckGo HTML", "focus.kontur.ru", "checko.ru"]
+                trace.append("Short-brand quick providers: DuckDuckGo HTML, focus.kontur.ru, checko.ru")
+            else:
+                quick_provider_names = ["DuckDuckGo HTML", "companies.rbc.ru", "focus.kontur.ru", "checko.ru"]
+                trace.append("Short-brand quick providers: DuckDuckGo HTML, companies.rbc.ru, focus.kontur.ru, checko.ru")
+
         hits: list[dict[str, Any]] = []
-        source_hits, source_trace = self._search_external_sources(query_value, no_cache=False, search_type=search_type)
+        source_hits, source_trace = self._search_external_sources(
+            query_value,
+            no_cache=False,
+            search_type=search_type,
+            provider_names=quick_provider_names,
+        )
         trace.extend(source_trace)
         hits.extend(source_hits)
 
@@ -5530,13 +5593,19 @@ class CompanyWebApp:
 
         short_brand_query = bool(self._short_brand_token(query_value))
         if short_brand_query and alt_queries:
+            prioritized_alt_queries = sorted(
+                alt_queries,
+                key=lambda item: (0 if "банк" in item.lower() else 1, len(item)),
+            )
+            max_alt_queries = min(2, len(prioritized_alt_queries))
             if self._has_confident_short_brand_bank_hit(hits, query_value):
                 trace.append("Короткий брендовый запрос: найден уверенный банк-кандидат в базовой выдаче")
             else:
                 trace.append("Короткий брендовый запрос: расширяем поиск по вариантам названия")
-                for alt_query in alt_queries:
+                trace.append(f"Лимит альтернативных запросов: {max_alt_queries}")
+                for alt_query in prioritized_alt_queries[:max_alt_queries]:
                     trace.append(f"Попытка: {alt_query}")
-                    alt_hits, alt_trace = self._search_external_sources(alt_query, no_cache=False, search_type=search_type)
+                    alt_hits, alt_trace = self._search_external_sources(alt_query, no_cache=False, search_type=search_type, provider_names=quick_provider_names)
                     trace.extend(alt_trace)
                     hits.extend(alt_hits)
                     preview_hits = self._dedup_source_hits(hits)
@@ -5548,7 +5617,7 @@ class CompanyWebApp:
             trace.append("Ничего не найдено, пробуем альтернативные написания")
             for alt_query in alt_queries:
                 trace.append(f"Попытка: {alt_query}")
-                alt_hits, alt_trace = self._search_external_sources(alt_query, no_cache=False, search_type=search_type)
+                alt_hits, alt_trace = self._search_external_sources(alt_query, no_cache=False, search_type=search_type, provider_names=quick_provider_names)
                 trace.extend(alt_trace)
                 if alt_hits:
                     hits.extend(alt_hits)
@@ -5627,7 +5696,8 @@ class CompanyWebApp:
                 candidates = self._build_person_candidates(source_hits, full_name, search_type=search_type)
             elif params.get("company"):
                 trace.append(f"Поиск по названию компании: {params['company']}")
-                source_hits, source_trace = self._search_by_company(params["company"], search_type=search_type)
+                trace.append("AUTO->COMPANY: включен company-mode для корректного выбора по бренду")
+                source_hits, source_trace = self._search_by_company(params["company"], search_type="company")
                 trace.extend(source_trace)
                 queried_providers.update(hit.get("source", "") for hit in source_hits)
 
@@ -5994,9 +6064,6 @@ class CompanyWebApp:
                 leader_valid_for_company = self._leader_matches_company_profile(profile, field_sources, source_hits)
                 if not leader_valid_for_company:
                     self._clear_profile_leader_fields(profile, field_sources)
-                    profile["ru_position"] = ""
-                    profile["en_position"] = ""
-                    profile["position"] = ""
                     logger.info("company_leader_clear: removed mismatched leader fields")
 
             if logger.isEnabledFor(logging.DEBUG):

@@ -5,15 +5,87 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
+import sys
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
+
+
+_OPTIONAL_DEPS_DIR = Path(__file__).resolve().parents[1] / ".deps"
+if _OPTIONAL_DEPS_DIR.exists():
+    sys.path.insert(0, str(_OPTIONAL_DEPS_DIR))
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:  # noqa: BLE001
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+
+try:
+    import fitz
+except Exception:  # noqa: BLE001
+    fitz = None
+
+
+def _configure_tk_env_for_frozen() -> None:
+    if not getattr(sys, "frozen", False):
+        return
+
+    roots: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        roots.append(Path(meipass))
+
+    exe_dir = Path(sys.executable).resolve().parent
+    roots.append(exe_dir / "_internal")
+    roots.append(exe_dir)
+
+    tcl_dirs = ("_tcl_data", "tcl8.6", "tcl8", "tcl")
+    tk_dirs = ("_tk_data", "tk8.6", "tk8", "tk")
+
+    tcl_candidate: Path | None = None
+    tk_candidate: Path | None = None
+
+    for root in roots:
+        if not root.exists():
+            continue
+
+        if tcl_candidate is None:
+            for folder in tcl_dirs:
+                candidate = root / folder
+                if (candidate / "init.tcl").exists():
+                    tcl_candidate = candidate
+                    break
+
+        if tk_candidate is None:
+            for folder in tk_dirs:
+                candidate = root / folder
+                if (candidate / "tk.tcl").exists() or (candidate / "ttk" / "ttk.tcl").exists():
+                    tk_candidate = candidate
+                    break
+
+        if tcl_candidate is not None and tk_candidate is not None:
+            break
+
+    if tcl_candidate is not None:
+        os.environ["TCL_LIBRARY"] = str(tcl_candidate)
+    if tk_candidate is not None:
+        os.environ["TK_LIBRARY"] = str(tk_candidate)
+
+
+_configure_tk_env_for_frozen()
+
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from app_paths import configure_runtime_env
 from logging_setup import setup_logging
-from main import CompanyWebApp
+from main import CompanyWebApp, SHORT_BRAND_BANK_HINTS, SHORT_BRAND_KNOWN_INN
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +117,23 @@ class NativeNadinApp(tk.Tk):
 
         self.candidates: list[dict[str, Any]] = []
         self._busy = False
+        self._screenshot_busy = False
         self._suppress_variant_event = False
         self._last_autofill_key = ""
         self._current_card_rows: list[tuple[str, str]] = []
+        self._active_search_token = 0
+        self._active_autofill_token = 0
+        self._card_drag_anchor: str | None = None
+        self._entry_undo_state: dict[str, tuple[str, int, int]] = {}
+
+        self._last_source_url = ""
+        self._pending_source_url = ""
+        self._last_screenshot_path = ""
+        self._screenshot_preview_image: tk.PhotoImage | None = None
+
+        app_data_dir = Path(os.getenv("APP_DATA_DIR", os.getcwd()))
+        self._screenshot_dir = app_data_dir / "screenshots"
+        self._screenshot_dir.mkdir(parents=True, exist_ok=True)
 
         self.surname_var = tk.StringVar()
         self.name_var = tk.StringVar()
@@ -56,6 +142,8 @@ class NativeNadinApp(tk.Tk):
         self.company_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Готово")
         self.card_title_var = tk.StringVar(value="Карточка")
+        self.screenshot_meta_var = tk.StringVar(value="Скриншот источника: —")
+        self.source_url_var = tk.StringVar(value="URL источника: —")
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -73,7 +161,11 @@ class NativeNadinApp(tk.Tk):
         ]
         for col, (label, var) in enumerate(fields):
             ttk.Label(top, text=label).grid(row=0, column=col, sticky="w", padx=(0, 8))
-            ttk.Entry(top, textvariable=var, width=22).grid(row=1, column=col, sticky="ew", padx=(0, 8))
+            entry = ttk.Entry(top, textvariable=var, width=22)
+            entry.grid(row=1, column=col, sticky="ew", padx=(0, 8))
+            self._bind_entry_shortcuts(entry)
+            entry.bind("<Return>", self._on_enter_pressed)
+            entry.bind("<KP_Enter>", self._on_enter_pressed)
             top.columnconfigure(col, weight=1)
 
         action_frame = ttk.Frame(self, padding=(10, 0, 10, 8))
@@ -81,13 +173,21 @@ class NativeNadinApp(tk.Tk):
         self.search_button = ttk.Button(action_frame, text="Найти", command=self._search)
         self.search_button.pack(side=tk.LEFT)
 
-        self.copy_card_button = ttk.Button(action_frame, text="Скопировать карточку", command=self._copy_card_to_clipboard)
+        self.copy_card_button = ttk.Button(action_frame, text="Копировать карточку", command=self._copy_full_card)
         self.copy_card_button.pack(side=tk.LEFT, padx=(8, 0))
 
-        self.copy_field_button = ttk.Button(action_frame, text="Скопировать поле", command=self._copy_selected_card_value)
-        self.copy_field_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.screenshot_button = ttk.Button(action_frame, text="Скриншот источника", command=self._capture_source_screenshot_manual)
+        self.screenshot_button.pack(side=tk.LEFT, padx=(8, 0))
 
-        self.progress = ttk.Progressbar(action_frame, mode="indeterminate", length=220)
+        self.download_screenshot_button = ttk.Button(
+            action_frame,
+            text="Скачать скриншот",
+            command=self._download_screenshot,
+            state=tk.DISABLED,
+        )
+        self.download_screenshot_button.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.progress = ttk.Progressbar(action_frame, mode="indeterminate", length=260)
         self.progress.pack(side=tk.LEFT, padx=(16, 0), fill=tk.X)
 
         split = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
@@ -103,7 +203,7 @@ class NativeNadinApp(tk.Tk):
             card_container,
             columns=("field", "value"),
             show="headings",
-            selectmode="browse",
+            selectmode="extended",
             height=18,
         )
         self.card_tree.heading("field", text="Поле")
@@ -118,7 +218,12 @@ class NativeNadinApp(tk.Tk):
         card_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
         card_container.bind("<Configure>", self._on_card_container_resize)
         self.card_tree.bind("<Control-c>", self._copy_selected_card_value)
+        self.card_tree.bind("<Control-C>", self._copy_selected_card_value)
+        self.card_tree.bind("<Control-a>", self._select_all_card_rows)
+        self.card_tree.bind("<Control-A>", self._select_all_card_rows)
         self.card_tree.bind("<Double-1>", self._copy_selected_card_value)
+        self.card_tree.bind("<ButtonPress-1>", self._on_card_tree_button_press, add="+")
+        self.card_tree.bind("<B1-Motion>", self._on_card_tree_drag, add="+")
 
         variants_frame = ttk.Frame(split)
         split.add(variants_frame, weight=8)
@@ -146,6 +251,18 @@ class NativeNadinApp(tk.Tk):
         variants_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
         variants_container.bind("<Configure>", self._on_variants_container_resize)
         self.result_tree.bind("<<TreeviewSelect>>", self._on_variant_selected)
+        self.result_tree.bind("<Control-c>", self._copy_selected_variant_value)
+        self.result_tree.bind("<Control-C>", self._copy_selected_variant_value)
+
+        screenshot_frame = ttk.LabelFrame(self, text="Скриншот источника", padding=(8, 6))
+        screenshot_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self.screenshot_preview_label = ttk.Label(screenshot_frame, text="Превью отсутствует", anchor="center", width=44)
+        self.screenshot_preview_label.pack(side=tk.LEFT, padx=(0, 10))
+
+        screenshot_info = ttk.Frame(screenshot_frame)
+        screenshot_info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttk.Label(screenshot_info, textvariable=self.screenshot_meta_var).pack(anchor="w")
+        ttk.Label(screenshot_info, textvariable=self.source_url_var, wraplength=740).pack(anchor="w", pady=(4, 0))
 
         trace_frame = ttk.Frame(self)
         trace_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(0, 10))
@@ -156,7 +273,144 @@ class NativeNadinApp(tk.Tk):
         status = ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor="w", padding=(8, 4))
         status.pack(fill=tk.X, side=tk.BOTTOM)
 
+        self.bind("<Return>", self._on_enter_pressed)
+        self.bind("<KP_Enter>", self._on_enter_pressed)
+
         self._render_card_rows([], "Карточка")
+
+    def _bind_entry_shortcuts(self, entry: ttk.Entry) -> None:
+        shortcuts = [
+            ("<Control-c>", "<<Copy>>"),
+            ("<Control-C>", "<<Copy>>"),
+            ("<Control-Insert>", "<<Copy>>"),
+            ("<Control-x>", "<<Cut>>"),
+            ("<Control-X>", "<<Cut>>"),
+            ("<Shift-Delete>", "<<Cut>>"),
+            ("<Control-v>", "<<Paste>>"),
+            ("<Control-V>", "<<Paste>>"),
+            ("<Shift-Insert>", "<<Paste>>"),
+            ("<Control-z>", "<<Undo>>"),
+            ("<Control-Z>", "<<Undo>>"),
+            ("<Control-a>", "<<SelectAll>>"),
+            ("<Control-A>", "<<SelectAll>>"),
+        ]
+        for sequence, virtual_event in shortcuts:
+            entry.bind(sequence, lambda event, ve=virtual_event: self._entry_generate_virtual(event, ve))
+
+        # Layout-independent shortcuts by physical key (Windows keycodes).
+        entry.bind("<Control-KeyPress>", self._entry_handle_ctrl_key, add="+")
+
+    def _entry_handle_ctrl_key(self, event: tk.Event) -> str | None:
+        keycode = int(getattr(event, "keycode", -1))
+        char = str(getattr(event, "char", "")).lower()
+        keysym = str(getattr(event, "keysym", "")).lower()
+
+        mapping = {
+            67: "<<Copy>>",      # C
+            86: "<<Paste>>",     # V
+            88: "<<Cut>>",       # X
+            90: "<<Undo>>",      # Z
+            65: "<<SelectAll>>", # A
+        }
+        virtual_event = mapping.get(keycode)
+        if not virtual_event:
+            fallback_by_key = {
+                "c": "<<Copy>>",
+                "v": "<<Paste>>",
+                "x": "<<Cut>>",
+                "z": "<<Undo>>",
+                "a": "<<SelectAll>>",
+            }
+            virtual_event = fallback_by_key.get(keysym) or fallback_by_key.get(char)
+        if not virtual_event:
+            return None
+        return self._entry_generate_virtual(event, virtual_event)
+
+    def _entry_generate_virtual(self, event: tk.Event, virtual_event: str) -> str:
+        widget = event.widget
+        if not isinstance(widget, (tk.Entry, ttk.Entry)):
+            return "break"
+
+        if virtual_event == "<<Undo>>":
+            self._entry_restore_last_state(widget)
+            return "break"
+
+        if virtual_event == "<<SelectAll>>":
+            try:
+                widget.selection_range(0, tk.END)
+                widget.icursor(tk.END)
+            except tk.TclError:
+                pass
+            return "break"
+
+        if virtual_event in {"<<Paste>>", "<<Cut>>"}:
+            self._entry_remember_state(widget)
+
+        try:
+            widget.event_generate(virtual_event)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _entry_remember_state(self, widget: tk.Entry | ttk.Entry) -> None:
+        value = widget.get()
+        try:
+            sel_start = int(widget.index("sel.first"))
+            sel_end = int(widget.index("sel.last"))
+        except tk.TclError:
+            cursor = int(widget.index(tk.INSERT))
+            sel_start = cursor
+            sel_end = cursor
+        self._entry_undo_state[str(widget)] = (value, sel_start, sel_end)
+
+    def _entry_restore_last_state(self, widget: tk.Entry | ttk.Entry) -> None:
+        snapshot = self._entry_undo_state.get(str(widget))
+        if snapshot is None:
+            return
+        value, sel_start, sel_end = snapshot
+
+        try:
+            widget.delete(0, tk.END)
+            widget.insert(0, value)
+            if sel_end > sel_start:
+                widget.selection_range(sel_start, sel_end)
+            widget.icursor(sel_end)
+        except tk.TclError:
+            pass
+
+    def _on_enter_pressed(self, _event: tk.Event | None = None) -> str:
+        self._search()
+        return "break"
+
+    def _on_card_tree_button_press(self, event: tk.Event) -> None:
+        row_id = self.card_tree.identify_row(event.y)
+        self._card_drag_anchor = row_id or None
+
+    def _on_card_tree_drag(self, event: tk.Event) -> str:
+        if not self._card_drag_anchor:
+            return "break"
+        row_id = self.card_tree.identify_row(event.y)
+        if not row_id:
+            return "break"
+
+        children = list(self.card_tree.get_children(""))
+        try:
+            start = children.index(self._card_drag_anchor)
+            end = children.index(row_id)
+        except ValueError:
+            return "break"
+
+        lo, hi = sorted((start, end))
+        self.card_tree.selection_set(children[lo : hi + 1])
+        self.card_tree.focus(row_id)
+        return "break"
+
+    def _select_all_card_rows(self, _event: object | None = None) -> str:
+        rows = list(self.card_tree.get_children(""))
+        if rows:
+            self.card_tree.selection_set(rows)
+            self.card_tree.focus(rows[0])
+        return "break"
 
     def _on_card_container_resize(self, event: tk.Event) -> None:
         total_width = max(int(event.width) - 28, 340)
@@ -178,8 +432,11 @@ class NativeNadinApp(tk.Tk):
         self._busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
         self.search_button.configure(state=state)
-        self.copy_card_button.configure(state=state)
-        self.copy_field_button.configure(state=state)
+        self.screenshot_button.configure(state=tk.DISABLED if (busy or self._screenshot_busy) else tk.NORMAL)
+
+        download_state = tk.NORMAL if (not busy and not self._screenshot_busy and self._last_screenshot_path) else tk.DISABLED
+        self.download_screenshot_button.configure(state=download_state)
+
         if busy:
             self.progress.start(12)
             self.configure(cursor="watch")
@@ -207,6 +464,9 @@ class NativeNadinApp(tk.Tk):
             messagebox.showwarning("Nadin", "Заполните хотя бы одно поле")
             return
 
+        self._active_search_token += 1
+        search_token = self._active_search_token
+
         self._set_busy(True, "Поиск...")
         self._last_autofill_key = ""
 
@@ -220,9 +480,15 @@ class NativeNadinApp(tk.Tk):
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Search failed")
                 error = str(exc)
-            self.after(0, lambda: self._on_search_done(params, source_hits, backend_candidates, trace, error))
+            self.after(0, lambda: self._on_search_done(params, source_hits, backend_candidates, trace, error, search_token))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _brand_known_inn_for_query(self, query: str) -> str:
+        token = self.engine._short_brand_token(self.engine._normalize_spaces(query))
+        if not token:
+            return ""
+        return SHORT_BRAND_KNOWN_INN.get(token, "")
 
     def _candidate_looks_like_company(self, item: dict[str, Any]) -> bool:
         hit_type = self.engine._normalize_spaces(str(item.get("type", ""))).lower()
@@ -231,21 +497,68 @@ class NativeNadinApp(tk.Tk):
         org = self.engine._normalize_spaces(str(item.get("org_ru", "")))
         return bool(org)
 
-    def _candidate_key(self, candidate: dict[str, Any]) -> str:
+    def _candidate_identity(self, candidate: dict[str, Any]) -> str:
         inn = self.engine._normalize_spaces(str(candidate.get("inn", "")))
-        org = self.engine._normalize_spaces(str(candidate.get("org_ru", ""))).lower()
-        src = self.engine._normalize_spaces(str(candidate.get("source", ""))).lower()
         if inn:
             return f"inn:{inn}"
+        org = self.engine._normalize_spaces(str(candidate.get("org_ru", "")).lower())
+        src = self.engine._normalize_spaces(str(candidate.get("source", "")).lower())
         return f"org:{org}|src:{src}"
+
+    def _candidate_key(self, candidate: dict[str, Any], query_for_autofill: str = "") -> str:
+        query = self.engine._normalize_spaces(query_for_autofill)
+        return f"{self._candidate_identity(candidate)}|query:{query}"
+
+    def _normalize_backend_candidate(self, item: dict[str, Any], query: str) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+
+        org = self._clean_org_for_list(str(item.get("org_ru", "")), str(item.get("inn", "")))
+        if not org:
+            return None
+
+        inn = self.engine._normalize_spaces(str(item.get("inn", "")))
+        if inn and not re.fullmatch(r"\d{10}|\d{12}", inn):
+            inn = ""
+
+        source_name = self.engine._normalize_spaces(str(item.get("source", ""))) or "—"
+        known_inn = self._brand_known_inn_for_query(query)
+        org_lower = org.lower()
+
+        score = 1000.0
+        if known_inn and inn == known_inn:
+            score += 500.0
+        if known_inn and inn and inn != known_inn and "банк" not in org_lower:
+            score -= 180.0
+
+        return {
+            "data": {},
+            "source": source_name,
+            "type": "company",
+            "url": "",
+            "score": score,
+            "fio_ru": self.engine._normalize_spaces(str(item.get("fio_ru", ""))),
+            "org_ru": org,
+            "position_ru": self.engine._normalize_spaces(str(item.get("position_ru", ""))),
+            "inn": inn,
+            "query_for_autofill": inn or self.engine._normalize_spaces(str(item.get("query_for_autofill", ""))) or org,
+            "revenue": str(item.get("revenue", "") or ""),
+            "source_names": [source_name],
+        }
 
     def _build_company_candidates_from_hits(self, source_hits: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
         by_key: dict[str, dict[str, Any]] = {}
         q_norm = self.engine._normalize_spaces(query)
+        brand_token = self.engine._short_brand_token(q_norm)
+        known_inn = SHORT_BRAND_KNOWN_INN.get(brand_token, "") if brand_token else ""
+        bank_context = bool(brand_token and brand_token in SHORT_BRAND_BANK_HINTS)
 
         for hit in source_hits:
             if not isinstance(hit, dict):
                 continue
+            if not self.engine._hit_looks_like_company(hit):
+                continue
+
             data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
             org = self._clean_org_for_list(str(data.get("ru_org", "")), str(data.get("inn", "")))
             if not org:
@@ -257,16 +570,33 @@ class NativeNadinApp(tk.Tk):
             if inn and not re.fullmatch(r"\d{10}|\d{12}", inn):
                 inn = ""
 
-            source_name = self.engine._normalize_spaces(str(hit.get("source", ""))) or "—"
-            score = self.engine._score_org_relevance(data, q_norm) + self.engine._score_hit(hit, q_norm)
-            key = inn or f"org:{org.lower()}"
+            org_lower = org.lower()
+            is_bank_brand_title = bool(bank_context and brand_token and brand_token in org_lower and "банк" in org_lower)
+            if known_inn and is_bank_brand_title and not inn:
+                inn = known_inn
 
+            source_name = self.engine._normalize_spaces(str(hit.get("source", ""))) or "?"
+            score = float(self.engine._score_hit(hit, q_norm))
+
+            if known_inn and inn == known_inn:
+                score += 500.0
+            if known_inn and inn and inn != known_inn and (bank_context or (brand_token and brand_token in org_lower)):
+                score -= 220.0
+            if bank_context:
+                if is_bank_brand_title:
+                    score += 220.0
+                elif "банк" in org_lower:
+                    score += 130.0
+                elif brand_token and brand_token in org_lower:
+                    score -= 180.0
+
+            key = inn or f"org:{org.lower()}"
             candidate = {
                 "data": data,
                 "source": source_name,
                 "type": "company",
                 "url": str(hit.get("url", "")),
-                "score": float(score),
+                "score": score,
                 "fio_ru": " ".join(
                     x
                     for x in [
@@ -280,7 +610,7 @@ class NativeNadinApp(tk.Tk):
                 "position_ru": self.engine._normalize_spaces(str(data.get("ru_position", ""))),
                 "inn": inn,
                 "query_for_autofill": inn or org,
-                "revenue": str(self.engine._parse_money_amount(data.get("revenue", 0))),
+                "revenue": str(self.engine._parse_financial_amount(data.get("revenue", 0))),
                 "source_names": [source_name],
             }
 
@@ -310,7 +640,7 @@ class NativeNadinApp(tk.Tk):
         for item in candidates:
             source_names = [self.engine._normalize_spaces(str(x)) for x in item.get("source_names", []) if self.engine._normalize_spaces(str(x))]
             item["source"] = ", ".join(source_names) if source_names else self.engine._normalize_spaces(str(item.get("source", "")))
-            item["score"] = f"{float(item.get('score', 0)):.2f}"
+            item["score"] = float(item.get("score", 0))
         return candidates[:20]
 
     def _prepare_candidates(self, params: dict[str, str], source_hits: list[dict[str, Any]], backend_candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -322,12 +652,27 @@ class NativeNadinApp(tk.Tk):
             and not params.get("middle_name")
         )
 
-        if company_only_query:
-            company_candidates = self._build_company_candidates_from_hits(source_hits, params.get("company", ""))
-            if company_candidates:
-                return company_candidates
+        if not company_only_query:
+            return backend_candidates
 
-        return backend_candidates
+        from_hits = self._build_company_candidates_from_hits(source_hits, params.get("company", ""))
+        from_backend: list[dict[str, Any]] = []
+        for backend_item in backend_candidates:
+            normalized = self._normalize_backend_candidate(backend_item, params.get("company", ""))
+            if normalized is not None:
+                from_backend.append(normalized)
+
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for group in (from_backend, from_hits):
+            for item in group:
+                key = self._candidate_identity(item)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+
+        return merged if merged else backend_candidates
 
     def _on_search_done(
         self,
@@ -336,7 +681,11 @@ class NativeNadinApp(tk.Tk):
         backend_candidates: list[dict[str, Any]],
         trace: list[str],
         error: str,
+        search_token: int,
     ) -> None:
+        if search_token != self._active_search_token:
+            return
+
         self._set_busy(False)
         if error:
             self.status_var.set("Ошибка поиска")
@@ -374,7 +723,6 @@ class NativeNadinApp(tk.Tk):
                 self.result_tree.focus("0")
             finally:
                 self._suppress_variant_event = False
-            self._render_candidate_preview(candidates[0])
             self._autofill_candidate(candidates[0], reason="single_match")
         else:
             self._render_card_rows(
@@ -419,7 +767,6 @@ class NativeNadinApp(tk.Tk):
         candidate = self._selected_candidate()
         if candidate is None:
             return
-        self._render_candidate_preview(candidate)
         self._autofill_candidate(candidate, reason="selected_variant")
 
     def _profile_from_candidate(self, candidate: dict[str, Any]) -> dict[str, str]:
@@ -475,23 +822,46 @@ class NativeNadinApp(tk.Tk):
         )
         self._render_card_rows(rows, "Предпросмотр карточки")
 
+    def _resolve_query_for_autofill(self, candidate: dict[str, Any]) -> str:
+        candidate_inn = self.engine._normalize_spaces(str(candidate.get("inn", "")))
+        if candidate_inn and re.fullmatch(r"\d{10}|\d{12}", candidate_inn):
+            query_for_autofill = candidate_inn
+        else:
+            query_for_autofill = self.engine._normalize_spaces(str(candidate.get("query_for_autofill", "")))
+
+        if not query_for_autofill:
+            query_for_autofill = self.company_var.get().strip() or self.inn_var.get().strip()
+
+        company_query = self.engine._normalize_spaces(self.company_var.get())
+        selected_org = self.engine._normalize_spaces(str(candidate.get("org_ru", ""))).lower()
+        brand_token = self.engine._short_brand_token(company_query)
+        known_bank_inn = SHORT_BRAND_KNOWN_INN.get(brand_token, "") if brand_token else ""
+
+        if (
+            known_bank_inn
+            and brand_token in SHORT_BRAND_BANK_HINTS
+            and not self.inn_var.get().strip()
+            and (not candidate_inn or candidate_inn != known_bank_inn)
+            and "банк" not in selected_org
+        ):
+            query_for_autofill = known_bank_inn
+
+        return self.engine._normalize_spaces(query_for_autofill)
+
     def _autofill_candidate(self, candidate: dict[str, Any], reason: str = "") -> None:
         if self._busy:
             return
 
-        query_for_autofill = self.engine._normalize_spaces(str(candidate.get("inn", "")))
-        if not query_for_autofill:
-            query_for_autofill = self.engine._normalize_spaces(str(candidate.get("query_for_autofill", "")))
-        if not query_for_autofill:
-            query_for_autofill = self.company_var.get().strip() or self.inn_var.get().strip()
-
+        query_for_autofill = self._resolve_query_for_autofill(candidate)
         if not query_for_autofill:
             return
 
-        key = self._candidate_key(candidate)
-        if key and key == self._last_autofill_key:
+        key = self._candidate_key(candidate, query_for_autofill)
+        if key and key == self._last_autofill_key and reason == "selected_variant":
             return
         self._last_autofill_key = key
+
+        self._pending_source_url = self.engine._normalize_spaces(str(candidate.get("url", "")))
 
         hit_type = self.engine._normalize_spaces(str(candidate.get("type", ""))).lower()
         if hit_type not in {"company", "person"}:
@@ -509,8 +879,13 @@ class NativeNadinApp(tk.Tk):
             "search_type": [forced_search_type],
         }
 
+        self._render_card_rows([("Статус", "Формирование карточки...")], "Карточка")
+
         status_suffix = " (выбран вариант)" if reason == "selected_variant" else ""
         self._set_busy(True, f"Формирование карточки{status_suffix}...")
+
+        self._active_autofill_token += 1
+        autofill_token = self._active_autofill_token
 
         def worker() -> None:
             error = ""
@@ -533,11 +908,14 @@ class NativeNadinApp(tk.Tk):
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Autofill failed")
                 error = str(exc)
-            self.after(0, lambda: self._on_autofill_done(card_id, error))
+            self.after(0, lambda: self._on_autofill_done(card_id, error, autofill_token))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_autofill_done(self, card_id: int, error: str) -> None:
+    def _on_autofill_done(self, card_id: int, error: str, autofill_token: int) -> None:
+        if autofill_token != self._active_autofill_token:
+            return
+
         self._set_busy(False)
         if error:
             self.status_var.set("Не удалось сформировать карточку")
@@ -546,6 +924,8 @@ class NativeNadinApp(tk.Tk):
 
         self._show_card(card_id)
         self.status_var.set(f"Карточка #{card_id} сформирована")
+        if self._last_source_url:
+            self.after(120, lambda: self._capture_source_screenshot(auto=True))
 
     def _compose_card_rows(
         self,
@@ -606,6 +986,326 @@ class NativeNadinApp(tk.Tk):
             names.append(source_name)
         return names
 
+    def _extract_source_url(self, payload: dict[str, Any], fallback_url: str = "") -> str:
+        candidates: list[tuple[str, dict[str, Any], bool]] = []
+        source_hits = payload.get("source_hits", []) if isinstance(payload, dict) else []
+        if isinstance(source_hits, list):
+            for hit in source_hits:
+                if not isinstance(hit, dict):
+                    continue
+                candidate_url = self.engine._normalize_spaces(str(hit.get("url", "")))
+                if candidate_url:
+                    candidates.append((candidate_url, hit, False))
+
+                fns_pdf_candidate = self._find_fns_pdf_candidate(hit)
+                if fns_pdf_candidate:
+                    candidates.append((fns_pdf_candidate, hit, False))
+
+        fallback = self.engine._normalize_spaces(fallback_url)
+        if fallback:
+            candidates.append((fallback, {}, True))
+
+        scored: list[tuple[int, str]] = []
+        seen_urls: set[str] = set()
+        for raw_url, hit, is_fallback in candidates:
+            normalized = self._normalize_source_url_for_screenshot(raw_url, hit)
+            if not normalized:
+                continue
+            key = normalized.lower()
+            if key in seen_urls:
+                continue
+            seen_urls.add(key)
+            score = self._score_source_url_for_screenshot(normalized, is_fallback=is_fallback)
+            scored.append((score, normalized))
+
+        if not scored:
+            return ""
+
+        scored.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+        best_score, best_url = scored[0]
+        # Do not use landing pages when no reliable result URL is available.
+        if best_score < 0:
+            return ""
+        return best_url
+
+    def _score_source_url_for_screenshot(self, source_url: str, *, is_fallback: bool = False) -> int:
+        normalized = self.engine._normalize_spaces(source_url)
+        if not normalized:
+            return -1000
+
+        if normalized.startswith("file://"):
+            parsed = urlparse(normalized)
+            local_path = unquote(parsed.path)
+            if re.match(r"^/[a-zA-Z]:", local_path):
+                local_path = local_path[1:]
+            path = Path(local_path)
+            if path.suffix.lower() == ".pdf":
+                return 320
+            return 250
+
+        if normalized.startswith("http://") or normalized.startswith("https://"):
+            parsed = urlparse(normalized)
+        else:
+            local_path = Path(normalized)
+            try:
+                if local_path.exists():
+                    if local_path.suffix.lower() == ".pdf":
+                        return 310
+                    return 200
+            except OSError:
+                return -1000
+            return -1000
+
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        query = parsed.query.lower()
+
+        score = 0
+        if is_fallback:
+            score += 120
+
+        if self._is_machine_source_url(normalized):
+            score -= 400
+
+        if self._is_search_engine_url(normalized):
+            score -= 300
+
+        if self._is_generic_landing_url(normalized):
+            score -= 260
+
+        detail_markers = (
+            "/company/",
+            "/id/",
+            "/ul/",
+            "/person/",
+            "/organization/",
+            "/org/",
+            "/card/",
+        )
+        if any(marker in path for marker in detail_markers):
+            score += 220
+
+        trusted_hosts = (
+            "zachestnyibiznes.ru",
+            "companies.rbc.ru",
+            "rusprofile.ru",
+            "focus.kontur.ru",
+            "checko.ru",
+            "list-org.com",
+        )
+        if any(host.endswith(domain) for domain in trusted_hosts):
+            score += 140
+
+        if host.endswith("nalog.ru") and "query=" in query:
+            score += 20
+
+        if host == "egrul.itsoft.ru":
+            score -= 500
+
+        if host.endswith("egrul.nalog.ru") and path in {"", "/", "/index.html"}:
+            score -= 240
+        if host.endswith("nalog.ru") and path in {"", "/", "/index.html"} and "query=" in query:
+            score -= 240
+
+        return score
+
+    def _is_search_engine_url(self, source_url: str) -> bool:
+        parsed = urlparse(source_url)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        return (
+            "duckduckgo.com" in host
+            or "google." in host
+            or "yandex." in host
+            or ("bing.com" in host and "/search" in path)
+        )
+
+    def _is_generic_landing_url(self, source_url: str) -> bool:
+        parsed = urlparse(source_url)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower().rstrip("/")
+
+        if host.endswith("nalog.ru") and path in {"", "/index.html", "/"}:
+            return True
+        if host.endswith("egrul.nalog.ru") and path in {"", "/index.html", "/"}:
+            return True
+        return False
+
+    def _is_machine_source_url(self, source_url: str) -> bool:
+        normalized = self.engine._normalize_spaces(source_url)
+        if not (normalized.startswith("http://") or normalized.startswith("https://")):
+            return True
+
+        parsed = urlparse(normalized)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        query = parsed.query.lower()
+
+        if host == "egrul.itsoft.ru":
+            return True
+        if path.endswith(".json"):
+            return True
+        if "/api/" in path:
+            return True
+        if "format=json" in query or "output=json" in query:
+            return True
+        return False
+
+    def _normalize_source_url_for_screenshot(self, source_url: str, hit: dict[str, Any] | None = None) -> str:
+        normalized = self.engine._normalize_spaces(source_url)
+        if not normalized:
+            return ""
+        if normalized.startswith("file://"):
+            return normalized
+        if normalized.startswith("http://") or normalized.startswith("https://"):
+            parsed = urlparse(normalized)
+        else:
+            local_path = Path(normalized)
+            try:
+                if local_path.exists():
+                    return str(local_path.resolve())
+            except OSError:
+                return ""
+            return ""
+
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+
+        inn = ""
+        if isinstance(hit, dict):
+            data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+            inn = self.engine._normalize_spaces(str(data.get("inn", "")))
+        if not inn:
+            inn_match = re.search(r"(\d{10,12})", path)
+            if inn_match:
+                inn = inn_match.group(1)
+
+        if host == "egrul.itsoft.ru" and path.endswith(".json"):
+            if isinstance(hit, dict):
+                fns_pdf_candidate = self._find_fns_pdf_candidate(hit)
+                if fns_pdf_candidate:
+                    return fns_pdf_candidate
+            return ""
+
+        return normalized
+
+    def _candidate_pdf_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        seen: set[str] = set()
+        env_candidates = [
+            os.getenv("USERPROFILE", ""),
+            os.getenv("HOMEDRIVE", "") + os.getenv("HOMEPATH", ""),
+            os.getenv("APP_DATA_DIR", ""),
+            os.getcwd(),
+        ]
+        for raw in env_candidates:
+            path_text = self.engine._normalize_spaces(raw)
+            if not path_text:
+                continue
+            root = Path(path_text)
+            try:
+                exists_root = root.exists()
+            except OSError:
+                continue
+            if not exists_root:
+                continue
+            try:
+                key = str(root.resolve()).lower()
+            except OSError:
+                key = str(root.absolute()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append(root)
+            downloads = root / "Downloads"
+            try:
+                downloads_exists = downloads.exists()
+            except OSError:
+                downloads_exists = False
+            if downloads_exists:
+                try:
+                    d_key = str(downloads.resolve()).lower()
+                except OSError:
+                    d_key = str(downloads.absolute()).lower()
+                if d_key not in seen:
+                    seen.add(d_key)
+                    roots.append(downloads)
+        return roots
+
+    def _find_latest_pdf(self, patterns: list[tuple[str, bool]]) -> str:
+        best_path: Path | None = None
+        best_mtime = -1.0
+        now_ts = datetime.now().timestamp()
+        max_generic_age_seconds = 60 * 60 * 24 * 14
+
+        for root in self._candidate_pdf_roots():
+            for pattern, is_generic in patterns:
+                try:
+                    iterator = root.glob(pattern)
+                except Exception:  # noqa: BLE001
+                    continue
+                try:
+                    for candidate in iterator:
+                        if not candidate.is_file():
+                            continue
+                        if candidate.suffix.lower() != ".pdf":
+                            continue
+                        try:
+                            mtime = candidate.stat().st_mtime
+                        except OSError:
+                            continue
+                        if is_generic and (now_ts - mtime) > max_generic_age_seconds:
+                            continue
+                        if mtime > best_mtime:
+                            best_mtime = mtime
+                            best_path = candidate
+                except OSError:
+                    continue
+
+        if best_path is None:
+            return ""
+        return str(best_path.resolve())
+
+    def _find_fns_pdf_candidate(self, hit: dict[str, Any]) -> str:
+        if not isinstance(hit, dict):
+            return ""
+
+        raw_url = self.engine._normalize_spaces(str(hit.get("url", "")))
+        if not raw_url:
+            return ""
+        parsed = urlparse(raw_url)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        if host != "egrul.itsoft.ru" or not path.endswith(".json"):
+            return ""
+
+        data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
+        tokens: list[str] = []
+        for key in ("ogrn", "inn"):
+            value = self.engine._normalize_spaces(str(data.get(key, "")))
+            if re.fullmatch(r"\d{10,15}", value):
+                tokens.append(value)
+
+        stem = Path(path).stem
+        if re.fullmatch(r"\d{10,15}", stem):
+            tokens.append(stem)
+
+        seen_tokens: set[str] = set()
+        uniq_tokens: list[str] = []
+        for token in tokens:
+            if token in seen_tokens:
+                continue
+            seen_tokens.add(token)
+            uniq_tokens.append(token)
+
+        patterns: list[tuple[str, bool]] = []
+        for token in uniq_tokens:
+            patterns.append((f"ul-{token}-*.pdf", False))
+            patterns.append((f"*{token}*.pdf", False))
+        patterns.append(("ul-*.pdf", True))
+
+        return self._find_latest_pdf(patterns)
+
     def _merge_profile_with_source_hits(self, profile: dict[str, Any], source_hits: list[dict[str, Any]]) -> dict[str, str]:
         merged = {key: self.engine._normalize_spaces(str(value)) for key, value in profile.items()}
         fill_keys = {key for _, key in self.CARD_FIELDS}
@@ -657,7 +1357,7 @@ class NativeNadinApp(tk.Tk):
                 year_candidates.append(year_from_amount)
                 return
 
-            amount = self.engine._parse_money_amount(amount_value)
+            amount = self.engine._parse_financial_amount(amount_value)
             year = self.engine._parse_financial_year(year_value)
             if year:
                 year_candidates.append(year)
@@ -735,6 +1435,10 @@ class NativeNadinApp(tk.Tk):
             profit_line=profit_line,
         )
         self._render_card_rows(rows, f"Карточка #{card_id}")
+        self._last_source_url = self._extract_source_url(payload, fallback_url=self._pending_source_url)
+        self._pending_source_url = ""
+        self.source_url_var.set(f"URL источника: {self._last_source_url or '—'}")
+
 
     def _render_card_rows(self, rows: list[tuple[str, str]], title: str) -> None:
         self.card_title_var.set(title)
@@ -750,30 +1454,443 @@ class NativeNadinApp(tk.Tk):
             display = self.engine._normalize_spaces(str(value)) if value is not None else ""
             self.card_tree.insert("", tk.END, values=(label, display or "—"))
 
-    def _copy_selected_card_value(self, _event: object | None = None) -> None:
+    def _copy_selected_card_value(self, _event: object | None = None) -> str:
         selected = self.card_tree.selection()
         if not selected:
-            self.status_var.set("Выберите поле карточки для копирования")
-            return
-        values = self.card_tree.item(selected[0], "values")
-        if not values or len(values) < 2:
-            return
-        text = f"{values[0]}: {values[1]}"
-        self.clipboard_clear()
-        self.clipboard_append(text)
-        self.status_var.set("Поле скопировано в буфер обмена")
+            return "break"
 
-    def _copy_card_to_clipboard(self) -> None:
+        lines: list[str] = []
+        for iid in selected:
+            values = self.card_tree.item(iid, "values")
+            if not values or len(values) < 2:
+                continue
+            lines.append(f"{values[0]}	{values[1]}")
+
+        if lines:
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(lines))
+            self.status_var.set("Выбранные поля карточки скопированы")
+        return "break"
+
+    def _copy_full_card(self) -> None:
         if not self._current_card_rows:
-            self.status_var.set("Карточка пуста")
+            self.status_var.set("Нет данных для копирования")
             return
-        text = "\n".join(
-            f"{self.engine._normalize_spaces(str(label))}: {self.engine._normalize_spaces(str(value)) or '—'}"
-            for label, value in self._current_card_rows
-        )
+
+        lines: list[str] = []
+        for label, value in self._current_card_rows:
+            display = self.engine._normalize_spaces(str(value)) if value is not None else ""
+            lines.append(f"{label}\t{display or '—'}")
+
         self.clipboard_clear()
-        self.clipboard_append(text)
-        self.status_var.set("Карточка скопирована в буфер обмена")
+        self.clipboard_append("\n".join(lines))
+        self.status_var.set("Карточка скопирована")
+
+    def _copy_selected_variant_value(self, _event: object | None = None) -> str:
+        selected = self.result_tree.selection()
+        if not selected:
+            return "break"
+        values = self.result_tree.item(selected[0], "values")
+        if values:
+            self.clipboard_clear()
+            self.clipboard_append("	".join(str(v) for v in values))
+            self.status_var.set("Выбранный вариант скопирован")
+        return "break"
+
+    def _capture_source_screenshot_manual(self) -> None:
+        self._capture_source_screenshot(auto=False)
+
+    def _capture_source_screenshot(self, auto: bool) -> None:
+        if self._screenshot_busy:
+            return
+        if self._busy and not auto:
+            return
+
+        source_url = self._normalize_screenshot_target(self._last_source_url)
+        should_offer_pdf = (not source_url) or self._is_machine_source_url(source_url) or self._is_generic_landing_url(source_url)
+        if not auto and should_offer_pdf:
+            picked_pdf = filedialog.askopenfilename(
+                title="Выберите PDF выписку (если URL источника недоступен)",
+                filetypes=[("PDF", "*.pdf"), ("All files", "*.*")],
+            )
+            if picked_pdf:
+                source_url = self._normalize_screenshot_target(picked_pdf)
+
+        if not source_url:
+            if not auto:
+                messagebox.showwarning("Nadin", "Нет URL источника для скриншота")
+            return
+
+        if not self._is_supported_screenshot_target(source_url):
+            if not auto:
+                messagebox.showwarning("Nadin", "URL источника не поддерживается")
+            return
+
+        self._screenshot_busy = True
+        self.screenshot_button.configure(state=tk.DISABLED)
+        self.download_screenshot_button.configure(state=tk.DISABLED)
+        self.status_var.set("Создание скриншота источника...")
+
+        def worker() -> None:
+            error = ""
+            saved_path = ""
+            captured_at = ""
+            try:
+                path, captured_at = self._capture_webpage_screenshot(source_url)
+                saved_path = str(path)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to capture source screenshot")
+                error = str(exc)
+            self.after(0, lambda: self._on_source_screenshot_done(saved_path, captured_at, source_url, error, auto))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _normalize_screenshot_target(self, source_url: str) -> str:
+        value = self.engine._normalize_spaces(str(source_url))
+        if not value:
+            return ""
+        if value.startswith("http://") or value.startswith("https://") or value.startswith("file://"):
+            return value
+        local_path = Path(value)
+        if local_path.exists():
+            return str(local_path.resolve())
+        return value
+
+    def _is_supported_screenshot_target(self, source_url: str) -> bool:
+        value = self._normalize_screenshot_target(source_url)
+        if not value:
+            return False
+        if value.startswith("http://") or value.startswith("https://") or value.startswith("file://"):
+            return True
+        return Path(value).exists()
+
+    def _is_pdf_target(self, source_url: str) -> bool:
+        value = self._normalize_screenshot_target(source_url).lower()
+        if value.endswith(".pdf"):
+            return True
+        parsed = urlparse(value)
+        return parsed.path.lower().endswith(".pdf")
+
+    def _source_to_local_path(self, source_url: str) -> Path:
+        value = self._normalize_screenshot_target(source_url)
+        if value.startswith("file://"):
+            parsed = urlparse(value)
+            local = unquote(parsed.path)
+            if re.match(r"^/[a-zA-Z]:", local):
+                local = local[1:]
+            return Path(local)
+        return Path(value)
+
+    def _read_pdf_bytes(self, source_url: str) -> bytes:
+        value = self._normalize_screenshot_target(source_url)
+        if value.startswith("http://") or value.startswith("https://"):
+            response = self.engine._request(value, timeout=30)
+            if not response.ok:
+                raise RuntimeError(f"PDF download failed: {response.status_code}")
+            return bytes(response.content)
+
+        local_path = self._source_to_local_path(value)
+        if not local_path.exists():
+            raise RuntimeError(f"PDF file not found: {local_path}")
+        return local_path.read_bytes()
+
+    def _render_pdf_snapshot(self, source_url: str, output_path: Path) -> None:
+        if fitz is None or Image is None:
+            raise RuntimeError("PDF snapshot requires Pillow and PyMuPDF")
+
+        pdf_bytes = self._read_pdf_bytes(source_url)
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            if doc.page_count <= 0:
+                raise RuntimeError("PDF has no pages")
+
+            rendered_pages: list[Image.Image] = []
+            target_width = 1300
+            for page in doc:
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.35, 1.35), alpha=False)
+                image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                if image.width > target_width:
+                    new_height = int(image.height * target_width / image.width)
+                    image = image.resize((target_width, new_height), Image.Resampling.LANCZOS)
+                rendered_pages.append(image)
+
+        margin = 24
+        gap = 18
+        max_height = 13000
+        total_height = sum(image.height for image in rendered_pages) + gap * (len(rendered_pages) - 1)
+        if total_height > max_height:
+            scale = max_height / total_height
+            scaled_pages: list[Image.Image] = []
+            for image in rendered_pages:
+                new_w = max(320, int(image.width * scale))
+                new_h = max(220, int(image.height * scale))
+                scaled_pages.append(image.resize((new_w, new_h), Image.Resampling.LANCZOS))
+            rendered_pages = scaled_pages
+
+        canvas_width = max(image.width for image in rendered_pages) + margin * 2
+        canvas_height = sum(image.height for image in rendered_pages) + gap * (len(rendered_pages) - 1) + margin * 2
+        canvas = Image.new("RGB", (canvas_width, canvas_height), "#f3f4f6")
+
+        y = margin
+        for index, image in enumerate(rendered_pages, start=1):
+            x = (canvas_width - image.width) // 2
+            canvas.paste(image, (x, y))
+            y += image.height + gap
+
+        canvas.save(output_path, format="PNG")
+
+    def _wrap_overlay_line(self, draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
+        words = text.split()
+        if not words:
+            return [""]
+        lines: list[str] = []
+        current = words[0]
+        for word in words[1:]:
+            probe = f"{current} {word}"
+            bbox = draw.textbbox((0, 0), probe, font=font)
+            width = bbox[2] - bbox[0]
+            if width <= max_width:
+                current = probe
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
+
+    def _annotate_screenshot_metadata(self, image_path: Path, source_url: str, captured_at: str) -> None:
+        if Image is None or ImageDraw is None or ImageFont is None:
+            return
+
+        with Image.open(image_path).convert("RGB") as body:
+            font = ImageFont.load_default()
+            draw_probe = ImageDraw.Draw(body)
+
+            lines = [f"URL: {source_url}", f"Date/Time: {captured_at}"]
+            wrapped: list[str] = []
+            max_width = max(240, body.width - 20)
+            for line in lines:
+                wrapped.extend(self._wrap_overlay_line(draw_probe, line, font, max_width))
+
+            line_height = 18
+            padding = 8
+            header_height = padding * 2 + line_height * len(wrapped)
+            result = Image.new("RGB", (body.width, body.height + header_height), "#0f172a")
+            result.paste(body, (0, header_height))
+
+            draw = ImageDraw.Draw(result)
+            y = padding
+            for line in wrapped:
+                draw.text((10, y), line, font=font, fill="#f8fafc")
+                y += line_height
+
+            result.save(image_path, format="PNG")
+
+    def _find_headless_browser(self) -> Path | None:
+        allow_edge = os.getenv("NADIN_SCREENSHOT_ALLOW_EDGE", "0").strip().lower() in {"1", "true", "yes"}
+        env_candidates = [
+            os.getenv("NADIN_SCREENSHOT_BROWSER", ""),
+            os.path.join(os.getenv("ProgramFiles", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.getenv("ProgramFiles(x86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.getenv("LocalAppData", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        ]
+        if allow_edge:
+            env_candidates.extend(
+                [
+                    os.path.join(os.getenv("ProgramFiles", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+                    os.path.join(os.getenv("ProgramFiles(x86)", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+                    os.path.join(os.getenv("LocalAppData", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+                ]
+            )
+
+        for raw_path in env_candidates:
+            candidate = raw_path.strip()
+            if not candidate:
+                continue
+            path = Path(os.path.expandvars(candidate))
+            if path.exists():
+                return path
+
+        command_candidates = ["chrome", "chrome.exe", "chromium", "chromium.exe"]
+        if allow_edge:
+            command_candidates.extend(["msedge", "msedge.exe"])
+
+        for cmd in command_candidates:
+            resolved = shutil.which(cmd)
+            if resolved:
+                return Path(resolved)
+        return None
+
+    def _capture_with_headless_browser(self, browser_path: Path, source_url: str, output_path: Path) -> tuple[bool, str]:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        attempts = ["--headless=new", "--headless"]
+        last_details = ""
+
+        for headless_flag in attempts:
+            if output_path.exists():
+                output_path.unlink(missing_ok=True)
+            command = [
+                str(browser_path),
+                headless_flag,
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-breakpad",
+                "--hide-scrollbars",
+                "--window-size=1366,768",
+                f"--screenshot={output_path}",
+                source_url,
+            ]
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+                creationflags=creationflags,
+            )
+            if completed.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+                return True, ""
+            stderr = (completed.stderr or "").strip()
+            stdout = (completed.stdout or "").strip()
+            last_details = stderr or stdout or f"code={completed.returncode}"
+
+        return False, last_details or "headless_browser_failed"
+
+    def _capture_webpage_screenshot_legacy_ie(self, source_url: str, output_path: Path) -> None:
+        ps_source_url = source_url.replace("'", "''")
+        ps_output_path = str(output_path).replace("'", "''")
+
+        ps_script = f"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$url = '{ps_source_url}'
+$out = '{ps_output_path}'
+$web = New-Object System.Windows.Forms.WebBrowser
+$web.ScriptErrorsSuppressed = $true
+$web.ScrollBarsEnabled = $false
+$web.Width = 1366
+$web.Height = 768
+$script:done = $false
+$web.add_DocumentCompleted({{ $script:done = $true }})
+$web.Navigate($url)
+$deadline = (Get-Date).AddSeconds(25)
+while (-not $script:done) {{
+    [System.Windows.Forms.Application]::DoEvents()
+    Start-Sleep -Milliseconds 120
+    if ((Get-Date) -gt $deadline) {{
+        throw 'page_load_timeout'
+    }}
+}}
+$bmp = New-Object System.Drawing.Bitmap($web.Width, $web.Height)
+$rect = New-Object System.Drawing.Rectangle(0, 0, $web.Width, $web.Height)
+$web.DrawToBitmap($bmp, $rect)
+$bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
+$bmp.Dispose()
+$web.Dispose()
+"""
+
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+            timeout=35,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        if completed.returncode != 0 or not output_path.exists():
+            stderr = (completed.stderr or "").strip()
+            stdout = (completed.stdout or "").strip()
+            details = stderr or stdout or f"code={completed.returncode}"
+            raise RuntimeError(f"IE WebBrowser fallback failed: {details}")
+
+    def _capture_webpage_screenshot(self, source_url: str) -> tuple[Path, str]:
+        now = datetime.now()
+        captured_at = now.strftime("%d.%m.%Y %H:%M:%S")
+
+        target = self._normalize_screenshot_target(source_url)
+        host = urlparse(target).netloc or Path(target).stem or "source"
+        safe_host = re.sub(r"[^a-zA-Z0-9_.-]", "_", host)
+        file_name = f"{safe_host}_{now.strftime('%Y%m%d_%H%M%S')}.png"
+        output_path = self._screenshot_dir / file_name
+
+        if self._is_pdf_target(target):
+            self._render_pdf_snapshot(target, output_path)
+            self._annotate_screenshot_metadata(output_path, target, captured_at)
+            return output_path, captured_at
+
+        failures: list[str] = []
+        browser = self._find_headless_browser()
+        if browser is not None:
+            ok, details = self._capture_with_headless_browser(browser, target, output_path)
+            if ok:
+                self._annotate_screenshot_metadata(output_path, target, captured_at)
+                return output_path, captured_at
+            failures.append(f"{browser.name}: {details}")
+        else:
+            failures.append("headless_browser_not_found")
+
+        try:
+            self._capture_webpage_screenshot_legacy_ie(target, output_path)
+            self._annotate_screenshot_metadata(output_path, target, captured_at)
+            return output_path, captured_at
+        except Exception as exc:  # noqa: BLE001
+            failures.append(str(exc))
+
+        raise RuntimeError("Не удалось создать скриншот источника: " + "; ".join(failures))
+
+    def _on_source_screenshot_done(self, saved_path: str, captured_at: str, source_url: str, error: str, auto: bool) -> None:
+        self._screenshot_busy = False
+        if not self._busy:
+            self.screenshot_button.configure(state=tk.NORMAL)
+
+        if error:
+            if not auto:
+                messagebox.showerror("Nadin", error)
+            self.status_var.set("Ошибка создания скриншота")
+            if not self._busy and self._last_screenshot_path:
+                self.download_screenshot_button.configure(state=tk.NORMAL)
+            return
+
+        self._last_screenshot_path = saved_path
+        self._update_screenshot_preview(saved_path)
+        self.screenshot_meta_var.set(f"Скриншот: {captured_at}")
+        self.source_url_var.set(f"URL источника: {source_url}")
+
+        if not self._busy:
+            self.download_screenshot_button.configure(state=tk.NORMAL)
+        self.status_var.set(f"Скриншот сохранен: {Path(saved_path).name}")
+
+    def _update_screenshot_preview(self, screenshot_path: str) -> None:
+        image = tk.PhotoImage(file=screenshot_path)
+        max_w = 320
+        max_h = 180
+        ratio = max(image.width() / max_w, image.height() / max_h, 1.0)
+        if ratio > 1:
+            factor = int(ratio)
+            if factor < ratio:
+                factor += 1
+            image = image.subsample(factor, factor)
+        self._screenshot_preview_image = image
+        self.screenshot_preview_label.configure(image=image, text="")
+
+    def _download_screenshot(self) -> None:
+        if not self._last_screenshot_path or not Path(self._last_screenshot_path).exists():
+            messagebox.showwarning("Nadin", "Скриншот еще не создан")
+            return
+
+        src = Path(self._last_screenshot_path)
+        target = filedialog.asksaveasfilename(
+            title="Сохранить скриншот",
+            initialfile=src.name,
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png")],
+        )
+        if not target:
+            return
+
+        shutil.copyfile(src, target)
+        self.status_var.set(f"Скриншот сохранен в: {target}")
 
     def _write_trace(self, trace: list[str]) -> None:
         self.trace_text.configure(state=tk.NORMAL)

@@ -667,3 +667,97 @@ def test_has_valid_leader_for_inn_checks_inn_match(app):
     assert app._has_valid_leader_for_inn(hits, "7702070139") is True
     assert app._has_valid_leader_for_inn(hits, "3662140164") is True
     assert app._has_valid_leader_for_inn(hits, "7728168971") is False
+
+
+def test_has_confident_short_brand_bank_hit_rejects_non_bank_entity(app):
+    hits = [
+        {
+            "source": "zachestnyibiznes.ru",
+            "type": "company",
+            "data": {
+                "ru_org": "ООО ВТБ",
+                "inn": "3662140164",
+            },
+        }
+    ]
+
+    assert app._has_confident_short_brand_bank_hit(hits, "ВТБ") is False
+
+
+def test_has_confident_short_brand_bank_hit_accepts_bank_title_without_inn(app):
+    hits = [
+        {
+            "source": "DuckDuckGo HTML",
+            "type": "company",
+            "data": {
+                "ru_org": "Банк ВТБ ПАО",
+                "inn": "",
+            },
+        }
+    ]
+
+    assert app._has_confident_short_brand_bank_hit(hits, "ВТБ") is True
+
+
+def test_extract_fio_from_leader_obj_reads_svfl_attributes(app):
+    leader_obj = {
+        "СвФЛ": {
+            "@attributes": {
+                "Фамилия": "КОСТИН",
+                "Имя": "АНДРЕЙ",
+                "Отчество": "ЛЕОНИДОВИЧ",
+            }
+        }
+    }
+
+    surname, name, middle = app._extract_fio_from_leader_obj(leader_obj)
+    assert surname == "КОСТИН"
+    assert name == "АНДРЕЙ"
+    assert middle == "ЛЕОНИДОВИЧ"
+
+
+def test_search_by_company_short_brand_keeps_searching_after_non_bank_base_hit(app, monkeypatch):
+    calls = []
+
+    base_non_bank_hit = {
+        "source": "companies.rbc.ru",
+        "type": "company",
+        "data": {"ru_org": "ООО ВТБ", "inn": "3662140164", "revenue": 0},
+    }
+    bank_hit = {
+        "source": "ФНС ЕГРЮЛ",
+        "type": "company",
+        "data": {"ru_org": "БАНК ВТБ (ПАО)", "inn": "7702070139", "revenue": 1_000_000},
+    }
+
+    monkeypatch.setattr(
+        app,
+        "_generate_company_name_variants",
+        lambda _name: ["ВТБ", "Банк ВТБ", "ПАО ВТБ"],
+    )
+
+    def fake_search_external_sources(raw, no_cache=False, search_type="", provider_names=None):
+        calls.append(raw)
+        if raw == "ВТБ":
+            return [base_non_bank_hit], ["base"]
+        if raw == "Банк ВТБ":
+            return [bank_hit], ["bank"]
+        return [], ["empty"]
+
+    monkeypatch.setattr(app, "_search_external_sources", fake_search_external_sources)
+
+    hits, _trace = app._search_by_company("ВТБ", search_type="company")
+
+    assert hits
+    assert hits[0]["data"]["inn"] == "7702070139"
+    assert "Банк ВТБ" in calls
+
+
+def test_detect_input_type_single_token_company_query(app):
+    query = "Пятерочка"
+    assert app.detect_input_type(query) == "ORG_TEXT"
+
+
+def test_detect_input_type_three_part_name_query(app):
+    query = "Греф Герман Оскарович"
+    assert app.detect_input_type(query) == "PERSON_TEXT"
