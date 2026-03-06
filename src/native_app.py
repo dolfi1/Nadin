@@ -9,10 +9,11 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 
 _OPTIONAL_DEPS_DIR = Path(__file__).resolve().parents[1] / ".deps"
@@ -130,6 +131,13 @@ class NativeNadinApp(tk.Tk):
         self._pending_source_url = ""
         self._last_screenshot_path = ""
         self._screenshot_preview_image: tk.PhotoImage | None = None
+
+        self._last_profile_inn = ""
+        self._last_profile_ogrn = ""
+        self._last_profile_org = ""
+        self._last_source_names: list[str] = []
+        self._rusprofile_url_cache: dict[str, str] = {}
+        self._fns_pdf_target_cache: dict[str, tuple[str, str, float]] = {}
 
         app_data_dir = Path(os.getenv("APP_DATA_DIR", os.getcwd()))
         self._screenshot_dir = app_data_dir / "screenshots"
@@ -997,10 +1005,6 @@ class NativeNadinApp(tk.Tk):
                 if candidate_url:
                     candidates.append((candidate_url, hit, False))
 
-                fns_pdf_candidate = self._find_fns_pdf_candidate(hit)
-                if fns_pdf_candidate:
-                    candidates.append((fns_pdf_candidate, hit, False))
-
         fallback = self.engine._normalize_spaces(fallback_url)
         if fallback:
             candidates.append((fallback, {}, True))
@@ -1170,25 +1174,10 @@ class NativeNadinApp(tk.Tk):
 
         host = parsed.netloc.lower()
         path = parsed.path.lower()
-
-        inn = ""
-        if isinstance(hit, dict):
-            data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
-            inn = self.engine._normalize_spaces(str(data.get("inn", "")))
-        if not inn:
-            inn_match = re.search(r"(\d{10,12})", path)
-            if inn_match:
-                inn = inn_match.group(1)
-
         if host == "egrul.itsoft.ru" and path.endswith(".json"):
-            if isinstance(hit, dict):
-                fns_pdf_candidate = self._find_fns_pdf_candidate(hit)
-                if fns_pdf_candidate:
-                    return fns_pdf_candidate
             return ""
 
         return normalized
-
     def _candidate_pdf_roots(self) -> list[Path]:
         roots: list[Path] = []
         seen: set[str] = set()
@@ -1305,7 +1294,292 @@ class NativeNadinApp(tk.Tk):
         patterns.append(("ul-*.pdf", True))
 
         return self._find_latest_pdf(patterns)
+    def _get_rusprofile_lookup_query(self) -> str:
+        for raw in (self._last_profile_inn, self._last_profile_ogrn, self._last_profile_org):
+            value = self.engine._normalize_spaces(raw)
+            if value:
+                return value
+        return ""
 
+    def _lookup_rusprofile_url(self, query: str) -> str:
+        normalized_query = self.engine._normalize_spaces(query)
+        if not normalized_query:
+            return ""
+
+        cache_key = normalized_query.lower()
+        cached = self._rusprofile_url_cache.get(cache_key, "")
+        if cached:
+            return cached
+
+        search_url = f"https://www.rusprofile.ru/search?query={quote(normalized_query)}"
+        resolved = search_url
+
+        try:
+            html = self.engine._fetch_page(search_url, timeout=18, max_retries=1)
+        except Exception:  # noqa: BLE001
+            html = ""
+
+        if html:
+            path_match = re.search(r"href=['\"](?P<path>/id/\d+[^'\"]*)['\"]", html, flags=re.IGNORECASE)
+            if path_match:
+                resolved = f"https://www.rusprofile.ru{path_match.group('path')}"
+            else:
+                full_match = re.search(r"https?://(?:www\.)?rusprofile\.ru/id/\d+[^\"'\s<]*", html, flags=re.IGNORECASE)
+                if full_match:
+                    resolved = full_match.group(0)
+
+        self._rusprofile_url_cache[cache_key] = resolved
+        return resolved
+
+    def _resolve_rusprofile_source_url(self, source_url: str) -> str:
+        normalized = self._normalize_screenshot_target(source_url)
+        if self._is_pdf_target(normalized):
+            return normalized
+
+        if normalized.startswith("http://") or normalized.startswith("https://"):
+            parsed = urlparse(normalized)
+            host = parsed.netloc.lower()
+            path = parsed.path.lower()
+            if host.endswith("rusprofile.ru") and "/id/" in path:
+                return normalized
+            if normalized and not self._is_machine_source_url(normalized) and not self._is_generic_landing_url(normalized):
+                return normalized
+
+        lookup_query = self._get_rusprofile_lookup_query()
+        if not lookup_query:
+            return normalized
+
+        resolved = self._lookup_rusprofile_url(lookup_query)
+        return resolved or normalized
+
+    def _has_fns_source_context(self, source_url: str) -> bool:
+        normalized = self._normalize_screenshot_target(source_url)
+        if normalized.startswith("http://") or normalized.startswith("https://"):
+            parsed = urlparse(normalized)
+            host = parsed.netloc.lower()
+            if host.endswith("nalog.ru") or host == "egrul.itsoft.ru":
+                return True
+
+        for source_name in self._last_source_names:
+            lowered = self.engine._normalize_spaces(str(source_name)).lower()
+            if not lowered:
+                continue
+            if "фнс" in lowered or "егрюл" in lowered:
+                return True
+        return False
+
+    def _iter_fns_identifier_candidates(self, source_url: str) -> list[str]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: str) -> None:
+            candidate = self.engine._normalize_spaces(str(value))
+            if not re.fullmatch(r"\d{10,15}", candidate):
+                return
+            if candidate in seen:
+                return
+            seen.add(candidate)
+            candidates.append(candidate)
+
+        add(self._last_profile_inn)
+        add(self._last_profile_ogrn)
+
+        normalized = self._normalize_screenshot_target(source_url)
+        if normalized:
+            for token in re.findall(r"\d{10,15}", normalized):
+                add(token)
+
+        return candidates
+
+    def _get_cached_fns_pdf_target(self, query: str) -> tuple[str, str]:
+        cached = self._fns_pdf_target_cache.get(query)
+        if not cached:
+            return "", ""
+
+        target_path, source_url, cached_at = cached
+        ttl_seconds = 60 * 60
+        if (time.time() - cached_at) > ttl_seconds:
+            self._fns_pdf_target_cache.pop(query, None)
+            return "", ""
+
+        target = self._normalize_screenshot_target(target_path)
+        if not target:
+            self._fns_pdf_target_cache.pop(query, None)
+            return "", ""
+
+        if target.startswith("http://") or target.startswith("https://"):
+            return target, source_url
+
+        local_path = Path(target)
+        if not local_path.exists():
+            self._fns_pdf_target_cache.pop(query, None)
+            return "", ""
+
+        return str(local_path.resolve()), source_url
+
+    def _fetch_fns_egrul_pdf_target(self, query: str) -> tuple[str, str]:
+        normalized_query = self.engine._normalize_spaces(query)
+        if not re.fullmatch(r"\d{10,15}", normalized_query):
+            return "", ""
+
+        base_url = "https://egrul.nalog.ru"
+        session = getattr(self.engine, "_http_session", None)
+        if session is None:
+            raise RuntimeError("HTTP session is not initialized")
+
+        try:
+            user_agent = self.engine._get_random_user_agent()
+            headers = self.engine._get_random_headers(user_agent)
+        except Exception:  # noqa: BLE001
+            headers = {
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json,text/plain,*/*",
+            }
+
+        payload = {
+            "query": normalized_query,
+            "region": "",
+            "page": "",
+            "PreventChromeAutocomplete": "",
+        }
+        seed_resp = session.post(base_url, data=payload, timeout=30, headers=headers)
+        if not seed_resp.ok:
+            raise RuntimeError(f"EGRUL search init failed ({seed_resp.status_code})")
+
+        try:
+            seed_json = seed_resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"EGRUL search init returned non-JSON: {exc}") from exc
+
+        if bool(seed_json.get("captchaRequired")):
+            raise RuntimeError("EGRUL requires captcha")
+
+        search_token = self.engine._normalize_spaces(str(seed_json.get("t", "")))
+        if not search_token:
+            raise RuntimeError("EGRUL search token is empty")
+
+        rows: list[dict[str, Any]] = []
+        for _ in range(6):
+            result_resp = session.get(f"{base_url}/search-result/{search_token}", timeout=30, headers=headers)
+            if not result_resp.ok:
+                raise RuntimeError(f"EGRUL search result failed ({result_resp.status_code})")
+
+            try:
+                result_json = result_resp.json()
+            except Exception:  # noqa: BLE001
+                result_json = {}
+
+            parsed_rows = result_json.get("rows", []) if isinstance(result_json, dict) else []
+            rows = [row for row in parsed_rows if isinstance(row, dict)] if isinstance(parsed_rows, list) else []
+            if rows:
+                break
+            time.sleep(0.6)
+
+        if not rows:
+            raise RuntimeError("EGRUL search returned no rows")
+
+        profile_inn = self.engine._normalize_spaces(self._last_profile_inn)
+        profile_ogrn = self.engine._normalize_spaces(self._last_profile_ogrn)
+        profile_org = self.engine._normalize_spaces(self._last_profile_org).lower()
+
+        def row_score(row: dict[str, Any]) -> int:
+            score = 0
+            row_inn = self.engine._normalize_spaces(str(row.get("i", "")))
+            row_ogrn = self.engine._normalize_spaces(str(row.get("o", "")))
+            row_org = self.engine._normalize_spaces(str(row.get("n", "") or row.get("c", ""))).lower()
+
+            if row_inn and row_inn == normalized_query:
+                score += 120
+            if row_ogrn and row_ogrn == normalized_query:
+                score += 120
+            if profile_inn and row_inn == profile_inn:
+                score += 140
+            if profile_ogrn and row_ogrn == profile_ogrn:
+                score += 140
+            if profile_org and row_org and profile_org in row_org:
+                score += 30
+            return score
+
+        best_row = max(rows, key=row_score)
+        row_token = self.engine._normalize_spaces(str(best_row.get("t", ""))) or search_token
+
+        request_resp = session.get(f"{base_url}/vyp-request/{row_token}", timeout=30, headers=headers)
+        if not request_resp.ok:
+            raise RuntimeError(f"EGRUL vyp-request failed ({request_resp.status_code})")
+
+        try:
+            request_json = request_resp.json()
+        except Exception:  # noqa: BLE001
+            request_json = {}
+
+        if bool(request_json.get("captchaRequired")):
+            raise RuntimeError("EGRUL vyp-request requires captcha")
+
+        request_token = self.engine._normalize_spaces(str(request_json.get("t", ""))) or row_token
+
+        ready = False
+        for _ in range(35):
+            status_resp = session.get(f"{base_url}/vyp-status/{request_token}", timeout=30, headers=headers)
+            if status_resp.ok:
+                status_value = ""
+                try:
+                    status_json = status_resp.json()
+                except Exception:  # noqa: BLE001
+                    status_json = {}
+                if isinstance(status_json, dict):
+                    status_value = self.engine._normalize_spaces(str(status_json.get("status", ""))).lower()
+                if status_value in {"ready", "completed", "done"}:
+                    ready = True
+                    break
+            time.sleep(0.9)
+
+        if not ready:
+            logger.info("EGRUL PDF status did not become ready quickly for query=%s; trying direct download", normalized_query)
+
+        download_url = f"{base_url}/vyp-download/{request_token}"
+        pdf_resp = session.get(download_url, timeout=45, headers=headers)
+        if not pdf_resp.ok:
+            raise RuntimeError(f"EGRUL PDF download failed ({pdf_resp.status_code})")
+
+        pdf_bytes = bytes(pdf_resp.content or b"")
+        content_type = self.engine._normalize_spaces(str(pdf_resp.headers.get("content-type", ""))).lower()
+        if not pdf_bytes.startswith(b"%PDF") and "pdf" not in content_type:
+            raise RuntimeError("EGRUL download is not a PDF")
+
+        pdf_dir = self._screenshot_dir / "egrul_pdf"
+        pdf_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_query = re.sub(r"[^0-9A-Za-z_-]", "_", normalized_query)
+        pdf_path = pdf_dir / f"egrul_{safe_query}_{stamp}.pdf"
+        pdf_path.write_bytes(pdf_bytes)
+
+        return str(pdf_path.resolve()), download_url
+
+    def _resolve_fns_egrul_pdf_target(self, source_url: str) -> tuple[str, str]:
+        queries = self._iter_fns_identifier_candidates(source_url)
+        if not queries:
+            return "", ""
+
+        should_try = self._has_fns_source_context(source_url) or bool(self._last_profile_inn)
+        if not should_try:
+            return "", ""
+
+        for query in queries:
+            cached_target, cached_source = self._get_cached_fns_pdf_target(query)
+            if cached_target:
+                return cached_target, cached_source
+
+            try:
+                target, source = self._fetch_fns_egrul_pdf_target(query)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("EGRUL PDF resolution failed for %s: %s", query, exc)
+                continue
+
+            if target:
+                self._fns_pdf_target_cache[query] = (target, source, time.time())
+                return target, source
+
+        return "", ""
     def _merge_profile_with_source_hits(self, profile: dict[str, Any], source_hits: list[dict[str, Any]]) -> dict[str, str]:
         merged = {key: self.engine._normalize_spaces(str(value)) for key, value in profile.items()}
         fill_keys = {key for _, key in self.CARD_FIELDS}
@@ -1435,6 +1709,10 @@ class NativeNadinApp(tk.Tk):
             profit_line=profit_line,
         )
         self._render_card_rows(rows, f"Карточка #{card_id}")
+        self._last_profile_inn = self.engine._normalize_spaces(str(profile.get("inn", "")))
+        self._last_profile_ogrn = self.engine._normalize_spaces(str(profile.get("ogrn", "")))
+        self._last_profile_org = self.engine._normalize_spaces(str(profile.get("ru_org", "")))
+        self._last_source_names = list(source_names)
         self._last_source_url = self._extract_source_url(payload, fallback_url=self._pending_source_url)
         self._pending_source_url = ""
         self.source_url_var.set(f"URL источника: {self._last_source_url or '—'}")
@@ -1507,24 +1785,6 @@ class NativeNadinApp(tk.Tk):
             return
 
         source_url = self._normalize_screenshot_target(self._last_source_url)
-        should_offer_pdf = (not source_url) or self._is_machine_source_url(source_url) or self._is_generic_landing_url(source_url)
-        if not auto and should_offer_pdf:
-            picked_pdf = filedialog.askopenfilename(
-                title="Выберите PDF выписку (если URL источника недоступен)",
-                filetypes=[("PDF", "*.pdf"), ("All files", "*.*")],
-            )
-            if picked_pdf:
-                source_url = self._normalize_screenshot_target(picked_pdf)
-
-        if not source_url:
-            if not auto:
-                messagebox.showwarning("Nadin", "Нет URL источника для скриншота")
-            return
-
-        if not self._is_supported_screenshot_target(source_url):
-            if not auto:
-                messagebox.showwarning("Nadin", "URL источника не поддерживается")
-            return
 
         self._screenshot_busy = True
         self.screenshot_button.configure(state=tk.DISABLED)
@@ -1535,13 +1795,39 @@ class NativeNadinApp(tk.Tk):
             error = ""
             saved_path = ""
             captured_at = ""
+            screenshot_target = source_url
+            display_source_url = source_url
             try:
-                path, captured_at = self._capture_webpage_screenshot(source_url)
+                fns_target, fns_source_url = self._resolve_fns_egrul_pdf_target(source_url)
+                if fns_target:
+                    screenshot_target = fns_target
+                    display_source_url = fns_source_url or fns_target
+                else:
+                    resolved = self._resolve_rusprofile_source_url(source_url) or source_url
+                    screenshot_target = resolved
+                    display_source_url = resolved
+
+                if not self._is_supported_screenshot_target(screenshot_target):
+                    raise RuntimeError("URL источника не поддерживается")
+
+                path, captured_at = self._capture_webpage_screenshot(
+                    screenshot_target,
+                    metadata_source_url=display_source_url,
+                )
                 saved_path = str(path)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to capture source screenshot")
                 error = str(exc)
-            self.after(0, lambda: self._on_source_screenshot_done(saved_path, captured_at, source_url, error, auto))
+            self.after(
+                0,
+                lambda: self._on_source_screenshot_done(
+                    saved_path,
+                    captured_at,
+                    display_source_url,
+                    error,
+                    auto,
+                ),
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1735,7 +2021,7 @@ class NativeNadinApp(tk.Tk):
                 "--no-default-browser-check",
                 "--disable-breakpad",
                 "--hide-scrollbars",
-                "--window-size=1366,768",
+                "--window-size=1366,1700",
                 f"--screenshot={output_path}",
                 source_url,
             ]
@@ -1754,6 +2040,38 @@ class NativeNadinApp(tk.Tk):
             last_details = stderr or stdout or f"code={completed.returncode}"
 
         return False, last_details or "headless_browser_failed"
+
+    def _capture_with_splash(self, source_url: str, output_path: Path) -> tuple[bool, str]:
+        splash_base = self.engine._normalize_spaces(os.getenv("NADIN_SPLASH_URL", "http://127.0.0.1:8050/render.png"))
+        if not splash_base:
+            return False, "splash_disabled"
+
+        params = (
+            f"url={quote(source_url, safe='')}"
+            "&wait=1"
+            "&images=1"
+            "&render_all=1"
+            "&viewport=1366x1700"
+        )
+        splash_url = f"{splash_base}&{params}" if "?" in splash_base else f"{splash_base}?{params}"
+
+        try:
+            response = self.engine._request(splash_url, timeout=60)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"splash_request_failed:{exc}"
+
+        content_type = self.engine._normalize_spaces(str(response.headers.get("content-type", ""))).lower()
+        if not response.ok:
+            return False, f"splash_status={response.status_code}"
+        if "image" not in content_type:
+            return False, f"splash_invalid_content_type={content_type or '-'}"
+
+        body = bytes(response.content or b"")
+        if not body:
+            return False, "splash_empty_body"
+
+        output_path.write_bytes(body)
+        return True, ""
 
     def _capture_webpage_screenshot_legacy_ie(self, source_url: str, output_path: Path) -> None:
         ps_source_url = source_url.replace("'", "''")
@@ -1804,11 +2122,12 @@ $web.Dispose()
             details = stderr or stdout or f"code={completed.returncode}"
             raise RuntimeError(f"IE WebBrowser fallback failed: {details}")
 
-    def _capture_webpage_screenshot(self, source_url: str) -> tuple[Path, str]:
+    def _capture_webpage_screenshot(self, source_url: str, *, metadata_source_url: str = "") -> tuple[Path, str]:
         now = datetime.now()
         captured_at = now.strftime("%d.%m.%Y %H:%M:%S")
 
         target = self._normalize_screenshot_target(source_url)
+        meta_source_url = self.engine._normalize_spaces(metadata_source_url) or target
         host = urlparse(target).netloc or Path(target).stem or "source"
         safe_host = re.sub(r"[^a-zA-Z0-9_.-]", "_", host)
         file_name = f"{safe_host}_{now.strftime('%Y%m%d_%H%M%S')}.png"
@@ -1816,7 +2135,7 @@ $web.Dispose()
 
         if self._is_pdf_target(target):
             self._render_pdf_snapshot(target, output_path)
-            self._annotate_screenshot_metadata(output_path, target, captured_at)
+            self._annotate_screenshot_metadata(output_path, meta_source_url, captured_at)
             return output_path, captured_at
 
         failures: list[str] = []
@@ -1824,15 +2143,22 @@ $web.Dispose()
         if browser is not None:
             ok, details = self._capture_with_headless_browser(browser, target, output_path)
             if ok:
-                self._annotate_screenshot_metadata(output_path, target, captured_at)
+                self._annotate_screenshot_metadata(output_path, meta_source_url, captured_at)
                 return output_path, captured_at
             failures.append(f"{browser.name}: {details}")
         else:
             failures.append("headless_browser_not_found")
 
+        if target.startswith("http://") or target.startswith("https://"):
+            splash_ok, splash_details = self._capture_with_splash(target, output_path)
+            if splash_ok:
+                self._annotate_screenshot_metadata(output_path, meta_source_url, captured_at)
+                return output_path, captured_at
+            failures.append(f"splash: {splash_details}")
+
         try:
             self._capture_webpage_screenshot_legacy_ie(target, output_path)
-            self._annotate_screenshot_metadata(output_path, target, captured_at)
+            self._annotate_screenshot_metadata(output_path, meta_source_url, captured_at)
             return output_path, captured_at
         except Exception as exc:  # noqa: BLE001
             failures.append(str(exc))
@@ -1913,3 +2239,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
