@@ -3,6 +3,8 @@ import io
 import json
 from urllib.parse import parse_qs, urlparse
 
+from native_app import NativeNadinApp
+
 
 def test_sanitize_ru_position_noise(app):
     assert app.sanitize_ru_position("Юридического лица история греф герман оскарович проверить") is None
@@ -799,3 +801,77 @@ def test_extract_rusprofile_search_hits_with_selector_company(app):
     assert hits[0]['url'] == 'https://www.rusprofile.ru/id/362378'
     assert hits[0]['inn'] == '7704217370'
     assert hits[0]['org'] == 'Company Example'
+
+
+class _NativeEngineStub:
+    @staticmethod
+    def _normalize_spaces(value: str) -> str:
+        return " ".join(str(value or "").split())
+
+
+def _make_native_app() -> NativeNadinApp:
+    app = NativeNadinApp.__new__(NativeNadinApp)
+    app.engine = _NativeEngineStub()
+    app._last_profile_inn = ""
+    app._last_profile_ogrn = ""
+    app._last_profile_org = ""
+    app._rusprofile_url_cache = {}
+    return app
+
+
+def test_native_app_extract_source_url_prefers_rusprofile_detail():
+    app = _make_native_app()
+    payload = {
+        "source_hits": [
+            {"url": "https://egrul.nalog.ru/index.html?query=7702070139", "source": "??? ?????"},
+            {"url": "https://www.rusprofile.ru/id/362378", "source": "rusprofile.ru"},
+        ]
+    }
+
+    best = app._extract_source_url(payload)
+
+    assert best == "https://www.rusprofile.ru/id/362378"
+
+
+def test_native_app_resolve_rusprofile_source_url_by_inn_lookup(monkeypatch):
+    app = _make_native_app()
+    app._last_profile_inn = "7702070139"
+    monkeypatch.setattr(app, "_lookup_rusprofile_url", lambda query: "https://www.rusprofile.ru/id/362378")
+
+    resolved = app._resolve_rusprofile_source_url("https://egrul.nalog.ru/index.html?query=7702070139")
+
+    assert resolved == "https://www.rusprofile.ru/id/362378"
+
+
+def test_native_app_normalize_source_url_for_screenshot_rejects_local_pdf_path():
+    app = _make_native_app()
+
+    normalized = app._normalize_source_url_for_screenshot(r"C:\Users\Admin\Downloads\sample.pdf")
+
+    assert normalized == ""
+
+
+def test_native_app_resolve_rusprofile_source_url_with_empty_source(monkeypatch):
+    app = _make_native_app()
+    app._last_profile_inn = "7702070139"
+    monkeypatch.setattr(app, "_lookup_rusprofile_url", lambda query: "https://www.rusprofile.ru/id/362378")
+
+    resolved = app._resolve_rusprofile_source_url("")
+
+    assert resolved == "https://www.rusprofile.ru/id/362378"
+
+
+def test_native_app_humanize_trace_line_blocked():
+    app = _make_native_app()
+
+    line = app._humanize_trace_line("trace: checko.ru - provider_blocked_403")
+
+    assert line == "• Источник: checko.ru — временно недоступен"
+
+
+def test_native_app_humanize_trace_line_empty():
+    app = _make_native_app()
+
+    line = app._humanize_trace_line("trace: focus.kontur.ru - provider_called_empty")
+
+    assert line == "• Источник: focus.kontur.ru — данных не найдено"
