@@ -48,8 +48,8 @@ PASSPORT_MAP: Dict[str, str] = {
 POSITION_TRANSLATIONS: Dict[str, str] = {
     "ректор": "Rector",
     "президент": "President",
-    "председатель правления": "Chairman of the Management Board",
-    "президент, председатель правления": "President, Chairman of the Management Board",
+    "председатель правления": "Chairman of the Board",
+    "президент, председатель правления": "President, Chairman of the Board",
     "генеральный директор": "General Director",
     "генеральный директор (гендиректор)": "General Director",
     "директор": "Director",

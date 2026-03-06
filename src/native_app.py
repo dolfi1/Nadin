@@ -13,6 +13,7 @@ import site
 import threading
 import time
 from datetime import datetime
+from html import unescape as html_unescape
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
@@ -140,6 +141,7 @@ class NativeNadinApp(tk.Tk):
         self._last_source_url = ""
         self._pending_source_url = ""
         self._last_screenshot_path = ""
+        self._last_screenshot_preview_path = ""
         self._screenshot_preview_image: tk.PhotoImage | None = None
 
         self._last_profile_inn = ""
@@ -814,8 +816,7 @@ class NativeNadinApp(tk.Tk):
             profile["family_name"] = self.engine._translit(profile["surname_ru"])
         if profile.get("name_ru") and not profile.get("first_name"):
             profile["first_name"] = self.engine._translit(profile["name_ru"])
-        if profile.get("middle_name_ru") and not profile.get("middle_name_en"):
-            profile["middle_name_en"] = self.engine._generate_middle_name_en(profile["middle_name_ru"])
+        profile["middle_name_en"] = self.engine._normalize_spaces(str(profile.get("middle_name_en", "")))
 
         return profile
 
@@ -932,14 +933,86 @@ class NativeNadinApp(tk.Tk):
 
         self._set_busy(False)
         if error:
-            self.status_var.set("Не удалось сформировать карточку")
-            self._render_card_rows([("Статус", error)], "Карточка")
+            self.status_var.set("\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u0444\u043e\u0440\u043c\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043a\u0430\u0440\u0442\u043e\u0447\u043a\u0443")
+            self._render_card_rows([("\u0421\u0442\u0430\u0442\u0443\u0441", error)], "\u041a\u0430\u0440\u0442\u043e\u0447\u043a\u0430")
             return
 
-        self._show_card(card_id)
-        self.status_var.set(f"Карточка #{card_id} сформирована")
+        try:
+            self._show_card(card_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to render autofill result for card_id=%s", card_id)
+            self.status_var.set("\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0442\u043e\u0431\u0440\u0430\u0437\u0438\u0442\u044c \u043a\u0430\u0440\u0442\u043e\u0447\u043a\u0443")
+            self._render_card_rows([("\u0421\u0442\u0430\u0442\u0443\u0441", str(exc))], "\u041a\u0430\u0440\u0442\u043e\u0447\u043a\u0430")
+            return
+
+        self.status_var.set(f"\u041a\u0430\u0440\u0442\u043e\u0447\u043a\u0430 #{card_id} \u0441\u0444\u043e\u0440\u043c\u0438\u0440\u043e\u0432\u0430\u043d\u0430")
         if self._last_source_url or self._last_profile_inn or self._last_profile_ogrn or self._last_profile_org:
             self.after(120, lambda: self._capture_source_screenshot(auto=True))
+
+    def _compose_card_rows(
+        self,
+        profile: dict[str, str],
+        *,
+        status: str,
+        source_names: list[str],
+        revenue_line: str,
+        profit_line: str,
+    ) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        for label, key in self.CARD_FIELDS:
+            rows.append((label, self.engine._normalize_spaces(str(profile.get(key, "")))))
+
+        rows.append(("\u0412\u044b\u0440\u0443\u0447\u043a\u0430", revenue_line))
+        rows.append(("\u041f\u0440\u0438\u0431\u044b\u043b\u044c", profit_line))
+        rows.append(("\u0421\u0442\u0430\u0442\u0443\u0441", self.engine._normalize_spaces(str(status))))
+
+        cleaned_sources: list[str] = []
+        seen: set[str] = set()
+        for source in source_names:
+            src = self.engine._normalize_spaces(str(source))
+            if not src:
+                continue
+            key = src.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned_sources.append(src)
+
+        rows.append(("\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0438", ", ".join(cleaned_sources) if cleaned_sources else "\u2014"))
+        return rows
+
+    def _merge_profile_with_source_hits(self, profile: dict[str, Any], source_hits: list[dict[str, Any]]) -> dict[str, str]:
+        merged = {key: self.engine._normalize_spaces(str(value)) for key, value in profile.items()}
+        fill_keys = {key for _, key in self.CARD_FIELDS}
+        fill_keys.update({"revenue", "profit", "financial_year", "revenue_year", "profit_year", "year", "report_year"})
+
+        for hit in source_hits:
+            if not isinstance(hit, dict):
+                continue
+            data = hit.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            for key in fill_keys:
+                if merged.get(key):
+                    continue
+                value = self.engine._normalize_spaces(str(data.get(key, "")))
+                if value:
+                    merged[key] = value
+
+        if merged.get("ru_org") and not merged.get("en_org"):
+            try:
+                merged["en_org"], _ = self.engine.normalize_en_org("", merged["ru_org"])
+            except Exception:  # noqa: BLE001
+                merged["en_org"] = ""
+        if merged.get("ru_position") and not merged.get("en_position"):
+            merged["en_position"] = self.engine._generate_en_position(merged["ru_position"])
+        if merged.get("surname_ru") and not merged.get("family_name"):
+            merged["family_name"] = self.engine._translit(merged["surname_ru"])
+        if merged.get("name_ru") and not merged.get("first_name"):
+            merged["first_name"] = self.engine._translit(merged["name_ru"])
+        merged["middle_name_en"] = self.engine._normalize_spaces(str(merged.get("middle_name_en", "")))
+
+        return merged
 
     def _resolve_metric_line(
         self,
@@ -959,7 +1032,7 @@ class NativeNadinApp(tk.Tk):
                 return
 
             amount = self.engine._parse_financial_amount(amount_value)
-            year = self.engine._parse_financial_year(year_value)
+            year = self.engine._parse_financial_year(year_value) or year_from_amount
             if year:
                 year_candidates.append(year)
             if amount != 0:
@@ -1011,6 +1084,17 @@ class NativeNadinApp(tk.Tk):
             source_hits = []
 
         profile = self._merge_profile_with_source_hits(profile, source_hits)
+        normalized_profile = {k: self.engine._normalize_spaces(str(v)) for k, v in profile.items()}
+        render_card_type = "person_in_company" if (
+            normalized_profile.get("ru_org")
+            and normalized_profile.get("surname_ru")
+            and normalized_profile.get("name_ru")
+        ) else ""
+        try:
+            normalized_profile, _ = self.engine.apply_card_rules(normalized_profile, card_type=render_card_type)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to normalize card %s before render", card_id)
+        profile = normalized_profile
 
         revenue_line = self._resolve_metric_line(
             profile,
@@ -1041,9 +1125,9 @@ class NativeNadinApp(tk.Tk):
         self._last_profile_org = self.engine._normalize_spaces(str(profile.get("ru_org", "")))
         self._last_source_names = list(source_names)
         base_source_url = self._extract_source_url(payload, fallback_url=self._pending_source_url)
-        self._last_source_url = self._resolve_rusprofile_source_url(base_source_url) or base_source_url
+        self._last_source_url = base_source_url
         self._pending_source_url = ""
-        self.source_url_var.set(f"URL \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0430: {self._last_source_url or '?'}")
+        self.source_url_var.set(f"URL \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0430: {self._last_source_url or chr(8212)}")
 
     def _render_card_rows(self, rows: list[tuple[str, str]], title: str) -> None:
         self.card_title_var.set(title)
@@ -1057,7 +1141,7 @@ class NativeNadinApp(tk.Tk):
 
         for label, value in rows:
             display = self.engine._normalize_spaces(str(value)) if value is not None else ""
-            self.card_tree.insert("", tk.END, values=(label, display or "?"))
+            self.card_tree.insert("", tk.END, values=(label, display or "\u2014"))
 
     def _copy_selected_card_value(self, _event: object | None = None) -> str:
         selected = self.card_tree.selection()
@@ -1085,7 +1169,7 @@ class NativeNadinApp(tk.Tk):
         lines: list[str] = []
         for label, value in self._current_card_rows:
             display = self.engine._normalize_spaces(str(value)) if value is not None else ""
-            lines.append(f"{label}\t{display or '?'}")
+            lines.append(f"{label}\t{display or chr(8212)}")
 
         self.clipboard_clear()
         self.clipboard_append("\n".join(lines))
@@ -1282,6 +1366,10 @@ class NativeNadinApp(tk.Tk):
         if not (normalized.startswith("http://") or normalized.startswith("https://")):
             return ""
 
+        sanitized_rusprofile = self._sanitize_rusprofile_detail_url(normalized)
+        if sanitized_rusprofile:
+            return sanitized_rusprofile
+
         parsed = urlparse(normalized)
         host = parsed.netloc.lower()
         path = parsed.path.lower()
@@ -1297,44 +1385,106 @@ class NativeNadinApp(tk.Tk):
                 return value
         return ""
 
+    def _sanitize_rusprofile_detail_url(self, value: str) -> str:
+        raw_value = self.engine._normalize_spaces(str(value))
+        if not raw_value:
+            return ""
+
+        variants = [raw_value]
+        for _ in range(2):
+            variants.append(html_unescape(variants[-1]))
+            variants.append(unquote(variants[-1]))
+
+        patterns = (
+            r'https?://(?:www\.)?rusprofile\.ru(?P<path>/id/\d+)',
+            r'(?P<path>/id/\d+)',
+        )
+
+        for text_variant in variants:
+            for pattern in patterns:
+                match = re.search(pattern, text_variant, flags=re.IGNORECASE)
+                if not match:
+                    continue
+                path = match.groupdict().get("path", "")
+                if path:
+                    return f"https://www.rusprofile.ru{path}"
+        return ""
+
+    def _extract_rusprofile_detail_url_from_html(self, html: str) -> str:
+        raw_html = str(html or "")
+        variants = [raw_html]
+        for _ in range(2):
+            variants.append(html_unescape(variants[-1]))
+            variants.append(unquote(variants[-1]))
+
+        patterns = (
+            r'href=[\'"](?P<path>/id/\d+[^\'"]*)[\'"]',
+            r'https?://(?:www\.)?rusprofile\.ru/id/\d+[^"\'\s<]*',
+        )
+
+        for text_variant in variants:
+            for pattern in patterns:
+                match = re.search(pattern, text_variant, flags=re.IGNORECASE)
+                if not match:
+                    continue
+                path = match.groupdict().get("path", "")
+                candidate = f"https://www.rusprofile.ru{path}" if path else match.group(0)
+                sanitized = self._sanitize_rusprofile_detail_url(candidate)
+                if sanitized:
+                    return sanitized
+        return ""
+
     def _lookup_rusprofile_url(self, query: str) -> str:
         normalized_query = self.engine._normalize_spaces(query)
         if not normalized_query:
             return ""
 
         cache_key = normalized_query.lower()
-        cached = self._rusprofile_url_cache.get(cache_key, "")
+        cached = self._sanitize_rusprofile_detail_url(self._rusprofile_url_cache.get(cache_key, ""))
         if cached:
             return cached
 
         search_url = f"https://www.rusprofile.ru/search?query={quote(normalized_query)}"
-        resolved = search_url
+        resolved = ""
 
         try:
-            html = self.engine._fetch_page(search_url, timeout=18, max_retries=1)
+            html = self.engine._fetch_page(search_url, timeout=10, max_retries=1)
         except Exception:  # noqa: BLE001
             html = ""
 
-        if html:
-            path_match = re.search(r"href=['\"](?P<path>/id/\d+[^'\"]*)['\"]", html, flags=re.IGNORECASE)
-            if path_match:
-                resolved = f"https://www.rusprofile.ru{path_match.group('path')}"
-            else:
-                full_match = re.search(r"https?://(?:www\.)?rusprofile\.ru/id/\d+[^\"'\s<]*", html, flags=re.IGNORECASE)
-                if full_match:
-                    resolved = full_match.group(0)
+        is_blocked_html = False
+        checker = getattr(self.engine, "_is_captcha_or_block", None)
+        if html and callable(checker):
+            try:
+                is_blocked_html = bool(checker(html, search_url))
+            except Exception:  # noqa: BLE001
+                is_blocked_html = False
 
-        self._rusprofile_url_cache[cache_key] = resolved
+        if html and not is_blocked_html:
+            resolved_from_html = self._extract_rusprofile_detail_url_from_html(html)
+            if resolved_from_html:
+                resolved = resolved_from_html
+
+        if not resolved:
+            ddg_query = quote(f"site:rusprofile.ru/id {normalized_query}")
+            ddg_url = f"https://duckduckgo.com/html/?q={ddg_query}"
+            try:
+                ddg_html = self.engine._fetch_page(ddg_url, timeout=8, max_retries=1)
+            except Exception:  # noqa: BLE001
+                ddg_html = ""
+            resolved_from_ddg = self._extract_rusprofile_detail_url_from_html(ddg_html)
+            if resolved_from_ddg:
+                resolved = resolved_from_ddg
+
+        self._rusprofile_url_cache[cache_key] = resolved or ""
         return resolved
 
     def _resolve_rusprofile_source_url(self, source_url: str) -> str:
         normalized = self._normalize_screenshot_target(source_url)
         if normalized.startswith("http://") or normalized.startswith("https://"):
-            parsed = urlparse(normalized)
-            host = parsed.netloc.lower()
-            path = parsed.path.lower()
-            if host.endswith("rusprofile.ru") and "/id/" in path:
-                return normalized
+            sanitized = self._sanitize_rusprofile_detail_url(normalized)
+            if sanitized:
+                return sanitized
 
         lookup_query = self._get_rusprofile_lookup_query()
         if lookup_query:
@@ -1343,6 +1493,10 @@ class NativeNadinApp(tk.Tk):
                 return resolved
 
         if normalized.startswith("http://") or normalized.startswith("https://"):
+            parsed = urlparse(normalized)
+            host = parsed.netloc.lower()
+            if host.endswith("rusprofile.ru"):
+                return ""
             if normalized and not self._is_machine_source_url(normalized) and not self._is_generic_landing_url(normalized):
                 return normalized
         return normalized
@@ -1364,6 +1518,7 @@ class NativeNadinApp(tk.Tk):
         def worker() -> None:
             error = ""
             saved_path = ""
+            preview_path = ""
             captured_at = ""
             display_source_url = source_url
             try:
@@ -1379,6 +1534,7 @@ class NativeNadinApp(tk.Tk):
                     metadata_source_url=display_source_url,
                 )
                 saved_path = str(path)
+                preview_path = str(self._build_screenshot_preview_asset(path))
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to capture source screenshot")
                 error = str(exc)
@@ -1386,6 +1542,7 @@ class NativeNadinApp(tk.Tk):
                 0,
                 lambda: self._on_source_screenshot_done(
                     saved_path,
+                    preview_path,
                     captured_at,
                     display_source_url,
                     error,
@@ -1412,32 +1569,147 @@ class NativeNadinApp(tk.Tk):
             return False
         return value.startswith("http://") or value.startswith("https://")
 
+    def _wrap_overlay_line(self, draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
+        words = text.split()
+        if not words:
+            return [""]
+        lines: list[str] = []
+        current = words[0]
+        for word in words[1:]:
+            probe = f"{current} {word}"
+            bbox = draw.textbbox((0, 0), probe, font=font)
+            width = bbox[2] - bbox[0]
+            if width <= max_width:
+                current = probe
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
+
+    def _build_screenshot_preview_asset(self, image_path: Path) -> Path:
+        if Image is None:
+            return image_path
+
+        preview_path = image_path.with_name(f"{image_path.stem}_preview.png")
+        with Image.open(image_path).convert("RGB") as source:
+            preview = source.copy()
+            resampling = getattr(Image, "Resampling", None)
+            lanczos = getattr(resampling, "LANCZOS", getattr(Image, "LANCZOS", getattr(Image, "ANTIALIAS", 1)))
+            preview.thumbnail((320, 180), lanczos)
+            preview.save(preview_path, format="PNG")
+        return preview_path
+
+    def _load_screenshot_font(self, size: int, *, bold: bool = False) -> ImageFont.ImageFont:
+        if ImageFont is None:
+            raise RuntimeError("Pillow font support is unavailable")
+
+        windows_fonts = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+        candidates = [
+            windows_fonts / ("segoeuib.ttf" if bold else "segoeui.ttf"),
+            windows_fonts / ("arialbd.ttf" if bold else "arial.ttf"),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                try:
+                    return ImageFont.truetype(str(candidate), size=size)
+                except Exception:  # noqa: BLE001
+                    continue
+        return ImageFont.load_default()
+
+    def _draw_browser_frame(self, draw: ImageDraw.ImageDraw, width: int, font: ImageFont.ImageFont, source_url: str) -> None:
+        title_bar_height = 32
+        toolbar_height = 46
+        draw.rectangle((0, 0, width, title_bar_height), fill="#1c1f24")
+        draw.rectangle((0, title_bar_height, width, title_bar_height + toolbar_height), fill="#2b2f36")
+        draw.line((0, title_bar_height + toolbar_height, width, title_bar_height + toolbar_height), fill="#111318", width=1)
+
+        tab_left = 44
+        tab_top = 5
+        tab_width = min(220, max(180, width // 6))
+        tab_bottom = title_bar_height + 2
+        draw.rounded_rectangle((tab_left, tab_top, tab_left + tab_width, tab_bottom), radius=6, fill="#2b2f36", outline="#454b55", width=1)
+        draw.text((tab_left + 14, tab_top + 8), "rusprofile.ru", font=font, fill="#f3f4f6")
+
+        button_y = 0
+        button_w = 46
+        right = width
+        buttons = [
+            (right - button_w * 3, "min"),
+            (right - button_w * 2, "max"),
+            (right - button_w, "close"),
+        ]
+        for x, kind in buttons:
+            fill = "#c42b1c" if kind == "close" else "#1c1f24"
+            draw.rectangle((x, button_y, x + button_w, title_bar_height), fill=fill)
+            cx = x + button_w // 2
+            cy = title_bar_height // 2
+            if kind == "min":
+                draw.line((cx - 8, cy + 5, cx + 8, cy + 5), fill="#f3f4f6", width=2)
+            elif kind == "max":
+                draw.rectangle((cx - 7, cy - 5, cx + 7, cy + 7), outline="#f3f4f6", width=2)
+            else:
+                draw.line((cx - 7, cy - 6, cx + 7, cy + 6), fill="#ffffff", width=2)
+                draw.line((cx - 7, cy + 6, cx + 7, cy - 6), fill="#ffffff", width=2)
+
+        nav_y = title_bar_height + 14
+        arrow_color = "#cfd6df"
+        draw.line((18, nav_y + 4, 10, nav_y + 11), fill=arrow_color, width=2)
+        draw.line((10, nav_y + 11, 18, nav_y + 18), fill=arrow_color, width=2)
+        draw.line((32, nav_y + 4, 40, nav_y + 11), fill=arrow_color, width=2)
+        draw.line((40, nav_y + 11, 32, nav_y + 18), fill=arrow_color, width=2)
+
+        address_left = 64
+        address_top = title_bar_height + 8
+        address_right = width - 150
+        address_bottom = address_top + 30
+        draw.rounded_rectangle(
+            (address_left, address_top, address_right, address_bottom),
+            radius=7,
+            fill="#f5f7fa",
+            outline="#7d8590",
+            width=1,
+        )
+
+        text_width = max(160, address_right - address_left - 18)
+        url_lines = self._wrap_overlay_line(draw, source_url, font, text_width)
+        address_text = url_lines[0] if url_lines else source_url
+        if len(address_text) > 120:
+            address_text = address_text[:117] + "..."
+        draw.text((address_left + 12, address_top + 7), address_text, font=font, fill="#111827")
+    def _draw_windows_taskbar(self, draw: ImageDraw.ImageDraw, width: int, top_y: int, height: int, font: ImageFont.ImageFont, captured_dt: datetime) -> None:
+        draw.rectangle((0, top_y, width, top_y + height), fill="#101114")
+        icon_x = 16
+        icon_y = top_y + 10
+        draw.rectangle((icon_x, icon_y, icon_x + 16, icon_y + 16), fill="#2a7de1")
+        draw.line((icon_x + 8, icon_y, icon_x + 8, icon_y + 16), fill="#f5f7fa", width=1)
+        draw.line((icon_x, icon_y + 8, icon_x + 16, icon_y + 8), fill="#f5f7fa", width=1)
+
+        time_text = captured_dt.strftime("%H:%M")
+        date_text = captured_dt.strftime("%d.%m.%Y")
+        time_bbox = draw.textbbox((0, 0), time_text, font=font)
+        date_bbox = draw.textbbox((0, 0), date_text, font=font)
+        text_width = max(time_bbox[2] - time_bbox[0], date_bbox[2] - date_bbox[0])
+        time_x = width - text_width - 18
+        draw.text((time_x, top_y + 6), time_text, font=font, fill="#f8fafc")
+        draw.text((time_x, top_y + 20), date_text, font=font, fill="#d5dbe3")
+
     def _annotate_screenshot_metadata(self, image_path: Path, source_url: str, captured_at: str) -> None:
         if Image is None or ImageDraw is None or ImageFont is None:
             return
 
         with Image.open(image_path).convert("RGB") as body:
-            font = ImageFont.load_default()
-            draw_probe = ImageDraw.Draw(body)
-
-            lines = [f"URL: {source_url}", f"Date/Time: {captured_at}"]
-            wrapped: list[str] = []
-            max_width = max(240, body.width - 20)
-            for line in lines:
-                wrapped.extend(self._wrap_overlay_line(draw_probe, line, font, max_width))
-
-            line_height = 18
-            padding = 8
-            header_height = padding * 2 + line_height * len(wrapped)
-            result = Image.new("RGB", (body.width, body.height + header_height), "#0f172a")
-            result.paste(body, (0, header_height))
+            font = self._load_screenshot_font(15)
+            taskbar_font = self._load_screenshot_font(13)
+            captured_dt = datetime.strptime(captured_at, "%d.%m.%Y %H:%M:%S")
+            top_height = 78
+            bottom_height = 40
+            result = Image.new("RGB", (body.width, body.height + top_height + bottom_height), "#dfe3e8")
+            result.paste(body, (0, top_height))
 
             draw = ImageDraw.Draw(result)
-            y = padding
-            for line in wrapped:
-                draw.text((10, y), line, font=font, fill="#f8fafc")
-                y += line_height
-
+            self._draw_browser_frame(draw, body.width, font, source_url)
+            self._draw_windows_taskbar(draw, body.width, top_height + body.height, bottom_height, taskbar_font, captured_dt)
             result.save(image_path, format="PNG")
 
     def _find_headless_browser(self) -> Path | None:
@@ -1488,9 +1760,9 @@ class NativeNadinApp(tk.Tk):
                     "--disable-crash-reporter",
                     "--disable-blink-features=AutomationControlled",
                     "--hide-scrollbars",
-                    "--window-size=1366,1700",
+                    "--window-size=1600,900",
                     "--lang=ru-RU",
-                    "--virtual-time-budget=9000",
+                    "--virtual-time-budget=3000",
                     f"--user-data-dir={profile_dir}",
                     f"--user-agent={user_agent}",
                     f"--screenshot={output_path}",
@@ -1500,11 +1772,11 @@ class NativeNadinApp(tk.Tk):
                     command,
                     capture_output=True,
                     text=True,
-                    timeout=60,
+                    timeout=15,
                     check=False,
                     creationflags=creationflags,
                 )
-            if completed.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+            if output_path.exists() and output_path.stat().st_size > 0:
                 return True, ""
             stderr = (completed.stderr or "").strip()
             stdout = (completed.stdout or "").strip()
@@ -1615,23 +1887,17 @@ $web.Dispose()
         else:
             failures.append("headless_browser_not_found")
 
-        if target.startswith("http://") or target.startswith("https://"):
+        use_splash = os.getenv("NADIN_SCREENSHOT_USE_SPLASH", "").strip().lower() in {"1", "true", "yes"}
+        if use_splash and (target.startswith("http://") or target.startswith("https://")):
             splash_ok, splash_details = self._capture_with_splash(target, output_path)
             if splash_ok:
                 self._annotate_screenshot_metadata(output_path, meta_source_url, captured_at)
                 return output_path, captured_at
             failures.append(f"splash: {splash_details}")
 
-        try:
-            self._capture_webpage_screenshot_legacy_ie(target, output_path)
-            self._annotate_screenshot_metadata(output_path, meta_source_url, captured_at)
-            return output_path, captured_at
-        except Exception as exc:  # noqa: BLE001
-            failures.append(str(exc))
-
         raise RuntimeError("\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u043e\u0437\u0434\u0430\u0442\u044c \u0441\u043a\u0440\u0438\u043d\u0448\u043e\u0442: " + "; ".join(failures))
 
-    def _on_source_screenshot_done(self, saved_path: str, captured_at: str, source_url: str, error: str, auto: bool) -> None:
+    def _on_source_screenshot_done(self, saved_path: str, preview_path: str, captured_at: str, source_url: str, error: str, auto: bool) -> None:
         self._screenshot_busy = False
         if error:
             self.status_var.set("Ошибка создания скриншота")
@@ -1640,7 +1906,8 @@ $web.Dispose()
             return
 
         self._last_screenshot_path = saved_path
-        self._update_screenshot_preview(saved_path)
+        self._last_screenshot_preview_path = preview_path
+        self._update_screenshot_preview(preview_path or saved_path)
         self.screenshot_meta_var.set(f"Скриншот: {captured_at}")
         self.source_url_var.set(f"URL источника: {source_url}")
 
@@ -1649,6 +1916,8 @@ $web.Dispose()
         self.status_var.set(f"Скриншот сохранен: {Path(saved_path).name}")
 
     def _update_screenshot_preview(self, screenshot_path: str) -> None:
+        if not screenshot_path:
+            return
         image = tk.PhotoImage(file=screenshot_path)
         max_w = 320
         max_h = 180

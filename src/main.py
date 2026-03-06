@@ -1595,13 +1595,19 @@ class CompanyWebApp:
 
     def _normalize_positions_ru(self, raw: str) -> tuple[str, list[str]]:
         notes: list[str] = []
-        items = [self._normalize_spaces(x.replace(" и ", ", ")) for x in raw.split(",") if self._normalize_spaces(x)]
+        raw = raw.replace(" и ", ", ").replace(";", ",")
+        items = [self._normalize_spaces(x) for x in raw.split(",") if self._normalize_spaces(x)]
         normalized: list[str] = []
+        seen: set[str] = set()
         for item in items:
             cleaned = item.replace("ИО", "Исполняющий обязанности")
             if cleaned != item:
                 notes.append("Должность RU: сокращения раскрыты")
-            normalized.append(cleaned[:1].upper() + cleaned[1:].lower() if cleaned else "")
+            canonical = self._normalize_position_ru(cleaned)
+            key = self._normalize_ru_position_key(canonical)
+            if key and key not in seen:
+                seen.add(key)
+                normalized.append(canonical)
         return ", ".join(normalized), notes
 
     def _normalize_positions_en(self, raw: str) -> tuple[str, list[str]]:
@@ -1609,6 +1615,7 @@ class CompanyWebApp:
         raw = raw.replace(" and ", ", ").replace(" & ", ", ")
         items = [self._normalize_spaces(x) for x in raw.split(",") if self._normalize_spaces(x)]
         normalized: list[str] = []
+        seen: set[str] = set()
         abbreviations = {"CEO", "CFO", "COO", "CTO", "CIO", "CMO", "CPO", "CSO", "CISO", "CHRO", "CCO", "CLO", "CDO", "EVP", "SVP", "VP", "GM"}
         small_words = {"and", "of", "the", "a", "an", "to", "for", "in", "on", "at", "by", "or"}
         for item in items:
@@ -1620,7 +1627,11 @@ class CompanyWebApp:
                     words.append(word.lower())
                 else:
                     words.append(word[:1].upper() + word[1:].lower())
-            normalized.append(" ".join(words))
+            joined = " ".join(words)
+            key = joined.lower()
+            if key not in seen:
+                seen.add(key)
+                normalized.append(joined)
         if " and " in raw.lower() or " & " in raw:
             notes.append("Position EN: разделители приведены к запятым")
         return ", ".join(normalized), notes
@@ -1827,6 +1838,49 @@ class CompanyWebApp:
         if not value or value == "—":
             return ""
         return self._transliterate_ru_to_en(value)
+
+    def _format_ru_person_name(self, value: str) -> str:
+        text_value = self._normalize_spaces(str(value or ""))
+        if not text_value:
+            return ""
+
+        particles = {"кызы", "кизи", "гызы", "оглы", "огли", "улы", "уулу"}
+        tokens: list[str] = []
+        for token in text_value.split():
+            parts: list[str] = []
+            for chunk in token.split("-"):
+                lowered = chunk.lower()
+                if lowered in particles:
+                    parts.append(lowered)
+                elif chunk:
+                    parts.append(chunk[:1].upper() + chunk[1:].lower())
+            tokens.append("-".join(parts))
+        return " ".join(tokens)
+
+    def _format_latin_person_name(self, value: str) -> str:
+        text_value = self._normalize_spaces(str(value or ""))
+        if not text_value:
+            return ""
+
+        def _format_token(token: str) -> str:
+            hyphen_parts: list[str] = []
+            for hyphen_chunk in token.split("-"):
+                apostrophe_parts: list[str] = []
+                for apostrophe_chunk in hyphen_chunk.split("'"):
+                    if apostrophe_chunk:
+                        apostrophe_parts.append(apostrophe_chunk[:1].upper() + apostrophe_chunk[1:].lower())
+                    else:
+                        apostrophe_parts.append("")
+                hyphen_parts.append("'".join(apostrophe_parts))
+            return "-".join(hyphen_parts)
+
+        return " ".join(_format_token(token) for token in text_value.split())
+
+    def _normalize_middle_name_en_value(self, value: str) -> str:
+        normalized = self._normalize_spaces(str(value or ""))
+        if not normalized or re.search(r"[А-Яа-яЁё]", normalized):
+            return ""
+        return self._format_latin_person_name(normalized)
 
     def _translit(self, token: str) -> str:
         if not re.search(r"[A-Za-zА-Яа-яЁё]", token):
@@ -2996,7 +3050,7 @@ class CompanyWebApp:
             "captcha", "проверка браузера", "cloudflare", "ddos-guard",
             "access denied", "just a moment", "введите код", "подтвердите, что вы человек",
             "браузер не подходит", "включите javascript", "разрешите куки",
-            "?????????????? ???? ??????-???????????????? ??????????????", "navigation to the webpage was canceled",
+            "переход на веб-страницу отменен", "navigation to the webpage was canceled",
             "internet explorer cannot display the webpage", "this page can't be displayed",
             "res://ieframe.dll/", "errorpagetemplate.css",
         ]
@@ -3327,13 +3381,15 @@ $web.Dispose()
         if html:
             return html
 
-        html = self._fetch_page_with_headless_browser(url, timeout=max(timeout, self._rusprofile_browser_timeout))
-        if html:
-            return html
+        browser_fallback_enabled = os.getenv("NADIN_RUSPROFILE_FETCH_BROWSER", "").strip().lower() in {"1", "true", "yes"}
+        if browser_fallback_enabled:
+            html = self._fetch_page_with_headless_browser(url, timeout=max(timeout, self._rusprofile_browser_timeout))
+            if html:
+                return html
 
-        html = self._fetch_page_with_legacy_webbrowser(url, timeout=max(timeout, self._rusprofile_browser_timeout))
-        if html:
-            return html
+            html = self._fetch_page_with_legacy_webbrowser(url, timeout=max(timeout, self._rusprofile_browser_timeout))
+            if html:
+                return html
 
         return None
 
@@ -5068,36 +5124,33 @@ $web.Dispose()
     def _enrich_merged_data(self, data: dict[str, Any]) -> None:
         if data.get("ru_position") and not data.get("position") and not data.get("en_position"):
             data["position"] = self._generate_en_position(str(data["ru_position"]))
-        if data.get("middle_name_ru") and not data.get("middle_name_en"):
-            data["middle_name_en"] = self._generate_middle_name_en(str(data["middle_name_ru"]))
+        data["middle_name_en"] = self._normalize_middle_name_en_value(data.get("middle_name_en", ""))
         if data.get("gender") and not data.get("appeal"):
             data["appeal"] = "Г-н" if data["gender"] == "М" else "Г-жа"
         if data.get("ru_org") and "Сбербанк" in str(data["ru_org"]) and "ПАО" not in str(data["ru_org"]):
             data["ru_org"] = f"{data['ru_org']} ПАО"
 
     def _normalize_card_data(self, profile: dict[str, str], field_sources: dict[str, str]) -> dict[str, str]:
-        """Универсальная нормализация данных карточки."""
-        if profile.get("ru_position") and not profile.get("en_position"):
-            profile["en_position"] = self._generate_en_position(profile["ru_position"])
-            if profile.get("en_position"):
+        """Universal card normalization before save/render."""
+        if profile.get("ru_position"):
+            generated_position = self._generate_en_position(profile["ru_position"])
+            if generated_position:
+                profile["en_position"] = generated_position
                 field_sources.setdefault("en_position", "Автогенерация из RU")
-        if not profile.get("middle_name_en"):
-            if profile.get("middle_name"):
-                profile["middle_name_en"] = self._generate_middle_name_en(profile["middle_name"])
-            elif profile.get("middle_name_ru"):
-                profile["middle_name_en"] = self._generate_middle_name_en(profile["middle_name_ru"])
+        profile["middle_name_en"] = self._normalize_middle_name_en_value(profile.get("middle_name_en", ""))
         if not profile.get("appeal") and profile.get("gender"):
             profile["appeal"] = "Г-н" if profile["gender"] == "М" else "Г-жа"
             field_sources.setdefault("appeal", "Автоопределение")
         return profile
 
     def apply_card_rules(self, profile: dict[str, str], card_type: str = "") -> tuple[dict[str, str], list[str]]:
-        """Применяет финальную нормализацию карточки перед сохранением."""
+        """Apply final normalization to the card before save."""
         normalized = dict(profile)
         notes: list[str] = []
 
         pos_raw = self._normalize_spaces(normalized.get("ru_position", ""))
         cleaned_position, pos_surname, pos_name, pos_middle, _ = self._clean_position_and_extract_fio(pos_raw)
+        extracted_position = bool(cleaned_position)
         if cleaned_position:
             normalized["ru_position"] = cleaned_position
             pos_raw = cleaned_position
@@ -5109,7 +5162,7 @@ $web.Dispose()
         org_type = self._detect_org_type(normalized.get("ru_org", ""))
 
         if pos_raw:
-            normalized["ru_position"] = self.sanitize_ru_position(pos_raw) or ""
+            normalized["ru_position"] = pos_raw if extracted_position else (self.sanitize_ru_position(pos_raw) or "")
         else:
             normalized["ru_position"] = self._infer_ru_position_from_en(
                 normalized.get("en_position") or normalized.get("position", ""),
@@ -5119,9 +5172,8 @@ $web.Dispose()
         ru_org, ru_notes = self.normalize_ru_org(normalized.get("ru_org", ""))
         en_org, en_notes = self.normalize_en_org(normalized.get("en_org", ""), ru_org)
         ru_pos, ru_pos_notes = self._normalize_positions_ru(normalized.get("ru_position", ""))
-        en_pos_raw = normalized.get("en_position") or normalized.get("position", "")
-        if ru_pos:
-            en_pos_raw = en_pos_raw or self._generate_en_position(ru_pos)
+        generated_en_position = self._generate_en_position(ru_pos) if ru_pos else ""
+        en_pos_raw = generated_en_position or normalized.get("en_position") or normalized.get("position", "")
         en_pos, en_pos_notes = self._normalize_positions_en(en_pos_raw)
 
         normalized["ru_org"] = ru_org
@@ -5147,13 +5199,28 @@ $web.Dispose()
             ):
                 normalized.pop(field, None)
         else:
+            normalized["surname_ru"] = self._format_ru_person_name(normalized.get("surname_ru", ""))
+            normalized["name_ru"] = self._format_ru_person_name(normalized.get("name_ru", ""))
+            normalized["middle_name_ru"] = self._format_ru_person_name(normalized.get("middle_name_ru", ""))
+            normalized["family_name"] = self._format_latin_person_name(normalized.get("family_name", ""))
+            normalized["first_name"] = self._format_latin_person_name(normalized.get("first_name", ""))
+            normalized["middle_name_en"] = self._normalize_middle_name_en_value(normalized.get("middle_name_en", ""))
             if normalized.get("middle_name_ru"):
-                middle_en = self._normalize_spaces(str(normalized.get("middle_name_en", "")))
-                if not middle_en or re.search(r"[А-Яа-яЁё]", middle_en):
-                    normalized["middle_name_en"] = self._generate_middle_name_en(normalized["middle_name_ru"])
+                normalized["middle_name_en"] = ""
+
+            if normalized.get("surname_ru") and not normalized.get("family_name"):
+                normalized["family_name"] = self._format_latin_person_name(self._translit(normalized["surname_ru"]))
+            if normalized.get("name_ru") and not normalized.get("first_name"):
+                normalized["first_name"] = self._format_latin_person_name(self._translit(normalized["name_ru"]))
             if not normalized.get("appeal"):
                 normalized["appeal"] = self._derive_salutation(normalized.get("gender", ""))
             normalized["salutation"] = normalized.get("appeal", "")
+            if normalized.get("surname_ru") and not normalized.get("surname"):
+                normalized["surname"] = normalized["surname_ru"]
+            if normalized.get("name_ru") and not normalized.get("name"):
+                normalized["name"] = normalized["name_ru"]
+            if normalized.get("middle_name_ru") and not normalized.get("middle_name"):
+                normalized["middle_name"] = normalized["middle_name_ru"]
 
         notes.extend(ru_notes)
         notes.extend(en_notes)
@@ -5533,11 +5600,7 @@ $web.Dispose()
         if profile.get("middle_name_ru") and not profile.get("middle_name"):
             profile["middle_name"] = profile["middle_name_ru"]
 
-        if not profile.get("middle_name_en"):
-            if profile.get("middle_name"):
-                profile["middle_name_en"] = self._generate_middle_name_en(profile["middle_name"])
-            elif profile.get("middle_name_ru"):
-                profile["middle_name_en"] = self._generate_middle_name_en(profile["middle_name_ru"])
+        profile["middle_name_en"] = self._normalize_middle_name_en_value(profile.get("middle_name_en", ""))
 
         if not profile.get("family_name") and profile.get("surname"):
             profile["family_name"] = self._translit(profile["surname"])
@@ -5679,8 +5742,7 @@ $web.Dispose()
             elif normalized_data.get("en_position"):
                 normalized_data["en_position"], _ = self._normalize_positions_en(str(normalized_data["en_position"]))
 
-            if normalized_data.get("middle_name_ru") and not normalized_data.get("middle_name_en"):
-                normalized_data["middle_name_en"] = self._translit(str(normalized_data["middle_name_ru"]))
+            normalized_data["middle_name_en"] = self._normalize_middle_name_en_value(normalized_data.get("middle_name_en", ""))
             if normalized_data.get("gender") and not normalized_data.get("appeal"):
                 normalized_data["appeal"] = "Г-н" if normalized_data["gender"] == "М" else "Г-жа"
 
@@ -5801,6 +5863,12 @@ $web.Dispose()
         if not text:
             return 0
 
+        text = re.sub(r"\((19\d{2}|20\d{2})\)", " ", text)
+        text = re.sub(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", " ", text)
+        text = self._normalize_spaces(text)
+        if not text:
+            return 0
+
         sign = -1 if re.search(r"(^-|\s-)", text) else 1
         unsigned = text.replace("-", " ")
         parsed = self._extract_revenue(unsigned)
@@ -5822,14 +5890,14 @@ $web.Dispose()
         year_candidates: list[int] = []
 
         if isinstance(profile, dict):
-            for key in ("financial_year", "revenue_year", "profit_year", "year"):
+            for key in ("financial_year", "revenue_year", "profit_year", "year", "report_year", "revenue", "profit", "income", "net_profit", "clean_profit"):
                 parsed_year = self._parse_financial_year(profile.get(key, ""))
                 if parsed_year:
                     year_candidates.append(parsed_year)
 
         for hit in source_hits:
             data = hit.get("data", {}) if isinstance(hit.get("data"), dict) else {}
-            for key in ("financial_year", "revenue_year", "profit_year", "year", "report_year"):
+            for key in ("financial_year", "revenue_year", "profit_year", "year", "report_year", "revenue", "profit", "income", "net_profit", "clean_profit"):
                 parsed_year = self._parse_financial_year(data.get(key, ""))
                 if parsed_year:
                     year_candidates.append(parsed_year)
@@ -5839,25 +5907,41 @@ $web.Dispose()
         return self._default_financial_year()
 
     def _format_financial_amount_mln(self, amount: int) -> str:
-        mln = amount / 1_000_000
-        abs_mln = abs(mln)
-        if abs_mln >= 100:
-            amount_str = f"{mln:,.0f}"
-        elif abs_mln >= 10:
-            amount_str = f"{mln:,.1f}"
+        abs_amount = abs(amount)
+        if abs_amount >= 1_000_000_000:
+            value = amount / 1_000_000_000
+            unit = "млрд руб."
+        elif abs_amount >= 1_000_000:
+            value = amount / 1_000_000
+            unit = "млн руб."
+        elif abs_amount >= 1_000:
+            value = amount / 1_000
+            unit = "тыс. руб."
         else:
-            amount_str = f"{mln:,.2f}"
+            value = float(amount)
+            unit = "руб."
+
+        abs_value = abs(value)
+        if unit == "руб." or abs_value >= 100:
+            amount_str = f"{value:,.0f}"
+        elif abs_value >= 10:
+            amount_str = f"{value:,.1f}"
+        else:
+            amount_str = f"{value:,.2f}"
         amount_str = amount_str.replace(",", " ")
         amount_str = re.sub(r"\.0+$", "", amount_str)
         amount_str = re.sub(r"(\.\d*?)0+$", r"\1", amount_str)
         amount_str = amount_str.replace(".", ",")
-        return f"{amount_str} млн руб."
+        return f"{amount_str} {unit}"
 
     def _format_financial_line(self, amount_value: Any, year: int) -> str:
+        text = self._normalize_spaces(str(amount_value))
+        parsed_year = self._parse_financial_year(text)
+        effective_year = parsed_year or year
         amount = self._parse_money_amount(amount_value)
         if amount == 0:
-            return f"Данных нет ({year})"
-        return f"{self._format_financial_amount_mln(amount)} ({year})"
+            return f"Данных нет ({effective_year})"
+        return f"{self._format_financial_amount_mln(amount)} ({effective_year})"
 
     def _render_search_results(
         self,
@@ -6675,7 +6759,7 @@ $web.Dispose()
         card_obj = Card.from_profile(profile_data)
         profile_data["family_name"] = card_obj.family_name or profile_data.get("family_name", "")
         profile_data["first_name"] = card_obj.first_name or profile_data.get("first_name", "")
-        profile_data["middle_name_en"] = card_obj.middle_name_en or profile_data.get("middle_name_en", profile_data.get("middle_name", ""))
+        profile_data["middle_name_en"] = (card_obj.middle_name_en or profile_data.get("middle_name_en", "")).strip()
         card_id = self._create_autofill_card(profile_data, notes, [{"source": s} for s in source_names], search_trace, field_provenance)
         return "", "302 Found", [("Location", f"/card/{card_id}")]
 

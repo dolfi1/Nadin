@@ -782,14 +782,14 @@ def test_fetch_page_rusprofile_uses_cloudscraper_fallback(app, monkeypatch):
     assert calls == [('https://www.rusprofile.ru/id/362378', False)]
 
 
-def test_fetch_page_rusprofile_uses_browser_after_cloudscraper_failure(app, monkeypatch):
+def test_fetch_page_rusprofile_skips_browser_without_flag(app, monkeypatch):
     monkeypatch.setattr(app, '_fetch_page_basic', lambda *_a, **_k: None)
     monkeypatch.setattr(app, '_fetch_rusprofile_page_with_cloudscraper', lambda *_a, **_k: None)
-    monkeypatch.setattr(app, '_fetch_page_with_headless_browser', lambda url, timeout=30: '<html>browser</html>')
+    monkeypatch.setattr(app, '_fetch_page_with_headless_browser', lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('browser fallback should not run')))
 
     html = app._fetch_page('https://www.rusprofile.ru/search?query=vtb')
 
-    assert html == '<html>browser</html>'
+    assert html is None
 
 
 def test_extract_rusprofile_search_hits_with_selector_company(app):
@@ -823,7 +823,7 @@ def test_native_app_extract_source_url_prefers_rusprofile_detail():
     app = _make_native_app()
     payload = {
         "source_hits": [
-            {"url": "https://egrul.nalog.ru/index.html?query=7702070139", "source": "??? ?????"},
+            {"url": "https://egrul.nalog.ru/index.html?query=7702070139", "source": "\u0424\u041d\u0421 \u0415\u0413\u0420\u042e\u041b"},
             {"url": "https://www.rusprofile.ru/id/362378", "source": "rusprofile.ru"},
         ]
     }
@@ -875,3 +875,106 @@ def test_native_app_humanize_trace_line_empty():
     line = app._humanize_trace_line("trace: focus.kontur.ru - provider_called_empty")
 
     assert line == "• Источник: focus.kontur.ru — данных не найдено"
+
+
+def test_native_app_compose_card_rows_exists_and_formats_sources():
+    app = _make_native_app()
+
+    rows = app._compose_card_rows(
+        {"ru_org": "\u0411\u0430\u043d\u043a \u0412\u0422\u0411 \u041f\u0410\u041e", "inn": "7702070139"},
+        status="\u041d\u0430\u0439\u0434\u0435\u043d\u043e",
+        source_names=["\u0424\u041d\u0421 \u0415\u0413\u0420\u042e\u041b", "Scrapy Merge", "\u0424\u041d\u0421 \u0415\u0413\u0420\u042e\u041b"],
+        revenue_line="\u0414\u0430\u043d\u043d\u044b\u0445 \u043d\u0435\u0442 (2025)",
+        profit_line="\u0414\u0430\u043d\u043d\u044b\u0445 \u043d\u0435\u0442 (2025)",
+    )
+
+    assert ("\u0421\u0442\u0430\u0442\u0443\u0441", "\u041d\u0430\u0439\u0434\u0435\u043d\u043e") in rows
+    assert ("\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0438", "\u0424\u041d\u0421 \u0415\u0413\u0420\u042e\u041b, Scrapy Merge") in rows
+
+
+def test_native_app_merge_profile_with_source_hits_does_not_generate_middle_name_en():
+    app = _make_native_app()
+    app.engine.normalize_en_org = lambda _en, ru: ("VTB Bank", "")
+    app.engine._generate_en_position = lambda value: f"EN:{value}"
+    app.engine._translit = lambda value: f"TR:{value}"
+
+    merged = app._merge_profile_with_source_hits(
+        {"ru_org": "\u0411\u0430\u043d\u043a \u0412\u0422\u0411 \u041f\u0410\u041e", "surname_ru": "\u041a\u041e\u0421\u0422\u0418\u041d", "name_ru": "\u0410\u041d\u0414\u0420\u0415\u0419", "middle_name_ru": "\u041b\u0415\u041e\u041d\u0418\u0414\u041e\u0412\u0418\u0427"},
+        [{"data": {"ru_position": "\u041f\u0440\u0435\u0434\u0441\u0435\u0434\u0430\u0442\u0435\u043b\u044c \u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u044f", "inn": "7702070139"}}],
+    )
+
+    assert merged["inn"] == "7702070139"
+    assert merged["en_org"] == "VTB Bank"
+    assert merged["en_position"] == "EN:\u041f\u0440\u0435\u0434\u0441\u0435\u0434\u0430\u0442\u0435\u043b\u044c \u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u044f"
+    assert merged["family_name"] == "TR:\u041a\u041e\u0421\u0422\u0418\u041d"
+    assert merged["middle_name_en"] == ""
+
+
+def test_native_app_lookup_rusprofile_url_falls_back_to_duckduckgo():
+    app = _make_native_app()
+    calls = []
+
+    def fake_fetch_page(url, timeout=0, max_retries=0):
+        calls.append(url)
+        if "duckduckgo.com" in url:
+            return '<a href="https://www.rusprofile.ru/id/362378">VTB</a>'
+        return "<html>blocked</html>"
+
+    app.engine._fetch_page = fake_fetch_page
+
+    resolved = app._lookup_rusprofile_url("7702070139")
+
+    assert resolved == "https://www.rusprofile.ru/id/362378"
+    assert any("duckduckgo.com" in url for url in calls)
+
+
+def test_native_app_sanitize_rusprofile_detail_url_strips_tracking():
+    app = _make_native_app()
+
+    resolved = app._sanitize_rusprofile_detail_url(
+        "https://www.rusprofile.ru/id/76374&amp;rut=c49c7792244ac20cc16663d2c8ccf65e4faae0f2ed411438b9ca719105795553"
+    )
+
+    assert resolved == "https://www.rusprofile.ru/id/76374"
+
+
+def test_native_app_lookup_rusprofile_url_ignores_cached_search_url():
+    app = _make_native_app()
+    app._rusprofile_url_cache["7702070139"] = "https://www.rusprofile.ru/search?query=7702070139"
+    calls = []
+
+    def fake_fetch_page(url, timeout=0, max_retries=0):
+        calls.append(url)
+        if "duckduckgo.com" in url:
+            return '<a href="https://www.rusprofile.ru/id/362378&amp;rut=test">VTB</a>'
+        return "<html>blocked</html>"
+
+    app.engine._fetch_page = fake_fetch_page
+
+    resolved = app._lookup_rusprofile_url("7702070139")
+
+    assert resolved == "https://www.rusprofile.ru/id/362378"
+    assert any("duckduckgo.com" in url for url in calls)
+
+
+def test_apply_card_rules_person_in_company_normalizes_fio_and_position(app):
+    profile = {
+        "ru_org": "Банк ВТБ ПАО",
+        "surname_ru": "КОСТИН",
+        "name_ru": "АНДРЕЙ",
+        "middle_name_ru": "ЛЕОНИДОВИЧ",
+        "ru_position": "ПРЕЗИДЕНТ, ПРЕДСЕДАТЕЛЬ ПРАВЛЕНИЯ",
+        "middle_name_en": "Leonidovich",
+    }
+
+    normalized, _ = app.apply_card_rules(profile, "person_in_company")
+
+    assert normalized["surname_ru"] == "Костин"
+    assert normalized["name_ru"] == "Андрей"
+    assert normalized["middle_name_ru"] == "Леонидович"
+    assert normalized["middle_name_en"] == ""
+    assert normalized["en_position"] == "President, Chairman of the Board"
+
+
+def test_format_financial_line_uses_available_historical_year(app):
+    assert app._format_financial_line("300 тыс. руб. (2021)", 2025) == "300 тыс. руб. (2021)"

@@ -70,7 +70,7 @@ class Card:
         payload["patronymic_ru"] = profile.get("patronymic_ru") or profile.get("middle_name_ru", "")
         payload["surname_en"] = profile.get("surname_en") or profile.get("family_name", "")
         payload["name_en"] = profile.get("name_en") or profile.get("first_name", "")
-        payload["middle_name_en"] = profile.get("middle_name_en") or profile.get("middle_name", "")
+        payload["middle_name_en"] = profile.get("middle_name_en", "") or ""
         payload["family_name"] = profile.get("family_name") or profile.get("surname_en", "")
         payload["first_name"] = profile.get("first_name") or profile.get("name_en", "")
         payload["ru_org"] = profile.get("ru_org", "")
@@ -314,8 +314,6 @@ class CardBot:
     def _enrich_card(self, card: Card) -> None:
         if card.ru_position and not card.en_position:
             card.en_position = self._generate_en_position(card.ru_position)
-        if card.patronymic_ru and not card.middle_name_en:
-            card.middle_name_en = self._generate_middle_name_en(card.patronymic_ru)
         if card.gender and not card.appeal:
             card.appeal = APPEAL_MAP.get(card.gender, "")
 
