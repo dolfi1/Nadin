@@ -8,6 +8,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import site
 import threading
 import time
 from datetime import datetime
@@ -18,7 +20,20 @@ from urllib.parse import quote, unquote, urlparse
 
 _OPTIONAL_DEPS_DIR = Path(__file__).resolve().parents[1] / ".deps"
 if _OPTIONAL_DEPS_DIR.exists():
-    sys.path.insert(0, str(_OPTIONAL_DEPS_DIR))
+    _optional_path = str(_OPTIONAL_DEPS_DIR)
+    if _optional_path not in sys.path:
+        sys.path.append(_optional_path)
+
+try:
+    _USER_SITE = site.getusersitepackages()
+except Exception:  # noqa: BLE001
+    _USER_SITE = ""
+try:
+    _USER_SITE_EXISTS = bool(_USER_SITE) and Path(_USER_SITE).exists()
+except OSError:
+    _USER_SITE_EXISTS = False
+if _USER_SITE_EXISTS and _USER_SITE not in sys.path:
+    site.addsitedir(_USER_SITE)
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -2009,30 +2024,40 @@ class NativeNadinApp(tk.Tk):
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         attempts = ["--headless=new", "--headless"]
         last_details = ""
+        user_agent = self.engine._get_random_user_agent()
 
         for headless_flag in attempts:
             if output_path.exists():
                 output_path.unlink(missing_ok=True)
-            command = [
-                str(browser_path),
-                headless_flag,
-                "--disable-gpu",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-breakpad",
-                "--hide-scrollbars",
-                "--window-size=1366,1700",
-                f"--screenshot={output_path}",
-                source_url,
-            ]
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=45,
-                check=False,
-                creationflags=creationflags,
-            )
+            with tempfile.TemporaryDirectory(prefix="nadin_screenshot_browser_") as profile_dir:
+                command = [
+                    str(browser_path),
+                    headless_flag,
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-breakpad",
+                    "--disable-crash-reporter",
+                    "--disable-blink-features=AutomationControlled",
+                    "--hide-scrollbars",
+                    "--window-size=1366,1700",
+                    "--lang=ru-RU",
+                    "--virtual-time-budget=9000",
+                    f"--user-data-dir={profile_dir}",
+                    f"--user-agent={user_agent}",
+                    f"--screenshot={output_path}",
+                    source_url,
+                ]
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                    creationflags=creationflags,
+                )
             if completed.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
                 return True, ""
             stderr = (completed.stderr or "").strip()

@@ -761,3 +761,41 @@ def test_detect_input_type_single_token_company_query(app):
 def test_detect_input_type_three_part_name_query(app):
     query = "Греф Герман Оскарович"
     assert app.detect_input_type(query) == "PERSON_TEXT"
+
+
+def test_fetch_page_rusprofile_uses_cloudscraper_fallback(app, monkeypatch):
+    calls = []
+
+    def fake_basic(url, timeout=15, max_retries=5, block_host_on_block=True):
+        calls.append((url, block_host_on_block))
+        return None
+
+    monkeypatch.setattr(app, '_fetch_page_basic', fake_basic)
+    monkeypatch.setattr(app, '_fetch_rusprofile_page_with_cloudscraper', lambda url, timeout=20: '<html>cloud</html>')
+    monkeypatch.setattr(app, '_fetch_page_with_headless_browser', lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('browser fallback should not run')))
+
+    html = app._fetch_page('https://www.rusprofile.ru/id/362378')
+
+    assert html == '<html>cloud</html>'
+    assert calls == [('https://www.rusprofile.ru/id/362378', False)]
+
+
+def test_fetch_page_rusprofile_uses_browser_after_cloudscraper_failure(app, monkeypatch):
+    monkeypatch.setattr(app, '_fetch_page_basic', lambda *_a, **_k: None)
+    monkeypatch.setattr(app, '_fetch_rusprofile_page_with_cloudscraper', lambda *_a, **_k: None)
+    monkeypatch.setattr(app, '_fetch_page_with_headless_browser', lambda url, timeout=30: '<html>browser</html>')
+
+    html = app._fetch_page('https://www.rusprofile.ru/search?query=vtb')
+
+    assert html == '<html>browser</html>'
+
+
+def test_extract_rusprofile_search_hits_with_selector_company(app):
+    html = '<html><body><div class="result"><a href="/id/362378">Company Example</a><span>INN 7704217370</span></div></body></html>'
+
+    hits = app._extract_rusprofile_search_hits_with_selector(html, search_type='company')
+
+    assert hits
+    assert hits[0]['url'] == 'https://www.rusprofile.ru/id/362378'
+    assert hits[0]['inn'] == '7704217370'
+    assert hits[0]['org'] == 'Company Example'

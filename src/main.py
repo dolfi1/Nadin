@@ -29,6 +29,8 @@ from typing import Any, Callable
 import shutil
 import subprocess
 import sys
+import tempfile
+import site
 import requests
 from bs4 import BeautifulSoup
 from bs4 import Tag
@@ -50,6 +52,37 @@ from constants import (
     RU_TO_EN_OPF,
 )
 from scrape_client import ScrapeClient
+
+_OPTIONAL_DEPS_DIR = Path(__file__).resolve().parents[1] / ".deps"
+if _OPTIONAL_DEPS_DIR.exists():
+    _optional_path = str(_OPTIONAL_DEPS_DIR)
+    if _optional_path not in sys.path:
+        sys.path.append(_optional_path)
+
+try:
+    _USER_SITE = site.getusersitepackages()
+except Exception:  # noqa: BLE001
+    _USER_SITE = ""
+try:
+    _USER_SITE_EXISTS = bool(_USER_SITE) and Path(_USER_SITE).exists()
+except OSError:
+    _USER_SITE_EXISTS = False
+if _USER_SITE_EXISTS and _USER_SITE not in sys.path:
+    site.addsitedir(_USER_SITE)
+
+try:
+    import cloudscraper
+except Exception:  # noqa: BLE001
+    cloudscraper = None
+
+try:
+    from parsel import Selector as HtmlSelector
+except Exception:  # noqa: BLE001
+    try:
+        from scrapy.selector import Selector as HtmlSelector
+    except Exception:  # noqa: BLE001
+        HtmlSelector = None
+
 try:
     from nadin_scrapy.service import merge_provider_payloads as scrapy_merge_provider_payloads
 except Exception:  # pragma: no cover - optional runtime dependency
@@ -470,6 +503,9 @@ class CompanyWebApp:
         )
         self._http_session.mount("https://", _adapter)
         self._http_session.mount("http://", _adapter)
+        self._cloudscraper_session = None
+        self._cloudscraper_lock = threading.Lock()
+        self._rusprofile_browser_timeout = max(20, int(os.getenv("NADIN_RUSPROFILE_BROWSER_TIMEOUT", "35")))
         self._source_cache_lock = threading.Lock()
         self._provider_state_lock = threading.Lock()
         self._active_searches_lock = threading.Lock()
@@ -536,6 +572,24 @@ class CompanyWebApp:
             self._thread_state.blocked_fetch = False
         if not hasattr(self._thread_state, "last_fetch_status_by_domain"):
             self._thread_state.last_fetch_status_by_domain = {}
+
+    def _set_fetch_status(self, domain: str, status: str, *, blocked: bool | None = None) -> None:
+        self._init_thread_state()
+        self._thread_state.last_fetch_status = status
+        self._thread_state.last_fetch_status_by_domain[domain] = status
+        if blocked is not None:
+            self._thread_state.blocked_fetch = blocked
+
+    def _clear_fetch_status(self, domain: str) -> None:
+        self._set_fetch_status(domain, FETCH_STATUS_EMPTY_OK, blocked=False)
+
+    def _create_html_selector(self, html: str) -> Any | None:
+        if HtmlSelector is None or not html:
+            return None
+        try:
+            return HtmlSelector(text=html)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _profile_value(self, profile: dict[str, Any], field: str) -> str:
         if field == "en_position":
@@ -2942,6 +2996,9 @@ class CompanyWebApp:
             "captcha", "проверка браузера", "cloudflare", "ddos-guard",
             "access denied", "just a moment", "введите код", "подтвердите, что вы человек",
             "браузер не подходит", "включите javascript", "разрешите куки",
+            "?????????????? ???? ??????-???????????????? ??????????????", "navigation to the webpage was canceled",
+            "internet explorer cannot display the webpage", "this page can't be displayed",
+            "res://ieframe.dll/", "errorpagetemplate.css",
         ]
         if any(marker in text_lower for marker in block_markers):
             return True
@@ -2964,7 +3021,226 @@ class CompanyWebApp:
 
         return False
 
-    def _fetch_page(self, url: str, timeout: int = 15, max_retries: int = 5) -> str | None:
+    def _ensure_cloudscraper_session(self) -> Any | None:
+        session = getattr(self, "_cloudscraper_session", None)
+        if session is not None:
+            return session
+        if cloudscraper is None:
+            return None
+
+        with self._cloudscraper_lock:
+            session = getattr(self, "_cloudscraper_session", None)
+            if session is not None:
+                return session
+            try:
+                session = cloudscraper.create_scraper(
+                    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+                )
+                adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=10,
+                    pool_maxsize=20,
+                    max_retries=0,
+                )
+                session.mount("https://", adapter)
+                session.mount("http://", adapter)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to initialize cloudscraper: %s", exc)
+                self._cloudscraper_session = None
+                return None
+            self._cloudscraper_session = session
+            return session
+
+    def _find_headless_browser(self) -> Path | None:
+        allow_edge = os.getenv("NADIN_SCREENSHOT_ALLOW_EDGE", "0").strip().lower() in {"1", "true", "yes"}
+        env_candidates = [
+            os.getenv("NADIN_RUSPROFILE_BROWSER", ""),
+            os.getenv("NADIN_SCREENSHOT_BROWSER", ""),
+            os.path.join(os.getenv("ProgramFiles", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.getenv("ProgramFiles(x86)", ""), "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(os.getenv("LocalAppData", ""), "Google", "Chrome", "Application", "chrome.exe"),
+        ]
+        if allow_edge:
+            env_candidates.extend(
+                [
+                    os.path.join(os.getenv("ProgramFiles", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+                    os.path.join(os.getenv("ProgramFiles(x86)", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+                    os.path.join(os.getenv("LocalAppData", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+                ]
+            )
+
+        for raw_path in env_candidates:
+            candidate = raw_path.strip()
+            if not candidate:
+                continue
+            path = Path(os.path.expandvars(candidate))
+            if path.exists():
+                return path
+
+        command_candidates = ["chrome", "chrome.exe", "chromium", "chromium.exe"]
+        if allow_edge:
+            command_candidates.extend(["msedge", "msedge.exe"])
+        for cmd in command_candidates:
+            resolved = shutil.which(cmd)
+            if resolved:
+                return Path(resolved)
+        return None
+
+    def _fetch_page_with_headless_browser(self, url: str, timeout: int = 30) -> str | None:
+        browser_path = self._find_headless_browser()
+        if browser_path is None:
+            logger.info("Headless browser is not available for %s", url)
+            return None
+
+        domain = urlparse(url).netloc.lower()
+        self._domain_throttle(url)
+        if not self._is_localhost(url):
+            time.sleep(random.uniform(0.4, 0.9))
+
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        last_details = ""
+        blocked_dom = False
+        user_agent = self._get_random_user_agent()
+
+        for headless_flag in ("--headless=new", "--headless"):
+            with tempfile.TemporaryDirectory(prefix="nadin_rusprofile_browser_") as profile_dir:
+                command = [
+                    str(browser_path),
+                    headless_flag,
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-breakpad",
+                    "--disable-crash-reporter",
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1366,1700",
+                    "--lang=ru-RU",
+                    "--virtual-time-budget=9000",
+                    f"--user-data-dir={profile_dir}",
+                    f"--user-agent={user_agent}",
+                    "--dump-dom",
+                    url,
+                ]
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=max(timeout, self._rusprofile_browser_timeout),
+                    check=False,
+                    creationflags=creationflags,
+                )
+
+            html = str(completed.stdout or "")
+            if completed.returncode == 0 and html:
+                if not self._is_captcha_or_block(html, url=url):
+                    self._clear_fetch_status(domain)
+                    logger.info("Fetched %s via headless browser len=%d", url, len(html))
+                    return html
+                blocked_dom = True
+                last_details = "blocked_dom"
+            else:
+                stderr = (completed.stderr or "").strip()
+                stdout = (completed.stdout or "").strip()
+                last_details = stderr or stdout or f"code={completed.returncode}"
+
+        status = FETCH_STATUS_BLOCKED_403 if blocked_dom or "403" in last_details.lower() or "access denied" in last_details.lower() else FETCH_STATUS_NETWORK_ERROR
+        self._set_fetch_status(domain, status, blocked=(status == FETCH_STATUS_BLOCKED_403))
+        logger.warning("Headless browser fetch failed for %s: %s", url, last_details or "empty_html")
+        return None
+
+    def _fetch_page_with_legacy_webbrowser(self, url: str, timeout: int = 35) -> str | None:
+        domain = urlparse(url).netloc.lower()
+        temp_dir = Path(tempfile.mkdtemp(prefix="nadin_rusprofile_ie_"))
+        output_path = temp_dir / "dom.html"
+        ps_url = url.replace("'", "''")
+        ps_output_path = str(output_path).replace("'", "''")
+        wait_seconds = max(timeout, 35)
+        ps_script = f"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+$url = '{ps_url}'
+$out = '{ps_output_path}'
+$web = New-Object System.Windows.Forms.WebBrowser
+$web.ScriptErrorsSuppressed = $true
+$web.ScrollBarsEnabled = $false
+$script:done = $false
+$web.add_DocumentCompleted({{ if ($_.Url.AbsoluteUri -eq $url) {{ $script:done = $true }} }})
+$web.Navigate($url)
+$deadline = (Get-Date).AddSeconds({wait_seconds})
+while (-not $script:done) {{
+    [System.Windows.Forms.Application]::DoEvents()
+    Start-Sleep -Milliseconds 150
+    if ((Get-Date) -gt $deadline) {{
+        throw 'page_load_timeout'
+    }}
+}}
+$html = $web.DocumentText
+if (-not $html) {{
+    throw 'empty_dom'
+}}
+[System.IO.File]::WriteAllText($out, $html, [System.Text.Encoding]::UTF8)
+$web.Dispose()
+"""
+        try:
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-STA", "-Command", ps_script],
+                capture_output=True,
+                text=True,
+                timeout=wait_seconds + 15,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if completed.returncode == 0 and output_path.exists():
+                html = output_path.read_text(encoding="utf-8", errors="ignore")
+                if html and not self._is_captcha_or_block(html, url=url):
+                    self._clear_fetch_status(domain)
+                    logger.info("Fetched %s via legacy WebBrowser len=%d", url, len(html))
+                    return html
+            stderr = (completed.stderr or "").strip()
+            stdout = (completed.stdout or "").strip()
+            details = stderr or stdout or f"code={completed.returncode}"
+            status = FETCH_STATUS_BLOCKED_403 if "403" in details.lower() or "access denied" in details.lower() else FETCH_STATUS_NETWORK_ERROR
+            self._set_fetch_status(domain, status, blocked=(status == FETCH_STATUS_BLOCKED_403))
+            logger.warning("Legacy WebBrowser fetch failed for %s: %s", url, details or "empty_html")
+            return None
+        finally:
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+    def _fetch_rusprofile_page_with_cloudscraper(self, url: str, timeout: int = 20) -> str | None:
+        session = self._ensure_cloudscraper_session()
+        if session is None:
+            return None
+
+        domain = urlparse(url).netloc.lower()
+        self._domain_throttle(url)
+        if not self._is_localhost(url):
+            time.sleep(random.uniform(0.2, 0.6))
+
+        try:
+            headers = self._get_stealth_headers()
+            response = session.get(url, timeout=timeout, headers=headers, allow_redirects=True)
+            if getattr(response, "apparent_encoding", None):
+                response.encoding = response.apparent_encoding
+            result_text = str(getattr(response, "text", ""))
+            status_code = int(getattr(response, "status_code", 500))
+            blocked = self._is_captcha_or_block(result_text, url=url)
+            logger.info("Fetched %s via cloudscraper status=%d len=%d", url, status_code, len(result_text))
+            if status_code == 200 and result_text and not blocked:
+                self._clear_fetch_status(domain)
+                return result_text
+            status = FETCH_STATUS_BLOCKED_403 if status_code == 403 or blocked else FETCH_STATUS_NETWORK_ERROR
+            self._set_fetch_status(domain, status, blocked=(status == FETCH_STATUS_BLOCKED_403))
+            return None
+        except Exception as exc:  # noqa: BLE001
+            self._set_fetch_status(domain, FETCH_STATUS_NETWORK_ERROR, blocked=False)
+            logger.warning("cloudscraper fetch failed for %s: %s", url, exc)
+            return None
+
+    def _fetch_page_basic(self, url: str, timeout: int = 15, max_retries: int = 5, *, block_host_on_block: bool = True) -> str | None:
         self._init_thread_state()
         if not self._normalize_spaces(url):
             logger.error("Provider generated empty URL, fetch skipped")
@@ -2982,20 +3258,18 @@ class CompanyWebApp:
                 result_text = str(getattr(response, "text", ""))
                 status_code = int(getattr(response, "status_code", 500))
                 if status_code == 200 and not self._is_captcha_or_block(result_text, url=url):
-                    self._thread_state.last_fetch_status_by_domain[domain] = FETCH_STATUS_EMPTY_OK
+                    self._clear_fetch_status(domain)
                     return result_text
                 if status_code == 403:
-                    self._thread_state.last_fetch_status = FETCH_STATUS_BLOCKED_403
+                    self._set_fetch_status(domain, FETCH_STATUS_BLOCKED_403, blocked=True)
                 elif status_code == 202:
-                    self._thread_state.last_fetch_status = FETCH_STATUS_RATE_LIMIT_202
+                    self._set_fetch_status(domain, FETCH_STATUS_RATE_LIMIT_202, blocked=False)
                 else:
-                    self._thread_state.last_fetch_status = FETCH_STATUS_NETWORK_ERROR
-                self._thread_state.last_fetch_status_by_domain[domain] = self._thread_state.last_fetch_status
+                    self._set_fetch_status(domain, FETCH_STATUS_NETWORK_ERROR, blocked=False)
                 logger.warning("Fallback fetch failed for %s: status=%d", url, status_code)
                 return None
             except requests.RequestException as exc:
-                self._thread_state.last_fetch_status = FETCH_STATUS_NETWORK_ERROR
-                self._thread_state.last_fetch_status_by_domain[domain] = FETCH_STATUS_NETWORK_ERROR
+                self._set_fetch_status(domain, FETCH_STATUS_NETWORK_ERROR, blocked=False)
                 logger.warning("Fallback fetch request error for %s: %s", url, exc)
                 return None
 
@@ -3010,21 +3284,22 @@ class CompanyWebApp:
             len(result.text),
         )
         if result.status_code == 403:
-            self._thread_state.last_fetch_status = FETCH_STATUS_BLOCKED_403
+            self._set_fetch_status(domain, FETCH_STATUS_BLOCKED_403, blocked=True)
         elif result.status_code == 202:
-            self._thread_state.last_fetch_status = FETCH_STATUS_RATE_LIMIT_202
+            self._set_fetch_status(domain, FETCH_STATUS_RATE_LIMIT_202, blocked=False)
         elif result.status_code >= 500 or result.error_code in {"network_error", "timeout", "request_error"}:
-            self._thread_state.last_fetch_status = FETCH_STATUS_NETWORK_ERROR
-        self._thread_state.last_fetch_status_by_domain[domain] = self._thread_state.last_fetch_status
+            self._set_fetch_status(domain, FETCH_STATUS_NETWORK_ERROR, blocked=False)
 
         if result.blocked or self._is_captcha_or_block(result.text, url=url):
             host = urlparse(url).netloc.lower()
             self._thread_state.blocked_fetch = True
             self._thread_state.last_fetch_status = FETCH_STATUS_BLOCKED_403
-            block_ttl = 12 * 60 * 60
-            self._save_rate_limited(host or "source", f"blocked:{url}", retry_seconds=block_ttl)
-            with self._provider_state_lock:
-                self._provider_disabled_until[host or "source"] = time.time() + block_ttl
+            self._thread_state.last_fetch_status_by_domain[domain] = FETCH_STATUS_BLOCKED_403
+            if block_host_on_block:
+                block_ttl = 12 * 60 * 60
+                self._save_rate_limited(host or "source", f"blocked:{url}", retry_seconds=block_ttl)
+                with self._provider_state_lock:
+                    self._provider_disabled_until[host or "source"] = time.time() + block_ttl
             logger.warning("%s returned captcha/block page", url)
             return None
         if not result.ok:
@@ -3037,9 +3312,36 @@ class CompanyWebApp:
             )
             return None
         if result.status_code != 200:
+            self._set_fetch_status(domain, FETCH_STATUS_NETWORK_ERROR, blocked=False)
             logger.error("Failed to fetch %s, status code: %d", url, result.status_code)
             return None
+        self._clear_fetch_status(domain)
         return result.text
+
+    def _fetch_rusprofile_page(self, url: str, timeout: int = 15, max_retries: int = 5) -> str | None:
+        html = self._fetch_page_basic(url, timeout=timeout, max_retries=max_retries, block_host_on_block=False)
+        if html:
+            return html
+
+        html = self._fetch_rusprofile_page_with_cloudscraper(url, timeout=max(timeout, 20))
+        if html:
+            return html
+
+        html = self._fetch_page_with_headless_browser(url, timeout=max(timeout, self._rusprofile_browser_timeout))
+        if html:
+            return html
+
+        html = self._fetch_page_with_legacy_webbrowser(url, timeout=max(timeout, self._rusprofile_browser_timeout))
+        if html:
+            return html
+
+        return None
+
+    def _fetch_page(self, url: str, timeout: int = 15, max_retries: int = 5) -> str | None:
+        host = urlparse(url).netloc.lower()
+        if host in {"rusprofile.ru", "www.rusprofile.ru"}:
+            return self._fetch_rusprofile_page(url, timeout=timeout, max_retries=max_retries)
+        return self._fetch_page_basic(url, timeout=timeout, max_retries=max_retries)
 
 
 
@@ -3356,6 +3658,88 @@ class CompanyWebApp:
             logger.error("EGRUL request failed for %s: %s", query, exc)
             return None
 
+    def _extract_rusprofile_search_hits_with_selector(
+        self,
+        html: str,
+        *,
+        search_type: str = "",
+        is_person: bool = False,
+    ) -> list[dict[str, str]]:
+        selector = self._create_html_selector(html)
+        if selector is None:
+            return []
+
+        hits: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add_hit(node: Any, hit_type: str) -> None:
+            href = self._normalize_spaces(str(getattr(node, 'attrib', {}).get('href', '')))
+            if hit_type == 'company' and not href.startswith('/id/'):
+                return
+            if hit_type == 'person' and not href.startswith('/person/'):
+                return
+
+            name = self._normalize_spaces(' '.join(node.xpath('.//text()').getall()))
+            if not name:
+                return
+
+            wrapper_text = self._normalize_spaces(
+                ' '.join(node.xpath('../text() | ../*//text()').getall())
+            )
+            if not wrapper_text:
+                wrapper_text = self._normalize_spaces(
+                    ' '.join(node.xpath('ancestor::*[self::li or self::div or self::article][1]//text()').getall())
+                )
+            inn_pattern = r'\b(\d{10}|\d{12})\b' if hit_type == 'person' else r'\b(\d{10})\b'
+            inn_match = re.search(inn_pattern, wrapper_text)
+            org_name = name
+            if hit_type == 'person':
+                org_name = self._normalize_spaces(
+                    ' '.join(
+                        node.xpath(
+                            'ancestor::*[self::li or self::div or self::article][1]//a[starts-with(@href, "/id/")][1]//text()'
+                        ).getall()
+                    )
+                )
+
+            full_url = href if href.startswith('http') else f'https://www.rusprofile.ru{href}'
+            key = (hit_type, full_url.lower())
+            if key in seen:
+                return
+            seen.add(key)
+            hits.append(
+                {
+                    'source': 'rusprofile.ru',
+                    'type': hit_type,
+                    'name': name,
+                    'org': org_name if hit_type == 'person' else name,
+                    'inn': inn_match.group(1) if inn_match else '',
+                    'url': full_url,
+                }
+            )
+
+        anchors = selector.css('a[href]')
+        if search_type == 'company':
+            for node in anchors:
+                add_hit(node, 'company')
+        elif search_type == 'person':
+            for node in anchors:
+                add_hit(node, 'person')
+        else:
+            for node in anchors:
+                add_hit(node, 'person')
+                if len(hits) >= 20:
+                    break
+            if not is_person:
+                for node in anchors:
+                    add_hit(node, 'company')
+                    if len(hits) >= 20:
+                        break
+            if is_person:
+                hits = [hit for hit in hits if hit.get('type') == 'person']
+
+        return hits[:20]
+
     def _search_rusprofile(self, query: str, is_person: bool = False, search_type: str = "") -> list[dict[str, str]]:
         search_url = f"https://www.rusprofile.ru/search?query={quote(query)}"
 
@@ -3455,6 +3839,9 @@ class CompanyWebApp:
             if is_person:
                 hits = [h for h in hits if h.get("type") == "person"]
 
+        if not hits:
+            hits = self._extract_rusprofile_search_hits_with_selector(html, search_type=search_type, is_person=is_person)
+
         logger.info("rusprofile hits: найдено %d записей (тип: %s)", len(hits), search_type or "auto")
         return hits[:20]
 
@@ -3467,21 +3854,45 @@ class CompanyWebApp:
         if not html:
             return {}
         soup = BeautifulSoup(html, "lxml")
+        selector = self._create_html_selector(html)
         profile: dict[str, Any] = {"url": url, "source": "rusprofile.ru"}
         page_text = soup.get_text(" ", strip=True)
         jsonld_data: dict[str, Any] = {}
-        keywords_node = soup.find("meta", attrs={"name": re.compile(r"^keywords$", re.IGNORECASE)})
-        keywords_raw = str(keywords_node.get("content", "")) if isinstance(keywords_node, Tag) else ""
+        keywords_raw = ""
+        if selector is not None:
+            keywords_raw = str(
+                selector.xpath(
+                    "//meta[translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='keywords']/@content"
+                ).get()
+                or ""
+            )
+        if not keywords_raw:
+            keywords_node = soup.find("meta", attrs={"name": re.compile(r"^keywords$", re.IGNORECASE)})
+            keywords_raw = str(keywords_node.get("content", "")) if isinstance(keywords_node, Tag) else ""
         keywords_text = self._normalize_spaces(unescape(keywords_raw))
         if keywords_text:
             profile["ru_org"] = self._extract_ru_org_from_keywords(keywords_text)
             logger.debug("RusProfile keywords: %s", keywords_text[:200])
-        for script in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.IGNORECASE)}):
-            if not isinstance(script, Tag):
-                continue
-            raw_json = script.string or script.get_text(" ", strip=True)
-            if not raw_json:
-                continue
+
+        raw_jsonld_scripts: list[str] = []
+        if selector is not None:
+            raw_jsonld_scripts.extend(
+                [
+                    raw
+                    for raw in selector.xpath(
+                        "//script[contains(translate(@type,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'application/ld+json')]/text()"
+                    ).getall()
+                    if raw
+                ]
+            )
+        if not raw_jsonld_scripts:
+            for script in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.IGNORECASE)}):
+                if not isinstance(script, Tag):
+                    continue
+                raw_json = script.string or script.get_text(" ", strip=True)
+                if raw_json:
+                    raw_jsonld_scripts.append(raw_json)
+        for raw_json in raw_jsonld_scripts:
             try:
                 payload = json.loads(raw_json)
             except json.JSONDecodeError:
@@ -3490,6 +3901,7 @@ class CompanyWebApp:
                 payload = next((item for item in payload if isinstance(item, dict)), {})
             if isinstance(payload, dict):
                 jsonld_data = payload
+
                 if isinstance(payload.get("name"), str):
                     profile["ru_org"] = profile.get("ru_org") or self._clean_ru_org_name(payload.get("name", ""))
                 identifier = payload.get("identifier")
@@ -3497,10 +3909,16 @@ class CompanyWebApp:
                     profile["inn"] = profile.get("inn") or re.sub(r"\D", "", identifier["value"])
                 elif isinstance(payload.get("taxID"), str):
                     profile["inn"] = profile.get("inn") or re.sub(r"\D", "", payload["taxID"])
+        if selector is not None and not profile.get("ru_org"):
+            selector_h1 = self._normalize_spaces(" ".join(selector.css("h1::text, h1 *::text").getall()))
+            if selector_h1:
+                profile["ru_org"] = self._clean_ru_org_name(selector_h1)
+
         is_person = "/person/" in url or "/ip/" in url
 
         if is_person:
             structure = self._detect_page_structure(soup)
+
             if structure == "old":
                 self._parse_rusprofile_old(soup, profile)
             elif structure == "new":
