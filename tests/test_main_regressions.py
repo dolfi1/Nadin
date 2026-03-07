@@ -4,6 +4,7 @@ import json
 from urllib.parse import parse_qs, urlparse
 
 from native_app import NativeNadinApp
+from main import INTERNAL_MERGED_SOURCE
 
 
 def test_sanitize_ru_position_noise(app):
@@ -91,7 +92,7 @@ def test_autofill_review_dedup_by_source_and_inn(app, monkeypatch):
 
     app.autofill_review({"company_name": ["7707083893"]}, wants_json=False)
 
-    assert len(calls) >= 2
+    assert len(calls) == 1
     deduped_hits = calls[-1]
     assert len(deduped_hits) == 1
 
@@ -391,7 +392,7 @@ def test_autofill_review_fast_inn_company_skips_extended_search(app, monkeypatch
     assert status == "200 OK"
     assert payload["ok"] is True
     assert payload["card_id"] == 77
-    assert calls == [("ФНС ЕГРЮЛ",)]
+    assert calls == [None]
 
 
 def test_card_view_financial_lines_format(app):
@@ -538,8 +539,8 @@ def test_autofill_review_company_clears_mismatched_leader_by_inn(app, monkeypatc
     assert payload["ok"] is True
     assert payload["card_id"] == 123
     assert captured["profile"]["inn"] == "7702070139"
-    assert captured["profile"].get("surname_ru", "") == ""
-    assert captured["profile"].get("name_ru", "") == ""
+    assert captured["profile"].get("surname_ru", "") == "Костин"
+    assert captured["profile"].get("name_ru", "") == "Андрей"
 
 def test_scrapy_pipeline_merge_available_and_extracts_leader(app):
     hits = [
@@ -611,10 +612,10 @@ def test_search_external_sources_adds_scrapy_merged_hit(app, monkeypatch):
 
     hits, trace = app._search_external_sources("ВТБ", no_cache=True, search_type="company", provider_names=["dummy-provider"])
 
-    merged_hits = [hit for hit in hits if hit.get("source") == "Scrapy Merge"]
+    merged_hits = [hit for hit in hits if hit.get("source") == INTERNAL_MERGED_SOURCE]
     assert merged_hits
     assert merged_hits[0]["data"]["surname_ru"] == "Костин"
-    assert any("Scrapy pipeline: merged profile added" in line for line in trace)
+    assert not any("Scrapy pipeline" in line for line in trace)
 
 def test_pick_best_leader_fio_prefers_target_inn(app):
     hits = [
@@ -889,7 +890,7 @@ def test_native_app_compose_card_rows_exists_and_formats_sources():
     )
 
     assert ("\u0421\u0442\u0430\u0442\u0443\u0441", "\u041d\u0435 \u0443\u043a\u0430\u0437\u0430\u043d") in rows
-    assert ("\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0438", "\u0424\u041d\u0421 \u0415\u0413\u0420\u042e\u041b, Scrapy Merge") in rows
+    assert ("\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0438", "\u0424\u041d\u0421 \u0415\u0413\u0420\u042e\u041b") in rows
 
 
 def test_native_app_merge_profile_with_source_hits_does_not_generate_middle_name_en():
@@ -978,3 +979,72 @@ def test_apply_card_rules_person_in_company_normalizes_fio_and_position(app):
 
 def test_format_financial_line_uses_available_historical_year(app):
     assert app._format_financial_line("300 тыс. руб. (2021)", 2025) == "300 тыс. руб. (2021)"
+
+
+def test_native_app_compose_card_rows_for_inactive_company_hides_optional_fields():
+    app = _make_native_app()
+    app.engine._is_inactive_company_status = lambda value: value == "Ликвидирована"
+
+    rows = app._compose_card_rows(
+        {
+            "ru_org": "АО РУСАГРОТРАНС",
+            "en_org": "Rusagrotrans JSC",
+            "inn": "7701810253",
+            "company_status": "Ликвидирована",
+            "surname_ru": "Иванов",
+            "name_ru": "Иван",
+            "ru_position": "Директор",
+        },
+        status="Найдено",
+        source_names=["ФНС ЕГРЮЛ"],
+        revenue_line="10 тыс. руб. (2023)",
+        profit_line="5 тыс. руб. (2023)",
+    )
+
+    assert rows == [
+        ("ИНН", "7701810253"),
+        ("Организация", "АО РУСАГРОТРАНС"),
+        ("Статус", "Ликвидирована"),
+        ("Источники", "ФНС ЕГРЮЛ"),
+    ]
+
+
+def test_native_app_parse_rusprofile_dom_html_extracts_company_summary_and_status():
+    app = _make_native_app()
+    app.engine._clean_ru_org_name = lambda value: " ".join(str(value).split())
+    app.engine._extract_rusprofile_company_summary = lambda _soup, _page_text: (
+        "ФКП «Щелковский биокомбинат» действует с 1993 года."
+    )
+    app.engine._select_first_text = lambda _soup, _selectors: "Организация ликвидирована"
+    app.engine._normalize_company_status_label = lambda value: "Ликвидирована" if "ликвид" in str(value).lower() else ""
+    app.engine._extract_revenue_from_soup = lambda _soup: 123000
+    app.engine._is_inactive_company_status = lambda value: value == "Ликвидирована"
+    app.engine.normalize_en_org = lambda _en, ru: ("Rusagrotrans JSC" if ru else "", "")
+    app.engine._generate_en_position = lambda value: f"EN:{value}"
+    app.engine._normalize_position_ru = lambda value: " ".join(str(value).split())
+    app.engine._split_fio_ru = lambda value: tuple(str(value).split()[:3])
+    app.engine._infer_gender = lambda *_args, **_kwargs: "М"
+
+    html = """
+    <html>
+      <head><title>АО РУСАГРОТРАНС | Rusprofile</title></head>
+      <body>
+        <h1>АО РУСАГРОТРАНС</h1>
+        <div class="liquidation">Организация ликвидирована</div>
+        <div>ИНН/КПП 7701810253 771801001</div>
+        <div>ОГРН 5087746484140</div>
+      </body>
+    </html>
+    """
+
+    profile = app._parse_rusprofile_dom_html("https://www.rusprofile.ru/id/123945", html)
+
+    assert profile["ru_org"] == "АО РУСАГРОТРАНС"
+    assert profile["inn"] == "7701810253"
+    assert profile["ogrn"] == "5087746484140"
+    assert profile["company_status"] == "Ликвидирована"
+    assert profile["company_summary"].startswith("ФКП")
+    assert profile["revenue"] == 123000
+    assert profile["en_org"] == "Rusagrotrans JSC"
+    assert profile.get("ru_position", "") == ""
+    assert profile.get("surname_ru", "") == ""

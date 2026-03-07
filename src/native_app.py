@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import io
+import ctypes
+from ctypes import wintypes
 import logging
 import os
 import re
@@ -116,7 +119,7 @@ class NativeNadinApp(tk.Tk):
         ("ИНН", "inn"),
         ("Организация", "ru_org"),
         ("Organization", "en_org"),
-        ("Статус компании", "company_status"),
+        ("Статус", "company_status"),
         ("Должность", "ru_position"),
         ("Position", "en_position"),
     ]
@@ -155,8 +158,15 @@ class NativeNadinApp(tk.Tk):
         self._last_profile_inn = ""
         self._last_profile_ogrn = ""
         self._last_profile_org = ""
+        self._last_profile_surname = ""
+        self._last_profile_name = ""
+        self._last_profile_middle = ""
         self._last_source_names: list[str] = []
         self._rusprofile_url_cache: dict[str, str] = {}
+        self._last_rusprofile_url = ""
+        self._last_company_summary = ""
+        self._viewer_image_path = ""
+        self._manual_proxy = ""
 
         app_data_dir = Path(os.getenv("APP_DATA_DIR", os.getcwd()))
         self._screenshot_dir = app_data_dir / "screenshots"
@@ -204,19 +214,43 @@ class NativeNadinApp(tk.Tk):
         self.copy_card_button = ttk.Button(action_frame, text="Копировать карточку", command=self._copy_full_card)
         self.copy_card_button.pack(side=tk.LEFT, padx=(8, 0))
 
-        self.download_screenshot_button = ttk.Button(
-            action_frame,
-            text="Скачать скриншот",
-            command=self._download_screenshot,
-            state=tk.DISABLED,
-        )
-        self.download_screenshot_button.pack(side=tk.LEFT, padx=(8, 0))
 
         self.progress = ttk.Progressbar(action_frame, mode="indeterminate", length=260)
         self.progress.pack(side=tk.LEFT, padx=(16, 0), fill=tk.X)
 
-        self._vertical_split = ttk.Panedwindow(self, orient=tk.VERTICAL)
-        self._vertical_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        proxy_frame = ttk.Frame(action_frame)
+        proxy_frame.pack(side=tk.LEFT, padx=(16, 0))
+        ttk.Label(proxy_frame, text="Прокси:").pack(side=tk.LEFT)
+        self.proxy_var = tk.StringVar()
+        self.proxy_entry = ttk.Entry(proxy_frame, textvariable=self.proxy_var, width=18)
+        self.proxy_entry.pack(side=tk.LEFT, padx=(4, 0))
+        self._bind_entry_shortcuts(self.proxy_entry)
+        self.proxy_entry.bind("<Return>", lambda e: self._update_proxy_from_input())
+        
+        self.proxy_status_var = tk.StringVar(value="Прокси: не задан")
+        ttk.Label(proxy_frame, textvariable=self.proxy_status_var, font=("TkDefaultFont", 8)).pack(side=tk.LEFT, padx=(8, 0))
+
+        style = ttk.Style(self)
+        style.configure("Nadin.TNotebook.Tab", padding=(14, 8), foreground="#111111")
+        style.map(
+            "Nadin.TNotebook.Tab",
+            background=[("selected", "#ffffff"), ("!selected", "#e6e6e6")],
+            foreground=[("selected", "#111111"), ("!selected", "#111111")],
+        )
+
+        self.notebook = ttk.Notebook(self, style="Nadin.TNotebook")
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        self.tab_card = ttk.Frame(self.notebook)
+        self.tab_screenshot = ttk.Frame(self.notebook)
+        self.tab_company = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.tab_card, text="Создание карточки")
+        self.notebook.add(self.tab_screenshot, text="\u0421\u043e\u0437\u0434\u0430\u043d\u0438\u0435 \u0441\u043a\u0440\u0438\u043d\u0448\u043e\u0442\u0430")
+        self.notebook.add(self.tab_company, text="Главное о компании")
+
+        self._vertical_split = ttk.Panedwindow(self.tab_card, orient=tk.VERTICAL)
+        self._vertical_split.pack(fill=tk.BOTH, expand=True)
         self._bind_paned_cursor(self._vertical_split, tk.VERTICAL)
 
         self._horizontal_split = ttk.Panedwindow(self._vertical_split, orient=tk.HORIZONTAL)
@@ -285,6 +319,29 @@ class NativeNadinApp(tk.Tk):
 
         screenshot_info = ttk.Frame(screenshot_frame)
         screenshot_info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        screenshot_btns = ttk.Frame(screenshot_info)
+        screenshot_btns.pack(fill=tk.X, pady=(0, 6))
+        self.copy_screenshot_button = ttk.Button(
+            screenshot_btns,
+            text="\u041a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0441\u043a\u0440\u0438\u043d\u0448\u043e\u0442",
+            command=self._copy_screenshot_to_clipboard,
+            state=tk.DISABLED,
+        )
+        self.copy_screenshot_button.pack(side=tk.LEFT)
+        self.download_screenshot_button = ttk.Button(
+            screenshot_btns,
+            text="\u0421\u043a\u0430\u0447\u0430\u0442\u044c \u0441\u043a\u0440\u0438\u043d\u0448\u043e\u0442",
+            command=self._download_screenshot,
+            state=tk.DISABLED,
+        )
+        self.download_screenshot_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.company_summary_button = ttk.Button(
+            screenshot_btns,
+            text="\u0413\u043b\u0430\u0432\u043d\u043e\u0435 \u043e \u043a\u043e\u043c\u043f\u0430\u043d\u0438\u0438",
+            command=self._open_company_summary_tab,
+            state=tk.DISABLED,
+        )
+        self.company_summary_button.pack(side=tk.LEFT, padx=(8, 0))
         self.screenshot_meta_entry = ttk.Entry(screenshot_info, textvariable=self.screenshot_meta_var, state="readonly")
         self.screenshot_meta_entry.pack(fill=tk.X, anchor="w")
         self._bind_entry_shortcuts(self.screenshot_meta_entry)
@@ -312,6 +369,707 @@ class NativeNadinApp(tk.Tk):
         self.bind("<KP_Enter>", self._on_enter_pressed)
 
         self._render_card_rows([], "Карточка")
+
+        self._init_proxy_settings()
+        if self.proxy_var.get().strip():
+            self.engine.reload_proxy_settings()
+        self._build_screenshot_tab()
+        self._build_company_tab()
+
+    def _init_proxy_settings(self) -> None:
+        self._manual_proxy = ""
+        proxy_type, proxy_url = self._get_proxy_settings()
+        if proxy_url:
+            self.proxy_var.set(proxy_url)
+            os.environ["NADIN_PROXY"] = proxy_url
+            self.proxy_status_var.set(f"Прокси: {proxy_url}")
+
+    def _update_proxy_from_input(self) -> None:
+        proxy_input = self.proxy_var.get().strip()
+        if proxy_input:
+            self._manual_proxy = proxy_input
+            os.environ["NADIN_PROXY"] = proxy_input
+            self.proxy_status_var.set(f"Прокси: {proxy_input}")
+            self.engine.reload_proxy_settings()
+        else:
+            self._manual_proxy = ""
+            os.environ.pop("NADIN_PROXY", None)
+            self.proxy_status_var.set("Прокси: не задан")
+            self.engine.reload_proxy_settings()
+
+    def _get_proxy_settings(self) -> tuple[str, str]:
+        proxy_url = self._manual_proxy
+        proxy_type = "http"
+        
+        if not proxy_url:
+            proxy_url = os.getenv("NADIN_PROXY", "").strip()
+        
+        if not proxy_url:
+            proxy_url = self._detect_windows_proxy()
+        
+        if not proxy_url:
+            proxy_url = self._fetch_free_proxy_from_2ip()
+        
+        if proxy_url:
+            if proxy_url.startswith("socks5://"):
+                proxy_type = "socks5"
+                proxy_url = proxy_url.replace("socks5://", "")
+            elif proxy_url.startswith("socks4://"):
+                proxy_type = "socks4"
+                proxy_url = proxy_url.replace("socks4://", "")
+            elif proxy_url.startswith("https://"):
+                proxy_url = proxy_url.replace("https://", "")
+            elif proxy_url.startswith("http://"):
+                proxy_url = proxy_url.replace("http://", "")
+        
+        return proxy_type, proxy_url
+
+    def _detect_windows_proxy(self) -> str:
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+            try:
+                proxy_enable = winreg.QueryValueEx(key, "ProxyEnable")[0]
+                if proxy_enable:
+                    proxy_server = winreg.QueryValueEx(key, "ProxyServer")[0]
+                    if proxy_server:
+                        return proxy_server
+            except FileNotFoundError:
+                pass
+            finally:
+                winreg.CloseKey(key)
+        except Exception:
+            pass
+        return ""
+
+    def _fetch_free_proxy_from_2ip(self) -> str:
+        try:
+            import requests
+            response = requests.get("https://2ip.ru/proxy/", timeout=15)
+            if response.status_code == 200:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(response.text, "lxml")
+                input_tag = soup.find("input", {"id": "x"})
+                if input_tag and input_tag.get("value"):
+                    proxy = input_tag.get("value").strip()
+                    if proxy and ":" in proxy:
+                        return proxy
+        except Exception as exc:
+            logger.warning("Failed to fetch proxy from 2ip.ru: %s", exc)
+        return ""
+
+    def _build_screenshot_tab(self) -> None:
+        url_frame = ttk.Frame(self.tab_screenshot, padding=10)
+        url_frame.pack(fill=tk.X)
+
+        ttk.Label(url_frame, text="URL страницы:").pack(anchor="w")
+        self.screenshot_url_var = tk.StringVar()
+        url_entry = ttk.Entry(url_frame, textvariable=self.screenshot_url_var, width=80)
+        url_entry.pack(fill=tk.X, pady=(4, 10))
+        self._bind_entry_shortcuts(url_entry)
+        url_entry.bind("<Button-3>", self._show_entry_context_menu, add="+")
+
+        btn_frame = ttk.Frame(url_frame)
+        btn_frame.pack(fill=tk.X)
+
+        self.screenshot_capture_btn = ttk.Button(
+            btn_frame,
+            text="Создать скриншот",
+            command=self._capture_screenshot_from_tab,
+        )
+        self.screenshot_capture_btn.pack(side=tk.LEFT)
+
+        self.screenshot_copy_btn = ttk.Button(
+            btn_frame,
+            text="Копировать скриншот",
+            command=self._copy_screenshot_from_tab,
+            state=tk.DISABLED,
+        )
+        self.screenshot_copy_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.screenshot_save_btn = ttk.Button(
+            btn_frame,
+            text="Сохранить скриншот",
+            command=self._save_screenshot_from_tab,
+            state=tk.DISABLED,
+        )
+        self.screenshot_save_btn.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.screenshot_tab_status_var = tk.StringVar(value="Готов к работе")
+        ttk.Label(btn_frame, textvariable=self.screenshot_tab_status_var).pack(side=tk.LEFT, padx=(16, 0))
+
+        preview_frame = ttk.LabelFrame(self.tab_screenshot, text="Превью скриншота", padding=(10, 10))
+        preview_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        self.screenshot_tab_preview_label = ttk.Label(preview_frame, text="Превью отсутствует", anchor="center", cursor="hand2")
+        self.screenshot_tab_preview_label.pack(fill=tk.BOTH, expand=True)
+        self.screenshot_tab_preview_label.bind("<Button-1>", self._open_tab_screenshot_viewer, add="+")
+
+        self._last_tab_screenshot_path = ""
+        self._screenshot_tab_preview_image = None
+
+    def _build_company_tab(self) -> None:
+        info_frame = ttk.Frame(self.tab_company, padding=10)
+        info_frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            info_frame,
+            text="Основная информация о выбранной компании",
+            font=("TkDefaultFont", 12, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+
+        self.company_summary_text = tk.Text(info_frame, wrap=tk.WORD, height=30)
+        self.company_summary_text.pack(fill=tk.BOTH, expand=True)
+        self.company_summary_text.bind("<Control-c>", self._copy_text_widget_selection)
+        self.company_summary_text.bind("<Control-C>", self._copy_text_widget_selection)
+        self.company_summary_text.bind("<Control-a>", self._select_all_text_widget)
+        self.company_summary_text.bind("<Control-A>", self._select_all_text_widget)
+        self.company_summary_text.bind("<Button-3>", self._show_text_context_menu, add="+")
+        self.company_summary_text.insert("1.0", "Выберите компанию из списка для отображения информации")
+
+    def _capture_screenshot_from_tab(self) -> None:
+        url = self.screenshot_url_var.get().strip()
+        if not url:
+            self.screenshot_tab_status_var.set("Введите URL")
+            return
+
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+            self.screenshot_url_var.set(url)
+
+        self.screenshot_tab_status_var.set("Создание скриншота...")
+        self.screenshot_capture_btn.configure(state=tk.DISABLED)
+
+        def worker() -> None:
+            try:
+                path, captured_at, error = self._capture_screenshot_sync(url)
+                self.after(0, lambda: self._on_tab_screenshot_done(path, captured_at, error))
+            except Exception as exc:
+                logger.exception("Screenshot capture failed")
+                self.after(0, lambda: self._on_tab_screenshot_done("", "", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _capture_screenshot_sync(self, url: str) -> tuple[str, str, str]:
+        normalized = self._normalize_screenshot_target(url)
+        meta_source_url = url
+
+        try:
+            output_path_result, captured_at = self._capture_webpage_screenshot(normalized, metadata_source_url=meta_source_url)
+        except Exception as exc:
+            logger.exception("Screenshot capture error")
+            return "", "", str(exc)
+
+        if not output_path_result or not output_path_result.exists():
+            return "", "", "screenshot_failed"
+
+        return str(output_path_result), captured_at, ""
+
+    def _on_tab_screenshot_done(self, saved_path: str, captured_at: str, error: str) -> None:
+        self.screenshot_capture_btn.configure(state=tk.NORMAL)
+
+        if error:
+            self.screenshot_tab_status_var.set(f"Ошибка: {error}")
+            self.screenshot_copy_btn.configure(state=tk.DISABLED)
+            self.screenshot_save_btn.configure(state=tk.DISABLED)
+            return
+
+        self._last_tab_screenshot_path = saved_path
+        self.screenshot_tab_status_var.set(f"Скриншот: {captured_at}")
+        self.screenshot_copy_btn.configure(state=tk.NORMAL)
+        self.screenshot_save_btn.configure(state=tk.NORMAL)
+
+        if saved_path and Path(saved_path).exists():
+            try:
+                image = tk.PhotoImage(file=saved_path)
+                max_width = 800
+                max_height = 600
+                w = image.width()
+                h = image.height()
+                if w > max_width or h > max_height:
+                    ratio = min(max_width / w, max_height / h)
+                    image = image.subsample(int(1/ratio) if ratio < 1 else 1)
+                self.screenshot_tab_preview_label.configure(image=image, text="")
+                self._screenshot_tab_preview_image = image
+            except Exception as exc:
+                logger.exception("Failed to load screenshot preview")
+                self.screenshot_tab_preview_label.configure(image="", text="Ошибка загрузки превью")
+
+    def _copy_screenshot_from_tab(self) -> None:
+        if not self._last_tab_screenshot_path or not Path(self._last_tab_screenshot_path).exists():
+            self.screenshot_tab_status_var.set("\u041d\u0435\u0442 \u0441\u043a\u0440\u0438\u043d\u0448\u043e\u0442\u0430 \u0434\u043b\u044f \u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u044f")
+            return
+
+        try:
+            self._copy_image_file_to_clipboard(self._last_tab_screenshot_path)
+            self.screenshot_tab_status_var.set("\u0421\u043a\u0440\u0438\u043d\u0448\u043e\u0442 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d \u0432 \u0431\u0443\u0444\u0435\u0440")
+        except Exception as exc:
+            logger.exception("Failed to copy screenshot to clipboard")
+            self.screenshot_tab_status_var.set(f"\u041e\u0448\u0438\u0431\u043a\u0430 \u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u044f: {exc}")
+
+    def _save_screenshot_from_tab(self) -> None:
+        if not self._last_tab_screenshot_path or not Path(self._last_tab_screenshot_path).exists():
+            self.screenshot_tab_status_var.set("Нет скриншота для сохранения")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("All files", "*.*")],
+            initialfile=Path(self._last_tab_screenshot_path).name,
+        )
+        if file_path:
+            try:
+                shutil.copy2(self._last_tab_screenshot_path, file_path)
+                self.screenshot_tab_status_var.set(f"Сохранено: {file_path}")
+            except Exception as exc:
+                logger.exception("Failed to save screenshot")
+                self.screenshot_tab_status_var.set(f"Ошибка сохранения: {exc}")
+
+    def _copy_image_file_to_clipboard(self, image_path: str) -> None:
+        if sys.platform != "win32":
+            raise RuntimeError("clipboard_image_supported_only_on_windows")
+        if Image is None:
+            raise RuntimeError("pillow_not_available")
+
+        path = Path(image_path)
+        if not path.exists():
+            raise RuntimeError("image_not_found")
+
+        with Image.open(path).convert("RGB") as image:
+            # Very large screenshots can exceed what CF_DIB reliably handles on
+            # Windows clipboard APIs. Downscale only for clipboard transfer.
+            max_clipboard_edge = 2400
+            width, height = image.size
+            longest_edge = max(width, height)
+            if longest_edge > max_clipboard_edge:
+                ratio = max_clipboard_edge / float(longest_edge)
+                image = image.resize(
+                    (max(1, int(width * ratio)), max(1, int(height * ratio))),
+                    Image.LANCZOS,
+                )
+            buffer = io.BytesIO()
+            image.save(buffer, format="BMP")
+            dib_data = buffer.getvalue()[14:]
+
+        GMEM_MOVEABLE = 0x0002
+        CF_DIB = 8
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+        kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalFree.restype = ctypes.c_void_p
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.EmptyClipboard.argtypes = []
+        user32.EmptyClipboard.restype = wintypes.BOOL
+        user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+        user32.SetClipboardData.restype = ctypes.c_void_p
+        user32.CloseClipboard.argtypes = []
+        user32.CloseClipboard.restype = wintypes.BOOL
+
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(dib_data))
+        if not handle:
+            raise RuntimeError("GlobalAlloc failed")
+
+        locked = kernel32.GlobalLock(handle)
+        if not locked:
+            kernel32.GlobalFree(handle)
+            raise RuntimeError("GlobalLock failed")
+
+        try:
+            ctypes.memmove(locked, dib_data, len(dib_data))
+        finally:
+            kernel32.GlobalUnlock(handle)
+
+        hwnd = self.winfo_id() if hasattr(self, 'winfo_id') else None
+        if not user32.OpenClipboard(hwnd):
+            kernel32.GlobalFree(handle)
+            raise RuntimeError("OpenClipboard failed")
+
+        try:
+            if not user32.EmptyClipboard():
+                kernel32.GlobalFree(handle)
+                raise RuntimeError("EmptyClipboard failed")
+            if not user32.SetClipboardData(CF_DIB, handle):
+                kernel32.GlobalFree(handle)
+                raise RuntimeError("SetClipboardData failed")
+            handle = None
+        finally:
+            user32.CloseClipboard()
+            if handle:
+                kernel32.GlobalFree(handle)
+
+    def _copy_screenshot_to_clipboard(self) -> None:
+        if not self._last_screenshot_path or not Path(self._last_screenshot_path).exists():
+            messagebox.showwarning("Nadin", "\u0421\u043a\u0440\u0438\u043d\u0448\u043e\u0442 \u0435\u0449\u0435 \u043d\u0435 \u0441\u043e\u0437\u0434\u0430\u043d")
+            return
+        try:
+            self._copy_image_file_to_clipboard(self._last_screenshot_path)
+            self.status_var.set("\u0421\u043a\u0440\u0438\u043d\u0448\u043e\u0442 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d \u0432 \u0431\u0443\u0444\u0435\u0440")
+        except Exception as exc:
+            logger.exception("Failed to copy screenshot to clipboard")
+            messagebox.showerror("Nadin", f"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0441\u043a\u0440\u0438\u043d\u0448\u043e\u0442: {exc}")
+
+    def _open_tab_screenshot_viewer(self, _event: tk.Event | None = None) -> str:
+        if not self._last_tab_screenshot_path or not Path(self._last_tab_screenshot_path).exists():
+            return "break"
+        self._open_image_viewer(self._last_tab_screenshot_path, self.screenshot_tab_status_var.get())
+        return "break"
+
+    def _update_company_summary(self, rusprofile_url: str) -> None:
+        if not rusprofile_url:
+            self._last_company_summary = ""
+            self.company_summary_button.configure(state=tk.DISABLED)
+            self.company_summary_text.delete("1.0", tk.END)
+            self.company_summary_text.insert("1.0", "Выберите компанию из списка для отображения информации")
+            return
+
+        self.company_summary_text.delete("1.0", tk.END)
+        self.company_summary_text.insert("1.0", f"Загрузка данных с {rusprofile_url}...")
+        self.company_summary_button.configure(state=tk.NORMAL)
+
+        def worker() -> None:
+            try:
+                profile = self._load_rusprofile_company_info(rusprofile_url)
+                self.after(0, lambda: self._display_company_summary(profile))
+            except Exception as exc:
+                logger.exception("Failed to load company summary")
+                self.after(0, lambda: self._display_company_summary_error(str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _fetch_rusprofile_html_loose(self, url: str) -> str:
+        headers = {
+            "User-Agent": self.engine._get_random_user_agent(),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        }
+        proxy_type, proxy_url = self._get_proxy_settings()
+        proxies = None
+        if proxy_url:
+            scheme = "http"
+            if proxy_type == "socks5":
+                scheme = "socks5"
+            elif proxy_type == "socks4":
+                scheme = "socks4"
+            proxies = {"http": f"{scheme}://{proxy_url}", "https": f"{scheme}://{proxy_url}"}
+
+        try:
+            session = self.engine._ensure_cloudscraper_session()
+            if session is not None:
+                response = session.get(url, timeout=30, headers=headers, proxies=proxies)
+                if getattr(response, "status_code", 0) == 200 and getattr(response, "text", ""):
+                    return str(response.text)
+        except Exception:
+            logger.exception("Loose RusProfile fetch via cloudscraper failed")
+
+        try:
+            return self.engine._fetch_page(url, timeout=12, max_retries=1)
+        except Exception:
+            logger.exception("Loose RusProfile fetch via engine failed")
+        return ""
+
+    def _fetch_rusprofile_full_info(self, url: str) -> dict[str, Any]:
+        html = self._fetch_rusprofile_html_loose(url)
+        profile = self._parse_rusprofile_dom_html(url, html) if html else {}
+        needs_dom_fallback = (
+            not self._has_meaningful_rusprofile_profile(profile)
+            or not self.engine._normalize_spaces(str(profile.get("company_summary", "")))
+        )
+        if not needs_dom_fallback:
+            return profile
+
+        try:
+            dom_html = self._fetch_dom_with_headless_browser(url)
+        except Exception:
+            logger.exception("RusProfile DOM fetch via headless browser failed")
+            return profile
+
+        dom_profile = self._parse_rusprofile_dom_html(url, dom_html) if dom_html else {}
+        if dom_profile:
+            return self._merge_rusprofile_profile(profile, dom_profile) if profile else dom_profile
+        return profile
+
+    def _parse_rusprofile_dom_html(self, url: str, html: str) -> dict[str, Any]:
+        raw_html = str(html or "")
+        if not raw_html:
+            return {}
+
+        try:
+            from bs4 import BeautifulSoup
+        except Exception:
+            return {}
+
+        soup = BeautifulSoup(raw_html, "lxml")
+        page_text = self.engine._normalize_spaces(soup.get_text(" ", strip=True))
+        profile: dict[str, Any] = {"source": "rusprofile.ru", "url": url}
+
+        org_text = ""
+        h1 = soup.find("h1")
+        if h1 is not None:
+            org_text = self.engine._normalize_spaces(h1.get_text(" ", strip=True))
+        if not org_text:
+            title_tag = soup.find("title")
+            if title_tag is not None:
+                org_text = self.engine._normalize_spaces(title_tag.get_text(" ", strip=True).split("|")[0])
+        if org_text:
+            cleaner = getattr(self.engine, "_clean_ru_org_name", None)
+            profile["ru_org"] = cleaner(org_text) if callable(cleaner) else org_text
+
+        for key, pattern in {
+            "inn": r"ИНН(?:/КПП)?\s*(\d{10,12})",
+            "kpp": r"ИНН/КПП\s*\d{10,12}\s*(\d{9})",
+            "ogrn": r"ОГРН\s*(\d{13,15})",
+        }.items():
+            match = re.search(pattern, page_text, flags=re.IGNORECASE)
+            if match:
+                profile[key] = match.group(1)
+
+        summary_text = ""
+        summary_extractor = getattr(self.engine, "_extract_rusprofile_company_summary", None)
+        if callable(summary_extractor):
+            try:
+                summary_text = self.engine._normalize_spaces(summary_extractor(soup, page_text))
+            except Exception:
+                summary_text = ""
+        if not summary_text:
+            match = re.search(r"Главное о компании(?: за 1 минуту)?\s*(.+?)\s*Показать", page_text, flags=re.IGNORECASE)
+            if match:
+                summary_text = self.engine._normalize_spaces(match.group(1))
+        if not summary_text:
+            marker = soup.find(string=re.compile(r"Главное о компании", re.IGNORECASE))
+            if marker is not None:
+                container = getattr(marker, "parent", None)
+                for _ in range(4):
+                    if container is None:
+                        break
+                    candidate = self.engine._normalize_spaces(container.get_text(" ", strip=True))
+                    candidate = re.sub(r"^.*?Главное о компании(?: за 1 минуту)?", "", candidate, flags=re.IGNORECASE)
+                    candidate = re.sub(r"\bПоказать\b.*$", "", candidate, flags=re.IGNORECASE)
+                    candidate = self.engine._normalize_spaces(candidate)
+                    if len(candidate) >= 30:
+                        summary_text = candidate
+                        break
+                    container = getattr(container, "parent", None)
+        if summary_text:
+            profile["company_summary"] = summary_text
+
+        status_source = page_text
+        selector_reader = getattr(self.engine, "_select_first_text", None)
+        if callable(selector_reader):
+            try:
+                status_source = selector_reader(soup, [".liquidation", ".company-status", ".status", "[class*='status']"]) or page_text
+            except Exception:
+                status_source = page_text
+        normalizer = getattr(self.engine, "_normalize_company_status_label", None)
+        status_value = normalizer(status_source) if callable(normalizer) else self.engine._normalize_spaces(status_source)
+        if status_value:
+            profile["company_status"] = status_value
+
+        revenue_reader = getattr(self.engine, "_extract_revenue_from_soup", None)
+        if callable(revenue_reader):
+            try:
+                revenue = revenue_reader(soup)
+                if revenue:
+                    profile["revenue"] = revenue
+            except Exception:
+                pass
+
+        inactive_checker = getattr(self.engine, "_is_inactive_company_status", None)
+        inactive_company = bool(callable(inactive_checker) and inactive_checker(profile.get("company_status", "")))
+        if not inactive_company:
+            leader_match = re.search(
+                r"((?:генеральный|исполняющий|технический|финансовый)\s+директор|директор|руководитель(?:\s+организации)?|президент(?:,?\s*председатель(?:\s+правления)?)?)\s+([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)",
+                summary_text or page_text,
+                flags=re.IGNORECASE,
+            )
+            if not leader_match:
+                leader_match = re.search(
+                    r"([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)\s*[—:-]?\s*((?:генеральный|исполняющий|технический|финансовый)\s+директор|директор|руководитель(?:\s+организации)?|президент(?:,?\s*председатель(?:\s+правления)?)?)",
+                    summary_text or page_text,
+                    flags=re.IGNORECASE,
+                )
+            if leader_match:
+                if re.search(r"директор|руководитель|президент", leader_match.group(1), flags=re.IGNORECASE):
+                    raw_position = self.engine._normalize_spaces(leader_match.group(1))
+                    raw_fio = self.engine._normalize_spaces(leader_match.group(2))
+                else:
+                    raw_fio = self.engine._normalize_spaces(leader_match.group(1))
+                    raw_position = self.engine._normalize_spaces(leader_match.group(2))
+                normalize_position = getattr(self.engine, "_normalize_position_ru", None)
+                profile["ru_position"] = normalize_position(raw_position) if callable(normalize_position) else raw_position
+                split_fio = getattr(self.engine, "_split_fio_ru", None)
+                if callable(split_fio):
+                    surname_ru, name_ru, middle_name_ru = split_fio(raw_fio)
+                else:
+                    parts = raw_fio.split()
+                    surname_ru, name_ru, middle_name_ru = (parts + ["", "", ""])[:3]
+                profile["surname_ru"] = surname_ru
+                profile["name_ru"] = name_ru
+                profile["middle_name_ru"] = middle_name_ru
+                infer_gender = getattr(self.engine, "_infer_gender", None)
+                if callable(infer_gender):
+                    profile["gender"] = infer_gender(middle_name_ru, profile.get("ru_position", ""), name_ru)
+
+
+        if profile.get("ru_org"):
+            try:
+                en_org, _ = self.engine.normalize_en_org("", profile["ru_org"])
+                if en_org:
+                    profile["en_org"] = en_org
+            except Exception:
+                pass
+        if not inactive_company and not (profile.get("surname_ru") and profile.get("name_ru")):
+            leader_name_match = re.search(
+                "руководитель(?:\s+организации)?\s*:?\s*([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+)?)",
+                page_text,
+                flags=re.IGNORECASE,
+            )
+            if leader_name_match:
+                raw_fio = self.engine._normalize_spaces(leader_name_match.group(1))
+                snippet_start = max(0, leader_name_match.start() - 120)
+                snippet_end = min(len(page_text), leader_name_match.end() + 120)
+                snippet = page_text[snippet_start:snippet_end]
+                position_match = re.search(
+                    "((?:генеральный|исполняющий|технический|финансовый)\s+директор|директор|руководитель(?:\s+организации)?|президент(?:,?\s*председатель(?:\s+правления)?)?)",
+                    snippet,
+                    flags=re.IGNORECASE,
+                )
+                raw_position = self.engine._normalize_spaces(position_match.group(1)) if position_match else ""
+                split_fio = getattr(self.engine, "_split_fio_ru", None)
+                if callable(split_fio):
+                    surname_ru, name_ru, middle_name_ru = split_fio(raw_fio)
+                else:
+                    parts = raw_fio.split()
+                    surname_ru, name_ru, middle_name_ru = (parts + ["", "", ""])[:3]
+                if surname_ru and name_ru:
+                    profile["surname_ru"] = surname_ru
+                    profile["name_ru"] = name_ru
+                    profile["middle_name_ru"] = middle_name_ru
+                    if raw_position and not profile.get("ru_position"):
+                        normalize_position = getattr(self.engine, "_normalize_position_ru", None)
+                        profile["ru_position"] = normalize_position(raw_position) if callable(normalize_position) else raw_position
+                    infer_gender = getattr(self.engine, "_infer_gender", None)
+                    if callable(infer_gender):
+                        profile["gender"] = infer_gender(middle_name_ru, profile.get("ru_position", ""), name_ru)
+
+        if profile.get("ru_position"):
+            try:
+                profile["en_position"] = self.engine._generate_en_position(profile["ru_position"])
+            except Exception:
+                pass
+        return profile
+
+    def _load_rusprofile_company_info(self, rusprofile_url: str) -> dict[str, Any]:
+        profile: dict[str, Any] = {}
+        try:
+            parsed = self.engine._parse_rusprofile(rusprofile_url)
+            if isinstance(parsed, dict):
+                profile.update(parsed)
+        except Exception:
+            logger.exception("Engine RusProfile parser failed")
+
+        dom_profile = self._fetch_rusprofile_full_info(rusprofile_url)
+        if dom_profile:
+            profile = self._merge_rusprofile_profile(profile, dom_profile) if profile else dict(dom_profile)
+        return profile
+
+    def _display_company_summary(self, profile: dict[str, Any]) -> None:
+        self.company_summary_text.delete("1.0", tk.END)
+
+        summary_text = self.engine._normalize_spaces(str(profile.get("company_summary", "")))
+        self._last_company_summary = summary_text
+
+        lines: list[str] = []
+        if summary_text:
+            lines.append("Главное о компании за 1 минуту")
+            lines.append(summary_text)
+            lines.append("")
+
+        if profile.get("ru_org"):
+            lines.append(f"Организация: {profile.get('ru_org')}")
+        if profile.get("company_status"):
+            lines.append(f"Статус компании: {profile.get('company_status')}")
+        if profile.get("inn"):
+            lines.append(f"ИНН: {profile.get('inn')}")
+        if profile.get("ogrn"):
+            lines.append(f"ОГРН: {profile.get('ogrn')}")
+        if profile.get("kpp"):
+            lines.append(f"КПП: {profile.get('kpp')}")
+        if profile.get("ru_position"):
+            lines.append(f"Должность: {profile.get('ru_position')}")
+        if profile.get("surname_ru") or profile.get("name_ru"):
+            fio = self.engine._normalize_spaces(" ".join(part for part in [profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")] if part))
+            if fio:
+                lines.append(f"Руководитель: {fio}")
+        if profile.get("address"):
+            lines.append(f"Адрес: {profile.get('address')}")
+        if profile.get("phone"):
+            lines.append(f"Телефон: {profile.get('phone')}")
+
+        has_visible_content = bool(lines)
+        self.company_summary_button.configure(state=tk.NORMAL if has_visible_content else tk.DISABLED)
+        if has_visible_content:
+            self.company_summary_text.insert("1.0", "\n".join(lines))
+        else:
+            self.company_summary_text.insert("1.0", "Нет данных о компании")
+
+    def _display_company_summary_error(self, error: str) -> None:
+        self._last_company_summary = ""
+        self.company_summary_button.configure(state=tk.NORMAL if self._last_rusprofile_url else tk.DISABLED)
+        self.company_summary_text.delete("1.0", tk.END)
+        self.company_summary_text.insert("1.0", f"Ошибка загрузки: {error}")
+
+    def _open_company_summary_tab(self) -> None:
+        self.notebook.select(self.tab_company)
+
+    def _copy_text_widget_selection(self, event: tk.Event | None = None) -> str:
+        widget = event.widget if event is not None else self.focus_get()
+        if not isinstance(widget, tk.Text):
+            return "break"
+        try:
+            selected = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            selected = widget.get("1.0", tk.END).strip()
+        if selected:
+            self.clipboard_clear()
+            self.clipboard_append(selected)
+        return "break"
+
+    def _select_all_text_widget(self, event: tk.Event | None = None) -> str:
+        widget = event.widget if event is not None else self.focus_get()
+        if not isinstance(widget, tk.Text):
+            return "break"
+        widget.tag_add("sel", "1.0", tk.END)
+        widget.mark_set("insert", "1.0")
+        widget.see("insert")
+        return "break"
+
+    def _copy_trace_text(self, _event: tk.Event | None = None) -> str:
+        if not hasattr(self, "trace_text"):
+            return "break"
+        try:
+            selected = self.trace_text.get("sel.first", "sel.last")
+        except tk.TclError:
+            selected = self.trace_text.get("1.0", tk.END).strip()
+        if selected:
+            self.clipboard_clear()
+            self.clipboard_append(selected)
+        return "break"
+
+    def _select_all_trace_text(self, _event: tk.Event | None = None) -> str:
+        if not hasattr(self, "trace_text"):
+            return "break"
+        self.trace_text.tag_add("sel", "1.0", tk.END)
+        self.trace_text.mark_set("insert", "1.0")
+        self.trace_text.see("insert")
+        return "break"
 
     def _bind_entry_shortcuts(self, entry: ttk.Entry) -> None:
         shortcuts = [
@@ -557,7 +1315,10 @@ class NativeNadinApp(tk.Tk):
         state = tk.DISABLED if busy else tk.NORMAL
         self.search_button.configure(state=state)
         download_state = tk.NORMAL if (not busy and not self._screenshot_busy and self._last_screenshot_path) else tk.DISABLED
-        self.download_screenshot_button.configure(state=download_state)
+        if self.download_screenshot_button is not None:
+            self.download_screenshot_button.configure(state=download_state)
+        if hasattr(self, "copy_screenshot_button"):
+            self.copy_screenshot_button.configure(state=download_state)
 
         if busy:
             self.progress.start(12)
@@ -630,6 +1391,21 @@ class NativeNadinApp(tk.Tk):
     def _candidate_key(self, candidate: dict[str, Any], query_for_autofill: str = "") -> str:
         query = self.engine._normalize_spaces(query_for_autofill)
         return f"{self._candidate_identity(candidate)}|query:{query}"
+
+    def _visible_source_name(self, source_name: str, source_names: Any = None) -> str:
+        candidates: list[str] = []
+        primary = self.engine._normalize_spaces(str(source_name))
+        if primary:
+            candidates.append(primary)
+        if isinstance(source_names, (list, tuple, set)):
+            for item in source_names:
+                normalized = self.engine._normalize_spaces(str(item))
+                if normalized:
+                    candidates.append(normalized)
+        for item in candidates:
+            if not self._is_hidden_source_name(item):
+                return item
+        return "?"
 
     def _normalize_backend_candidate(self, item: dict[str, Any], query: str) -> dict[str, Any] | None:
         if not isinstance(item, dict):
@@ -760,7 +1536,11 @@ class NativeNadinApp(tk.Tk):
 
         candidates.sort(key=lambda item: float(item.get("score", 0)), reverse=True)
         for item in candidates:
-            source_names = [self.engine._normalize_spaces(str(x)) for x in item.get("source_names", []) if self.engine._normalize_spaces(str(x))]
+            source_names = [
+                self.engine._normalize_spaces(str(x))
+                for x in item.get("source_names", [])
+                if self.engine._normalize_spaces(str(x)) and not self._is_hidden_source_name(str(x))
+            ]
             item["source"] = ", ".join(source_names) if source_names else self.engine._normalize_spaces(str(item.get("source", "")))
             item["score"] = float(item.get("score", 0))
         return candidates[:20]
@@ -1087,7 +1867,6 @@ class NativeNadinApp(tk.Tk):
             field_layout: list[tuple[str, str]] = [
                 ("ИНН", "inn"),
                 ("Организация", "ru_org"),
-                ("Organization", "en_org"),
                 ("Статус", "company_status"),
             ]
         elif compact_company:
@@ -1119,7 +1898,7 @@ class NativeNadinApp(tk.Tk):
         seen: set[str] = set()
         for source in source_names:
             src = self.engine._normalize_spaces(str(source))
-            if not src:
+            if not src or self._is_hidden_source_name(src):
                 continue
             key = src.lower()
             if key in seen:
@@ -1129,6 +1908,7 @@ class NativeNadinApp(tk.Tk):
 
         rows.append(("Источники", ", ".join(cleaned_sources) if cleaned_sources else "—"))
         return rows
+
 
     def _merge_profile_with_source_hits(self, profile: dict[str, Any], source_hits: list[dict[str, Any]]) -> dict[str, str]:
         merged = {key: self.engine._normalize_spaces(str(value)) for key, value in profile.items()}
@@ -1266,6 +2046,8 @@ class NativeNadinApp(tk.Tk):
         if sanitized_rusprofile_url:
             base_source_url = sanitized_rusprofile_url
             self._append_source_name(source_names, 'rusprofile.ru')
+        
+        self._last_rusprofile_url = sanitized_rusprofile_url or ""
 
         rows = self._compose_card_rows(
             {k: self.engine._normalize_spaces(str(v)) for k, v in profile.items()},
@@ -1278,6 +2060,9 @@ class NativeNadinApp(tk.Tk):
         self._last_profile_inn = self.engine._normalize_spaces(str(profile.get("inn", "")))
         self._last_profile_ogrn = self.engine._normalize_spaces(str(profile.get("ogrn", "")))
         self._last_profile_org = self.engine._normalize_spaces(str(profile.get("ru_org", "")))
+        self._last_profile_surname = self.engine._normalize_spaces(str(profile.get("surname_ru", "")))
+        self._last_profile_name = self.engine._normalize_spaces(str(profile.get("name_ru", "")))
+        self._last_profile_middle = self.engine._normalize_spaces(str(profile.get("middle_name_ru", "")))
         self._last_source_names = list(source_names)
         self._last_source_url = base_source_url
         self._pending_source_url = ""
@@ -1285,6 +2070,8 @@ class NativeNadinApp(tk.Tk):
 
         if self._needs_rusprofile_enrichment(card_id, profile, source_hits, source_names, self._last_source_url):
             self._schedule_rusprofile_enrichment(card_id, self._last_source_url)
+
+        self._update_company_summary(self._last_rusprofile_url)
 
     def _render_card_rows(self, rows: list[tuple[str, str]], title: str) -> None:
         self.card_title_var.set(title)
@@ -1343,6 +2130,10 @@ class NativeNadinApp(tk.Tk):
             self.status_var.set("\u0412\u044b\u0431\u0440\u0430\u043d\u043d\u044b\u0439 \u0432\u0430\u0440\u0438\u0430\u043d\u0442 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d")
         return "break"
 
+    def _is_hidden_source_name(self, source_name: str) -> bool:
+        normalized = self.engine._normalize_spaces(str(source_name)).lower()
+        return normalized in {"scrapy merge", "__merged__", "internal merged"} or "scrapy merge" in normalized or "__merged__" in normalized
+
     def _extract_source_names(self, payload: dict[str, object], primary_source: str = "") -> list[str]:
         raw_hits = payload.get("source_hits", []) if isinstance(payload, dict) else []
         names: list[str] = []
@@ -1350,7 +2141,7 @@ class NativeNadinApp(tk.Tk):
 
         if primary_source:
             src = self.engine._normalize_spaces(primary_source)
-            if src:
+            if src and not self._is_hidden_source_name(src):
                 names.append(src)
                 seen.add(src.lower())
 
@@ -1361,7 +2152,7 @@ class NativeNadinApp(tk.Tk):
             if not isinstance(hit, dict):
                 continue
             source_name = self.engine._normalize_spaces(str(hit.get("source", "")))
-            if not source_name:
+            if not source_name or self._is_hidden_source_name(source_name):
                 continue
             key = source_name.lower()
             if key in seen:
@@ -1410,7 +2201,7 @@ class NativeNadinApp(tk.Tk):
 
     def _append_source_name(self, source_names: list[str], source_name: str) -> list[str]:
         normalized = self.engine._normalize_spaces(str(source_name))
-        if not normalized:
+        if not normalized or self._is_hidden_source_name(normalized):
             return source_names
         seen = {self.engine._normalize_spaces(str(item)).lower() for item in source_names}
         if normalized.lower() not in seen:
@@ -1564,13 +2355,22 @@ class NativeNadinApp(tk.Tk):
                 db.execute('UPDATE cards SET data_json=? WHERE id=?', (json.dumps(payload, ensure_ascii=False), card_id))
             return updated
 
+    def _has_meaningful_rusprofile_profile(self, profile: dict[str, Any]) -> bool:
+        if not isinstance(profile, dict):
+            return False
+        meaningful_keys = {
+            "ru_org", "inn", "ogrn", "company_status", "company_summary",
+            "surname_ru", "name_ru", "middle_name_ru", "ru_position", "revenue", "profit",
+        }
+        return any(self._profile_has_value(profile.get(key, "")) for key in meaningful_keys)
+
     def _schedule_rusprofile_enrichment(self, card_id: int, source_url: str) -> None:
         if card_id in self._card_enrichment_inflight:
             return
 
         self._card_enrichment_inflight.add(card_id)
         if self._current_card_id == card_id:
-            self.status_var.set('Карточка показана. Уточняем данные из rusprofile...')
+            self.status_var.set('\u041a\u0430\u0440\u0442\u043e\u0447\u043a\u0430 \u043f\u043e\u043a\u0430\u0437\u0430\u043d\u0430. \u0423\u0442\u043e\u0447\u043d\u044f\u0435\u043c \u0434\u0430\u043d\u043d\u044b\u0435 \u0438\u0437 rusprofile...')
 
         def worker() -> None:
             error = ''
@@ -1580,16 +2380,19 @@ class NativeNadinApp(tk.Tk):
                 resolved_url = self._resolve_rusprofile_source_url(source_url) or self._resolve_rusprofile_source_url('')
                 resolved_url = self._sanitize_rusprofile_detail_url(resolved_url)
                 if not resolved_url:
-                    raise RuntimeError('rusprofile_url_not_found')
+                    self.after(0, lambda: self._on_rusprofile_enrichment_done(card_id, '', False, ''))
+                    return
 
-                rusprofile_profile = self.engine._parse_rusprofile(resolved_url)
-                if not isinstance(rusprofile_profile, dict) or not rusprofile_profile:
-                    raise RuntimeError('rusprofile_profile_empty')
+                rusprofile_profile = self._load_rusprofile_company_info(resolved_url)
+                if not self._has_meaningful_rusprofile_profile(rusprofile_profile):
+                    self.after(0, lambda: self._on_rusprofile_enrichment_done(card_id, resolved_url, False, ''))
+                    return
 
                 with self.engine._connect() as db:
                     row = db.execute('SELECT data_json FROM cards WHERE id=?', (card_id,)).fetchone()
                     if row is None:
-                        raise RuntimeError('card_not_found')
+                        self.after(0, lambda: self._on_rusprofile_enrichment_done(card_id, resolved_url, False, ''))
+                        return
                     payload = json.loads(row['data_json'] or '{}')
                     if not isinstance(payload, dict):
                         payload = {}
@@ -1836,18 +2639,22 @@ class NativeNadinApp(tk.Tk):
         except Exception:  # noqa: BLE001
             html = ""
 
-        is_blocked_html = False
-        checker = getattr(self.engine, "_is_captcha_or_block", None)
-        if html and callable(checker):
-            try:
-                is_blocked_html = bool(checker(html, search_url))
-            except Exception:  # noqa: BLE001
-                is_blocked_html = False
-
-        if html and not is_blocked_html:
+        if html:
             resolved_from_html = self._extract_rusprofile_detail_url_from_html(html)
             if resolved_from_html:
                 resolved = resolved_from_html
+
+        if not resolved:
+            try:
+                session = self.engine._ensure_cloudscraper_session()
+                if session is not None:
+                    response = session.get(search_url, timeout=12)
+                    if getattr(response, "status_code", 0) == 200:
+                        resolved_from_cloud = self._extract_rusprofile_detail_url_from_html(getattr(response, "text", ""))
+                        if resolved_from_cloud:
+                            resolved = resolved_from_cloud
+            except Exception:  # noqa: BLE001
+                logger.exception("RusProfile URL lookup via cloudscraper failed")
 
         if not resolved:
             ddg_query = quote(f"site:rusprofile.ru/id {normalized_query}")
@@ -1865,6 +2672,9 @@ class NativeNadinApp(tk.Tk):
 
     def _resolve_rusprofile_source_url(self, source_url: str) -> str:
         normalized = self._normalize_screenshot_target(source_url)
+        cached_rusprofile = self._sanitize_rusprofile_detail_url(self.__dict__.get("_last_rusprofile_url", ""))
+        if cached_rusprofile:
+            return cached_rusprofile
         if normalized.startswith("http://") or normalized.startswith("https://"):
             sanitized = self._sanitize_rusprofile_detail_url(normalized)
             if sanitized:
@@ -1883,7 +2693,18 @@ class NativeNadinApp(tk.Tk):
                 return ""
             if normalized and not self._is_machine_source_url(normalized) and not self._is_generic_landing_url(normalized):
                 return normalized
+
+        if lookup_query:
+            return f"https://egrul.nalog.ru/index.html?query={quote(lookup_query)}"
         return normalized
+
+    def _build_card_screenshot_stem(self) -> str:
+        org = self.engine._normalize_spaces(self._last_profile_org)
+        fio = self.engine._normalize_spaces(" ".join(part for part in [self._last_profile_surname, self._last_profile_name, self._last_profile_middle] if part))
+        stem = self.engine._normalize_spaces(" ".join(part for part in [org, fio] if part)) or "source"
+        stem = re.sub(r'[\/:*?"<>|]+', ' ', stem)
+        stem = self.engine._normalize_spaces(stem).strip('. ')
+        return stem[:120] or 'source'
 
     def _capture_source_screenshot(self, auto: bool) -> None:
         if self._screenshot_busy:
@@ -1901,7 +2722,10 @@ class NativeNadinApp(tk.Tk):
             return
 
         self._screenshot_busy = True
-        self.download_screenshot_button.configure(state=tk.DISABLED)
+        if self.download_screenshot_button is not None:
+            self.download_screenshot_button.configure(state=tk.DISABLED)
+        if hasattr(self, "copy_screenshot_button"):
+            self.copy_screenshot_button.configure(state=tk.DISABLED)
         if not self._busy:
             self.progress.start(12)
         self.screenshot_meta_var.set("Скриншот: создается...")
@@ -1927,6 +2751,7 @@ class NativeNadinApp(tk.Tk):
                 path, captured_at = self._capture_webpage_screenshot(
                     resolved,
                     metadata_source_url=display_source_url,
+                    preferred_stem=self._build_card_screenshot_stem(),
                 )
                 saved_path = str(path)
                 preview_path = str(self._build_screenshot_preview_asset(path))
@@ -2024,7 +2849,8 @@ class NativeNadinApp(tk.Tk):
         tab_width = min(220, max(180, width // 6))
         tab_bottom = title_bar_height + 2
         draw.rounded_rectangle((tab_left, tab_top, tab_left + tab_width, tab_bottom), radius=6, fill="#2b2f36", outline="#454b55", width=1)
-        draw.text((tab_left + 14, tab_top + 8), "rusprofile.ru", font=font, fill="#f3f4f6")
+        tab_title = self.engine._normalize_spaces((urlparse(source_url).netloc or source_url).replace("www.", "")) or "browser"
+        draw.text((tab_left + 14, tab_top + 8), tab_title[:28], font=font, fill="#f3f4f6")
 
         button_y = 0
         button_w = 46
@@ -2179,6 +3005,56 @@ class NativeNadinApp(tk.Tk):
 
         return False, last_details or "headless_browser_failed"
 
+    def _fetch_dom_with_headless_browser(self, source_url: str) -> str:
+        browser_path = self._find_headless_browser()
+        if browser_path is None:
+            raise RuntimeError("headless_browser_not_found")
+
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        attempts = ["--headless=new", "--headless"]
+        user_agent = self.engine._get_random_user_agent()
+        last_details = ""
+
+        for headless_flag in attempts:
+            with tempfile.TemporaryDirectory(prefix="nadin_dom_browser_") as profile_dir:
+                command = [
+                    str(browser_path),
+                    headless_flag,
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-breakpad",
+                    "--disable-crash-reporter",
+                    "--disable-blink-features=AutomationControlled",
+                    "--hide-scrollbars",
+                    "--window-size=1600,900",
+                    "--lang=ru-RU",
+                    "--virtual-time-budget=5000",
+                    f"--user-data-dir={profile_dir}",
+                    f"--user-agent={user_agent}",
+                    "--dump-dom",
+                    source_url,
+                ]
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    timeout=20,
+                    check=False,
+                    creationflags=creationflags,
+                )
+            stdout = str(completed.stdout or "")
+            if completed.returncode == 0 and "<html" in stdout.lower():
+                return stdout
+            stderr = (completed.stderr or "").strip()
+            last_details = stderr or stdout.strip() or f"code={completed.returncode}"
+
+        raise RuntimeError(last_details or "headless_dom_fetch_failed")
+
     def _capture_with_splash(self, source_url: str, output_path: Path) -> tuple[bool, str]:
         splash_base = self.engine._normalize_spaces(os.getenv("NADIN_SPLASH_URL", "http://127.0.0.1:8050/render.png"))
         if not splash_base:
@@ -2260,14 +3136,19 @@ $web.Dispose()
             details = stderr or stdout or f"code={completed.returncode}"
             raise RuntimeError(f"IE WebBrowser fallback failed: {details}")
 
-    def _capture_webpage_screenshot(self, source_url: str, *, metadata_source_url: str = "") -> tuple[Path, str]:
+    def _capture_webpage_screenshot(self, source_url: str, *, metadata_source_url: str = "", preferred_stem: str = "") -> tuple[Path, str]:
         now = datetime.now()
         captured_at = now.strftime("%d.%m.%Y %H:%M:%S")
 
         target = self._normalize_screenshot_target(source_url)
         meta_source_url = self.engine._normalize_spaces(metadata_source_url) or target
-        host = urlparse(target).netloc or Path(target).stem or "source"
-        safe_host = re.sub(r"[^a-zA-Z0-9_.-]", "_", host)
+        stem_source = self.engine._normalize_spaces(preferred_stem)
+        if stem_source:
+            safe_host = re.sub(r'[\/:*?"<>|]+', ' ', stem_source)
+            safe_host = self.engine._normalize_spaces(safe_host).strip('. ') or 'source'
+        else:
+            host = urlparse(target).netloc or Path(target).stem or "source"
+            safe_host = re.sub(r"[^a-zA-Z0-9_. \-]", "_", host)
         file_name = f"{safe_host}_{now.strftime('%Y%m%d_%H%M%S')}.png"
         output_path = self._screenshot_dir / file_name
 
@@ -2303,7 +3184,9 @@ $web.Dispose()
                 self._screenshot_preview_image = None
                 self.screenshot_preview_label.configure(image="", text="Превью отсутствует")
             self.status_var.set("Скриншот источника не создан")
-            if not self._busy and self._last_screenshot_path:
+            if hasattr(self, "copy_screenshot_button"):
+                self.copy_screenshot_button.configure(state=tk.DISABLED)
+            if not self._busy and self._last_screenshot_path and self.download_screenshot_button is not None:
                 self.download_screenshot_button.configure(state=tk.NORMAL)
             return
 
@@ -2324,9 +3207,13 @@ $web.Dispose()
             self._pending_source_url = sanitized_rusprofile
             self._show_card(self._current_card_id)
         elif self._current_card_id and sanitized_rusprofile:
+            self._last_rusprofile_url = sanitized_rusprofile
+            self._update_company_summary(self._last_rusprofile_url)
             self._schedule_rusprofile_enrichment(self._current_card_id, sanitized_rusprofile)
 
-        if not self._busy:
+        if hasattr(self, "copy_screenshot_button"):
+            self.copy_screenshot_button.configure(state=tk.NORMAL)
+        if not self._busy and self.download_screenshot_button is not None:
             self.download_screenshot_button.configure(state=tk.NORMAL)
         self.status_var.set(f"Скриншот сохранен: {Path(saved_path).name}")
 
@@ -2346,9 +3233,12 @@ $web.Dispose()
         self.screenshot_preview_label.configure(image=image, text="")
         self._update_screenshot_viewer_image()
 
-    def _open_screenshot_viewer(self, _event: tk.Event | None = None) -> str:
-        if not self._last_screenshot_path or not Path(self._last_screenshot_path).exists():
-            return "break"
+    def _open_image_viewer(self, image_path: str, meta_text: str) -> None:
+        if not image_path or not Path(image_path).exists():
+            return
+
+        self._viewer_image_path = image_path
+        self.viewer_meta_var.set(meta_text)
 
         if self._screenshot_viewer is None or not self._screenshot_viewer.winfo_exists():
             viewer = tk.Toplevel(self)
@@ -2360,7 +3250,7 @@ $web.Dispose()
 
             top_bar = ttk.Frame(viewer, padding=(10, 8))
             top_bar.pack(fill=tk.X)
-            ttk.Label(top_bar, textvariable=self.screenshot_meta_var).pack(side=tk.LEFT)
+            ttk.Label(top_bar, textvariable=self.viewer_meta_var).pack(side=tk.LEFT)
             ttk.Button(top_bar, text="Закрыть", command=self._close_screenshot_viewer).pack(side=tk.RIGHT)
 
             body = ttk.Frame(viewer, padding=(10, 0, 10, 10))
@@ -2373,6 +3263,11 @@ $web.Dispose()
         self._screenshot_viewer.deiconify()
         self._screenshot_viewer.lift()
         self._screenshot_viewer.focus_force()
+
+    def _open_screenshot_viewer(self, _event: tk.Event | None = None) -> str:
+        if not self._last_screenshot_path or not Path(self._last_screenshot_path).exists():
+            return "break"
+        self._open_image_viewer(self._last_screenshot_path, self.screenshot_meta_var.get())
         return "break"
 
     def _close_screenshot_viewer(self) -> None:
@@ -2381,14 +3276,15 @@ $web.Dispose()
         self._screenshot_viewer = None
         self._screenshot_viewer_label = None
         self._screenshot_viewer_image = None
+        self._viewer_image_path = ""
 
     def _update_screenshot_viewer_image(self) -> None:
         if self._screenshot_viewer is None or not self._screenshot_viewer.winfo_exists() or self._screenshot_viewer_label is None:
             return
-        if not self._last_screenshot_path or not Path(self._last_screenshot_path).exists():
+        if not self._viewer_image_path or not Path(self._viewer_image_path).exists():
             return
 
-        image = tk.PhotoImage(file=self._last_screenshot_path)
+        image = tk.PhotoImage(file=self._viewer_image_path)
         max_w = max(self.winfo_screenwidth() - 120, 800)
         max_h = max(self.winfo_screenheight() - 180, 520)
         ratio = max(image.width() / max_w, image.height() / max_h, 1.0)
@@ -2421,11 +3317,30 @@ $web.Dispose()
 
     def _humanize_trace_line(self, line: str) -> str:
         value = self.engine._normalize_spaces(str(line))
+        if not value:
+            return ""
+        if "Scrapy pipeline" in value or "Scrapy Merge" in value or "__merged__" in value:
+            return ""
+        if value.startswith("Провайдеры в поиске:"):
+            providers = [item.strip() for item in value.split(":", 1)[1].split(",")]
+            providers = [item for item in providers if item and not self._is_hidden_source_name(item)]
+            return f"Провайдеры в поиске: {', '.join(providers)}" if providers else ""
+        if value.startswith("hits_by_provider:"):
+            pairs: list[str] = []
+            for item in value.split(":", 1)[1].split(","):
+                chunk = self.engine._normalize_spaces(item)
+                if not chunk or "=" not in chunk:
+                    continue
+                provider_name, provider_count = [part.strip() for part in chunk.split("=", 1)]
+                if self._is_hidden_source_name(provider_name):
+                    continue
+                pairs.append(f"{provider_name}={provider_count}")
+            return f"hits_by_provider: {', '.join(pairs)}" if pairs else ""
         if "provider_" not in value:
             return value
 
         separator = ""
-        for candidate in ("\u2014", "-", "\u2013"):
+        for candidate in ("—", "-", "–"):
             if candidate in value:
                 separator = candidate
         if not separator:
@@ -2439,44 +3354,19 @@ $web.Dispose()
         provider_name = head
         if ":" in head:
             provider_name = head.split(":", 1)[1].strip()
-        provider_name = provider_name.lstrip("\u2713\u2714\u2705\u2716\u274c\u2022 ").strip()
+        provider_name = provider_name.lstrip("✓✔✅✖❌• ").strip()
+        if self._is_hidden_source_name(provider_name):
+            return ""
 
         labels = {
-            "provider_called_ok": "\u043e\u0442\u0432\u0435\u0442 \u043f\u043e\u043b\u0443\u0447\u0435\u043d",
-            "provider_called_empty": "\u0434\u0430\u043d\u043d\u044b\u0445 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e",
-            "provider_blocked_403": "\u0432\u0440\u0435\u043c\u0435\u043d\u043d\u043e \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d",
-            "provider_network_error": "\u0441\u0435\u0442\u0435\u0432\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430",
-            "provider_rate_limited_202": "\u0437\u0430\u043f\u0440\u043e\u0441 \u043e\u0442\u043b\u043e\u0436\u0435\u043d",
-            "provider_temporarily_disabled": "\u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a \u043e\u0442\u043a\u043b\u044e\u0447\u0435\u043d",
-            "provider_timeout_skipped": "\u043f\u0440\u043e\u043f\u0443\u0449\u0435\u043d \u043f\u043e \u0442\u0430\u0439\u043c\u0430\u0443\u0442\u0443",
-            "provider_unavailable": "\u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u0435\u043d",
-            "provider_error": "\u043e\u0448\u0438\u0431\u043a\u0430 \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0430",
+            "provider_called_ok": "ответ получен",
+            "provider_called_empty": "данных не найдено",
+            "provider_blocked_403": "временно недоступен",
+            "provider_blocked_429": "временно недоступен",
+            "provider_failed": "ошибка",
         }
-        label = labels.get(state, state)
-        icon = "\u2713" if state == "provider_called_ok" else "\u2022"
-        return f"{icon} \u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a: {provider_name} \u2014 {label}"
-
-    def _copy_trace_text(self, _event: object | None = None) -> str:
-        try:
-            if self.trace_text.tag_ranges(tk.SEL):
-                content = self.trace_text.get(tk.SEL_FIRST, tk.SEL_LAST)
-            else:
-                content = self.trace_text.get("1.0", tk.END).rstrip()
-        except tk.TclError:
-            content = self.trace_text.get("1.0", tk.END).rstrip()
-        if not content:
-            return "break"
-        self.clipboard_clear()
-        self.clipboard_append(content)
-        self.status_var.set("\u041b\u043e\u0433 \u043f\u043e\u0438\u0441\u043a\u0430 \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u043d")
-        return "break"
-
-    def _select_all_trace_text(self, _event: object | None = None) -> str:
-        self.trace_text.tag_add(tk.SEL, "1.0", tk.END)
-        self.trace_text.mark_set(tk.INSERT, "1.0")
-        self.trace_text.see("1.0")
-        self.trace_text.focus_set()
-        return "break"
+        human_state = labels.get(state, state.replace("provider_", ""))
+        return f"• Источник: {provider_name} — {human_state}"
 
     def _write_trace(self, trace: list[str]) -> None:
         display_trace = [self._humanize_trace_line(item) for item in trace]
