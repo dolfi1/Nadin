@@ -374,6 +374,7 @@ CARD_FIELDS: list[tuple[str, str]] = [
     ("inn", "ИНН"),
     ("ru_org", "Организация"),
     ("en_org", "Organization"),
+    ("company_status", "Статус"),
     ("ru_position", "Должность"),
     ("en_position", "Position"),
 ]
@@ -970,6 +971,80 @@ class CompanyWebApp:
             # Single-token text is ambiguous; treat it as organization in auto mode.
             return False
         return all(re.fullmatch(r"[А-Яа-яЁё]+", part) for part in parts)
+
+    def _normalize_company_status_label(self, value: str) -> str:
+        text_value = self._normalize_spaces(str(value))
+        if not text_value:
+            return ""
+
+        lowered = text_value.lower()
+        if any(
+            phrase in lowered
+            for phrase in (
+                "в стадии ликвидации",
+                "в стадии реорганизации",
+                "процедура ликвидации",
+            )
+        ):
+            return "В стадии ликвидации"
+        if any(
+            phrase in lowered
+            for phrase in (
+                "организация ликвидирована",
+                "ликвидирована",
+                "ликвидация",
+                "прекращение деятельности юридического лица",
+                "исключена из егрюл",
+            )
+        ):
+            return "Ликвидирована"
+        if "действует" in lowered or "действующая" in lowered:
+            return "Действующая"
+        if "банкрот" in lowered:
+            return "В процессе банкротства"
+        if any(
+            phrase in lowered
+            for phrase in (
+                "реорганизация",
+                "реорганизована",
+                "реорганизуется",
+            )
+        ):
+            return "Реорганизована"
+        return text_value[:1].upper() + text_value[1:]
+
+    def _is_inactive_company_status(self, value: str) -> bool:
+        normalized = self._normalize_company_status_label(value)
+        return normalized in {
+            "Ликвидирована",
+            "В стадии ликвидации",
+            "Реорганизована",
+            "В процессе банкротства",
+        }
+
+    def _extract_company_status_from_fns_record(self, sv_yul: dict[str, Any], data: dict[str, Any]) -> str:
+        status_raw = (
+            self._first_non_empty_deep_value(
+                sv_yul,
+                {"НаимСтатус", "НаимСтатЮЛ", "НаимСтат", "Статус", "СвСтатус"},
+            )
+            or self._first_non_empty_deep_value(
+                data,
+                {"НаимСтатус", "НаимСтатЮЛ", "НаимСтат", "Статус", "СвСтатус"},
+            )
+        )
+        normalized = self._normalize_company_status_label(status_raw)
+        if normalized:
+            return normalized
+
+        if isinstance(sv_yul, dict) and sv_yul.get("СвПрекрЮЛ"):
+            return "Ликвидирована"
+        if isinstance(data, dict) and data.get("СвПрекрЮЛ"):
+            return "Ликвидирована"
+        if self._deep_values_for_keys(data, {"СвПрекрЮЛ"}):
+            return "Ликвидирована"
+        return ""
+
     def _clean_ru_org_name(self, value: str) -> str:
         return re.sub(r"^Организация\s+", "", self._normalize_spaces(value), flags=re.IGNORECASE).strip()
 
@@ -1990,7 +2065,7 @@ class CompanyWebApp:
 
     def _provider_chain(self, input_type: str, raw: str) -> list[dict[str, Any]]:
         if input_type == INPUT_TYPE_PERSON_TEXT:
-            names = ["rusprofile.ru", "Wikipedia", "tbank/tinkoff"]
+            names = ["rusprofile.ru", "DuckDuckGo HTML", "Wikipedia", "zachestnyibiznes.ru", "companies.rbc.ru", "tbank/tinkoff"]
         elif input_type == INPUT_TYPE_INN:
             names = ["ФНС ЕГРЮЛ", "zachestnyibiznes.ru", "checko.ru", "rusprofile.ru", "focus.kontur.ru", "companies.rbc.ru"]
         elif input_type == INPUT_TYPE_ORG_TEXT:
@@ -2881,6 +2956,8 @@ class CompanyWebApp:
     ) -> tuple[list[dict[str, Any]], list[str]]:
         self._init_thread_state()
         input_type = self.detect_input_type(raw)
+        if search_type == "person" and input_type not in {INPUT_TYPE_INN, INPUT_TYPE_URL}:
+            input_type = INPUT_TYPE_PERSON_TEXT
         request_fingerprint = hashlib.sha1(f"{input_type}|{self._normalize_spaces(raw).lower()}|{search_type}|{int(no_cache)}".encode("utf-8")).hexdigest()
         active_key = f"external:{request_fingerprint}"
         with self._active_searches_lock:
@@ -3695,6 +3772,7 @@ $web.Dispose()
                 or 0
             )
             gender = self._infer_gender(middle_name_ru, position, name_ru)
+            company_status = self._extract_company_status_from_fns_record(sv_yul, data)
 
             return {
                 "url": url,
@@ -3708,6 +3786,7 @@ $web.Dispose()
                 "gender": gender,
                 "ru_position": (position or ""),
                 "en_position": "",
+                "company_status": company_status,
                 "revenue": self._extract_revenue(str(rev_raw)),
             }
         except Exception as exc:  # noqa: BLE001
@@ -4082,6 +4161,7 @@ $web.Dispose()
                 profile["okpo"] = okpo_match.group(1)
 
             profile["revenue"] = self._extract_revenue_from_soup(soup)
+            profile["company_status"] = self._normalize_company_status_label(page_text)
             head_block = re.search(r"Руководитель\s+([А-ЯЁа-яё\-,\s]{3,120}?)\s+([А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+\s+[А-ЯЁ][а-яё-]+)", page_text)
             fio_match = None
             if head_block:
@@ -5182,6 +5262,8 @@ $web.Dispose()
         normalized["position"] = en_pos
         normalized["en_position"] = en_pos
 
+        normalized["company_status"] = self._normalize_company_status_label(normalized.get("company_status", ""))
+
         profile_type = card_type or self._detect_profile_type(normalized)
         forced_search_type = self._normalize_spaces(str(normalized.get("search_type", ""))).lower()
         has_leader = bool(
@@ -5191,13 +5273,24 @@ $web.Dispose()
         if forced_search_type == "company" and has_leader:
             profile_type = "person_in_company"
 
+        inactive_company = self._is_inactive_company_status(normalized.get("company_status", ""))
+        if inactive_company:
+            profile_type = "company"
+            normalized["ru_position"] = ""
+            normalized["position"] = ""
+            normalized["en_position"] = ""
+            self._clear_profile_leader_fields(normalized, {})
+
         is_company = profile_type == "company"
         if is_company:
             for field in (
                 "surname_ru", "name_ru", "middle_name_ru", "family_name", "first_name", "middle_name_en",
-                "gender", "salutation", "title", "appeal",
+                "gender", "salutation", "title", "appeal", "surname", "name", "middle_name",
             ):
                 normalized.pop(field, None)
+            if inactive_company:
+                for field in ("ru_position", "position", "en_position"):
+                    normalized.pop(field, None)
         else:
             normalized["surname_ru"] = self._format_ru_person_name(normalized.get("surname_ru", ""))
             normalized["name_ru"] = self._format_ru_person_name(normalized.get("name_ru", ""))
@@ -5279,6 +5372,7 @@ $web.Dispose()
                 "en_position",
                 "gender",
                 "inn",
+                "company_status",
                 "appeal",
             ]:
                 if data.get(field):
@@ -5333,6 +5427,7 @@ $web.Dispose()
                 "ru_position",
                 "en_org",
                 "en_position",
+                "company_status",
             ]:
                 if fns_fio_locked and field in {"surname_ru", "name_ru", "middle_name_ru"} and source_name != "ФНС ЕГРЮЛ":
                     continue
@@ -5700,23 +5795,25 @@ $web.Dispose()
             normalized_data = dict(data)
             hit_type = str(hit.get("type") or normalized_data.get("type") or "unknown")
 
+            has_person_names = bool(normalized_data.get("surname_ru") and normalized_data.get("name_ru"))
+            has_company_markers = bool(normalized_data.get("ru_org") or normalized_data.get("inn") or normalized_data.get("ogrn"))
             source_is_person = bool(
                 hit.get("person_source")
                 or normalized_data.get("person_source")
                 or hit_type == "person"
+                or has_person_names
             )
             source_is_company = hit_type == "company"
-            if not source_is_company:
-                has_person_names = bool(normalized_data.get("surname_ru") and normalized_data.get("name_ru"))
-                has_company_markers = bool(normalized_data.get("ru_org") or normalized_data.get("inn") or normalized_data.get("ogrn"))
-                if not has_person_names and has_company_markers:
-                    source_is_company = True
-                    hit_type = "company"
+            if not source_is_company and has_company_markers and not has_person_names:
+                source_is_company = True
+                hit_type = "company"
 
-            if search_type == "person" and source_is_company:
+            if search_type == "person" and source_is_company and not has_person_names:
                 continue
-            if search_type == "company" and source_is_person:
+            if search_type == "company" and source_is_person and not source_is_company:
                 continue
+            if search_type == "person" and has_person_names and source_is_company:
+                hit_type = "person"
 
             if normalized_data.get("ru_org"):
                 cleaned_org = self._clean_ru_org_name(str(normalized_data["ru_org"]))
@@ -5757,7 +5854,15 @@ $web.Dispose()
                     normalized_data["middle_name_ru"] = parts[2]
 
             fio_ru = " ".join(x for x in [normalized_data.get("surname_ru", ""), normalized_data.get("name_ru", ""), normalized_data.get("middle_name_ru", "")] if x).strip()
-            if query_words and fio_ru:
+            if query_words and search_type == "person":
+                if not fio_ru:
+                    continue
+                fio_lower = self._normalize_spaces(fio_ru.lower())
+                surname = self._normalize_spaces(str(normalized_data.get("surname_ru", "")).lower())
+                if not (any(word in surname for word in query_words) or all(word in fio_lower for word in query_words)):
+                    logger.debug("Кандидат %d: ФИО не совпало с запросом", idx)
+                    continue
+            elif query_words and fio_ru:
                 fio_lower = self._normalize_spaces(fio_ru.lower())
                 surname = self._normalize_spaces(str(normalized_data.get("surname_ru", "")).lower())
                 if not (any(word in surname for word in query_words) or all(word in fio_lower for word in query_words)):
@@ -6052,7 +6157,7 @@ $web.Dispose()
 
     def _search_by_person(self, full_name: str, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
         trace = [f"Поиск по персоне: {full_name}"]
-        hits, source_trace = self._search_external_sources(full_name, no_cache=False, search_type=search_type)
+        hits, source_trace = self._search_external_sources(full_name, no_cache=False, search_type="person")
         trace.extend(source_trace)
         return hits, trace
     def _search_by_company(self, company_name: str, search_type: str = "") -> tuple[list[dict[str, Any]], list[str]]:
@@ -6195,7 +6300,7 @@ $web.Dispose()
                         if self._company_name_matches(str(hit.get("data", {}).get("ru_org", "")), params["company"])
                     ]
                     trace.append(f"Фильтрация по компании: {params['company']}")
-                candidates = self._build_person_candidates(source_hits, full_name, search_type=search_type)
+                candidates = self._build_person_candidates(source_hits, full_name, search_type="person")
             elif params.get("company"):
                 trace.append(f"Поиск по названию компании: {params['company']}")
                 trace.append("AUTO->COMPANY: включен company-mode для корректного выбора по бренду")
@@ -6657,11 +6762,7 @@ $web.Dispose()
                     field_sources.get("ru_position", ""),
                 )
                 if has_position and not has_fio:
-                    logger.info("autocreate_skipped: reason=invalid_fields details=company_without_leader")
-                    manual_payload["error"] = "Не найден руководитель компании, уточните/выберите из списка"
-                    response = self._autofill_redirect_response(f"/create/manual?{urlencode(manual_payload)}", wants_json=wants_json)
-                    self._set_cached_autofill_response(cache_key, response)
-                    return response
+                    logger.info("autocreate_continue: missing company leader fields, creating compact company card")
 
             missing_fields = self._missing_required_fields(profile)
             logger.info("autofill.card_type=%s", self._detect_profile_type(profile))

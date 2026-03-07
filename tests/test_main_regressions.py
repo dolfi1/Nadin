@@ -888,7 +888,7 @@ def test_native_app_compose_card_rows_exists_and_formats_sources():
         profit_line="\u0414\u0430\u043d\u043d\u044b\u0445 \u043d\u0435\u0442 (2025)",
     )
 
-    assert ("\u0421\u0442\u0430\u0442\u0443\u0441", "\u041d\u0430\u0439\u0434\u0435\u043d\u043e") in rows
+    assert ("\u0421\u0442\u0430\u0442\u0443\u0441", "\u041d\u0435 \u0443\u043a\u0430\u0437\u0430\u043d") in rows
     assert ("\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0438", "\u0424\u041d\u0421 \u0415\u0413\u0420\u042e\u041b, Scrapy Merge") in rows
 
 

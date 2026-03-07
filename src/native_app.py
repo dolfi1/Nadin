@@ -16,7 +16,7 @@ from datetime import datetime
 from html import unescape as html_unescape
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
 _OPTIONAL_DEPS_DIR = Path(__file__).resolve().parents[1] / ".deps"
@@ -116,6 +116,7 @@ class NativeNadinApp(tk.Tk):
         ("ИНН", "inn"),
         ("Организация", "ru_org"),
         ("Organization", "en_org"),
+        ("Статус компании", "company_status"),
         ("Должность", "ru_position"),
         ("Position", "en_position"),
     ]
@@ -137,12 +138,19 @@ class NativeNadinApp(tk.Tk):
         self._active_autofill_token = 0
         self._card_drag_anchor: str | None = None
         self._entry_undo_state: dict[str, tuple[str, int, int]] = {}
+        self._card_enrichment_inflight: set[int] = set()
+        self._current_card_id = 0
 
         self._last_source_url = ""
         self._pending_source_url = ""
         self._last_screenshot_path = ""
         self._last_screenshot_preview_path = ""
         self._screenshot_preview_image: tk.PhotoImage | None = None
+        self._screenshot_viewer: tk.Toplevel | None = None
+        self._screenshot_viewer_label: ttk.Label | None = None
+        self._screenshot_viewer_image: tk.PhotoImage | None = None
+        self._vertical_split: ttk.Panedwindow | None = None
+        self._horizontal_split: ttk.Panedwindow | None = None
 
         self._last_profile_inn = ""
         self._last_profile_ogrn = ""
@@ -185,6 +193,7 @@ class NativeNadinApp(tk.Tk):
             self._bind_entry_shortcuts(entry)
             entry.bind("<Return>", self._on_enter_pressed)
             entry.bind("<KP_Enter>", self._on_enter_pressed)
+            entry.bind("<Button-3>", self._show_entry_context_menu, add="+")
             top.columnconfigure(col, weight=1)
 
         action_frame = ttk.Frame(self, padding=(10, 0, 10, 8))
@@ -206,11 +215,15 @@ class NativeNadinApp(tk.Tk):
         self.progress = ttk.Progressbar(action_frame, mode="indeterminate", length=260)
         self.progress.pack(side=tk.LEFT, padx=(16, 0), fill=tk.X)
 
-        split = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
-        split.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self._vertical_split = ttk.Panedwindow(self, orient=tk.VERTICAL)
+        self._vertical_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self._bind_paned_cursor(self._vertical_split, tk.VERTICAL)
 
-        card_frame = ttk.Frame(split)
-        split.add(card_frame, weight=9)
+        self._horizontal_split = ttk.Panedwindow(self._vertical_split, orient=tk.HORIZONTAL)
+        self._bind_paned_cursor(self._horizontal_split, tk.HORIZONTAL)
+
+        card_frame = ttk.Frame(self._horizontal_split)
+        self._horizontal_split.add(card_frame, weight=9)
         ttk.Label(card_frame, textvariable=self.card_title_var).pack(anchor="w")
 
         card_container = ttk.Frame(card_frame)
@@ -226,12 +239,7 @@ class NativeNadinApp(tk.Tk):
         self.card_tree.heading("value", text="Значение")
         self.card_tree.column("field", width=200, anchor="w", stretch=False)
         self.card_tree.column("value", width=470, anchor="w", stretch=True)
-        card_scroll_y = ttk.Scrollbar(card_container, orient="vertical", command=self.card_tree.yview)
-        card_scroll_x = ttk.Scrollbar(card_container, orient="horizontal", command=self.card_tree.xview)
-        self.card_tree.configure(yscrollcommand=card_scroll_y.set, xscrollcommand=card_scroll_x.set)
         self.card_tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        card_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
-        card_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
         card_container.bind("<Configure>", self._on_card_container_resize)
         self.card_tree.bind("<Control-c>", self._copy_selected_card_value)
         self.card_tree.bind("<Control-C>", self._copy_selected_card_value)
@@ -240,9 +248,10 @@ class NativeNadinApp(tk.Tk):
         self.card_tree.bind("<Double-1>", self._copy_selected_card_value)
         self.card_tree.bind("<ButtonPress-1>", self._on_card_tree_button_press, add="+")
         self.card_tree.bind("<B1-Motion>", self._on_card_tree_drag, add="+")
+        self.card_tree.bind("<Button-3>", self._show_card_tree_context_menu, add="+")
 
-        variants_frame = ttk.Frame(split)
-        split.add(variants_frame, weight=8)
+        variants_frame = ttk.Frame(self._horizontal_split)
+        self._horizontal_split.add(variants_frame, weight=8)
         ttk.Label(variants_frame, text="Варианты").pack(anchor="w")
 
         variants_container = ttk.Frame(variants_frame)
@@ -259,36 +268,42 @@ class NativeNadinApp(tk.Tk):
         self.result_tree.column("org", width=430, anchor="w")
         self.result_tree.column("inn", width=130, anchor="center", stretch=False)
         self.result_tree.column("source", width=220, anchor="w", stretch=False)
-        variants_scroll_y = ttk.Scrollbar(variants_container, orient="vertical", command=self.result_tree.yview)
-        variants_scroll_x = ttk.Scrollbar(variants_container, orient="horizontal", command=self.result_tree.xview)
-        self.result_tree.configure(yscrollcommand=variants_scroll_y.set, xscrollcommand=variants_scroll_x.set)
         self.result_tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        variants_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
-        variants_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
         variants_container.bind("<Configure>", self._on_variants_container_resize)
         self.result_tree.bind("<<TreeviewSelect>>", self._on_variant_selected)
         self.result_tree.bind("<Control-c>", self._copy_selected_variant_value)
         self.result_tree.bind("<Control-C>", self._copy_selected_variant_value)
+        self.result_tree.bind("<Button-3>", self._show_result_tree_context_menu, add="+")
 
-        screenshot_frame = ttk.LabelFrame(self, text="Превью скриншота", padding=(8, 6))
-        screenshot_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-        self.screenshot_preview_label = ttk.Label(screenshot_frame, text="Превью отсутствует", anchor="center", width=44)
+        self._vertical_split.add(self._horizontal_split, weight=12)
+
+        screenshot_frame = ttk.LabelFrame(self._vertical_split, text="Превью скриншота", padding=(8, 6))
+        self._vertical_split.add(screenshot_frame, weight=4)
+        self.screenshot_preview_label = ttk.Label(screenshot_frame, text="Превью отсутствует", anchor="center", width=44, cursor="hand2")
         self.screenshot_preview_label.pack(side=tk.LEFT, padx=(0, 10))
+        self.screenshot_preview_label.bind("<Button-1>", self._open_screenshot_viewer, add="+")
 
         screenshot_info = ttk.Frame(screenshot_frame)
         screenshot_info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ttk.Label(screenshot_info, textvariable=self.screenshot_meta_var).pack(anchor="w")
-        ttk.Label(screenshot_info, textvariable=self.source_url_var, wraplength=740).pack(anchor="w", pady=(4, 0))
+        self.screenshot_meta_entry = ttk.Entry(screenshot_info, textvariable=self.screenshot_meta_var, state="readonly")
+        self.screenshot_meta_entry.pack(fill=tk.X, anchor="w")
+        self._bind_entry_shortcuts(self.screenshot_meta_entry)
+        self.screenshot_meta_entry.bind("<Button-3>", self._show_entry_context_menu, add="+")
 
-        trace_frame = ttk.Frame(self)
-        trace_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(0, 10))
-        ttk.Label(trace_frame, text="Лог поиска").pack(anchor="w")
+        self.source_url_entry = ttk.Entry(screenshot_info, textvariable=self.source_url_var, state="readonly")
+        self.source_url_entry.pack(fill=tk.X, anchor="w", pady=(4, 0))
+        self._bind_entry_shortcuts(self.source_url_entry)
+        self.source_url_entry.bind("<Button-3>", self._show_entry_context_menu, add="+")
+
+        trace_frame = ttk.LabelFrame(self._vertical_split, text="Лог поиска", padding=(8, 6))
+        self._vertical_split.add(trace_frame, weight=3)
         self.trace_text = tk.Text(trace_frame, height=7, wrap=tk.WORD, state=tk.DISABLED)
-        self.trace_text.pack(fill=tk.BOTH, expand=False)
+        self.trace_text.pack(fill=tk.BOTH, expand=True)
         self.trace_text.bind("<Control-c>", self._copy_trace_text)
         self.trace_text.bind("<Control-C>", self._copy_trace_text)
         self.trace_text.bind("<Control-a>", self._select_all_trace_text)
         self.trace_text.bind("<Control-A>", self._select_all_trace_text)
+        self.trace_text.bind("<Button-3>", self._show_text_context_menu, add="+")
 
         status = ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor="w", padding=(8, 4))
         status.pack(fill=tk.X, side=tk.BOTTOM)
@@ -398,6 +413,68 @@ class NativeNadinApp(tk.Tk):
         except tk.TclError:
             pass
 
+    def _popup_context_menu(self, menu: tk.Menu, event: tk.Event) -> str:
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _entry_is_readonly(self, widget: tk.Entry | ttk.Entry) -> bool:
+        try:
+            state = str(widget.cget("state")).lower()
+        except tk.TclError:
+            return False
+        return state in {"readonly", "disabled"}
+
+    def _show_entry_context_menu(self, event: tk.Event) -> str:
+        widget = event.widget
+        if not isinstance(widget, (tk.Entry, ttk.Entry)):
+            return "break"
+        widget.focus_set()
+        readonly = self._entry_is_readonly(widget)
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="Вырезать", command=lambda: widget.event_generate("<<Cut>>"), state=(tk.DISABLED if readonly else tk.NORMAL))
+        menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"), state=(tk.DISABLED if readonly else tk.NORMAL))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: widget.event_generate("<<SelectAll>>"))
+        return self._popup_context_menu(menu, event)
+
+    def _show_text_context_menu(self, event: tk.Event) -> str:
+        widget = event.widget
+        if not isinstance(widget, tk.Text):
+            return "break"
+        widget.focus_set()
+        state = str(widget.cget("state")).lower()
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label="Копировать", command=lambda: self._copy_trace_text())
+        menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"), state=(tk.NORMAL if state == "normal" else tk.DISABLED))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: self._select_all_trace_text())
+        return self._popup_context_menu(menu, event)
+
+    def _show_card_tree_context_menu(self, event: tk.Event) -> str:
+        row_id = self.card_tree.identify_row(event.y)
+        if row_id:
+            self.card_tree.selection_set(row_id)
+            self.card_tree.focus(row_id)
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label="Копировать выделенное", command=self._copy_selected_card_value)
+        menu.add_command(label="Копировать карточку", command=self._copy_full_card)
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=self._select_all_card_rows)
+        return self._popup_context_menu(menu, event)
+
+    def _show_result_tree_context_menu(self, event: tk.Event) -> str:
+        row_id = self.result_tree.identify_row(event.y)
+        if row_id:
+            self.result_tree.selection_set(row_id)
+            self.result_tree.focus(row_id)
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label="Копировать вариант", command=self._copy_selected_variant_value)
+        return self._popup_context_menu(menu, event)
+
     def _on_enter_pressed(self, _event: tk.Event | None = None) -> str:
         self._search()
         return "break"
@@ -433,20 +510,47 @@ class NativeNadinApp(tk.Tk):
         return "break"
 
     def _on_card_container_resize(self, event: tk.Event) -> None:
-        total_width = max(int(event.width) - 28, 340)
+        total_width = max(int(event.width) - 6, 340)
         field_width = min(240, max(180, int(total_width * 0.34)))
         value_width = max(230, total_width - field_width)
         self.card_tree.column("field", width=field_width, stretch=False)
         self.card_tree.column("value", width=value_width, stretch=True)
 
     def _on_variants_container_resize(self, event: tk.Event) -> None:
-        total_width = max(int(event.width) - 28, 430)
+        total_width = max(int(event.width) - 6, 430)
         inn_width = 130
         source_width = 220
         org_width = max(220, total_width - inn_width - source_width)
         self.result_tree.column("org", width=org_width, stretch=True)
         self.result_tree.column("inn", width=inn_width, stretch=False)
         self.result_tree.column("source", width=source_width, stretch=False)
+
+    def _bind_paned_cursor(self, paned: ttk.Panedwindow, orient: str) -> None:
+        paned.bind("<Motion>", lambda event, p=paned, o=orient: self._update_paned_cursor(p, o, event), add="+")
+        paned.bind("<Leave>", lambda _event, p=paned: p.configure(cursor=""), add="+")
+
+    def _update_paned_cursor(self, paned: ttk.Panedwindow, orient: str, event: tk.Event) -> None:
+        try:
+            pane_count = len(paned.panes())
+        except Exception:  # noqa: BLE001
+            pane_count = 0
+        if pane_count <= 1:
+            paned.configure(cursor="")
+            return
+
+        coordinate = int(event.x if orient == tk.HORIZONTAL else event.y)
+        tolerance = 8
+        over_sash = False
+        for sash_index in range(pane_count - 1):
+            try:
+                sash_position = int(paned.sashpos(sash_index))
+            except Exception:  # noqa: BLE001
+                continue
+            if abs(coordinate - sash_position) <= tolerance:
+                over_sash = True
+                break
+
+        paned.configure(cursor="sb_h_double_arrow" if over_sash and orient == tk.HORIZONTAL else "sb_v_double_arrow" if over_sash else "")
 
     def _set_busy(self, busy: bool, status: str = "") -> None:
         self._busy = busy
@@ -593,7 +697,7 @@ class NativeNadinApp(tk.Tk):
             if known_inn and is_bank_brand_title and not inn:
                 inn = known_inn
 
-            source_name = self.engine._normalize_spaces(str(hit.get("source", ""))) or "?"
+            source_name = self.engine._normalize_spaces(str(hit.get("source", ""))) or "—"
             score = float(self.engine._score_hit(hit, q_norm))
 
             if known_inn and inn == known_inn:
@@ -863,6 +967,16 @@ class NativeNadinApp(tk.Tk):
 
         return self.engine._normalize_spaces(query_for_autofill)
 
+    def _extract_redirect_error(self, redirect: str) -> str:
+        normalized = self.engine._normalize_spaces(redirect)
+        if not normalized:
+            return ""
+        parsed = urlparse(normalized)
+        if not parsed.path.endswith('/create/manual'):
+            return ""
+        query = parse_qs(parsed.query)
+        return self.engine._normalize_spaces(unquote(query.get('error', [''])[0]))
+
     def _autofill_candidate(self, candidate: dict[str, Any], reason: str = "") -> None:
         if self._busy:
             return
@@ -934,7 +1048,7 @@ class NativeNadinApp(tk.Tk):
         self._set_busy(False)
         if error:
             self.status_var.set("\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u0444\u043e\u0440\u043c\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043a\u0430\u0440\u0442\u043e\u0447\u043a\u0443")
-            self._render_card_rows([("\u0421\u0442\u0430\u0442\u0443\u0441", error)], "\u041a\u0430\u0440\u0442\u043e\u0447\u043a\u0430")
+            self._render_card_rows([("Состояние", error)], "Карточка")
             return
 
         try:
@@ -942,7 +1056,7 @@ class NativeNadinApp(tk.Tk):
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to render autofill result for card_id=%s", card_id)
             self.status_var.set("\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0442\u043e\u0431\u0440\u0430\u0437\u0438\u0442\u044c \u043a\u0430\u0440\u0442\u043e\u0447\u043a\u0443")
-            self._render_card_rows([("\u0421\u0442\u0430\u0442\u0443\u0441", str(exc))], "\u041a\u0430\u0440\u0442\u043e\u0447\u043a\u0430")
+            self._render_card_rows([("Состояние", str(exc))], "Карточка")
             return
 
         self.status_var.set(f"\u041a\u0430\u0440\u0442\u043e\u0447\u043a\u0430 #{card_id} \u0441\u0444\u043e\u0440\u043c\u0438\u0440\u043e\u0432\u0430\u043d\u0430")
@@ -958,13 +1072,48 @@ class NativeNadinApp(tk.Tk):
         revenue_line: str,
         profit_line: str,
     ) -> list[tuple[str, str]]:
-        rows: list[tuple[str, str]] = []
-        for label, key in self.CARD_FIELDS:
-            rows.append((label, self.engine._normalize_spaces(str(profile.get(key, "")))))
+        normalized_profile = {
+            key: self.engine._normalize_spaces(str(value))
+            for key, value in profile.items()
+        }
+        company_status = self.engine._normalize_spaces(str(normalized_profile.get("company_status", "")))
+        has_company = bool(normalized_profile.get("ru_org"))
+        has_leader = bool(normalized_profile.get("surname_ru") and normalized_profile.get("name_ru"))
+        inactive_checker = getattr(self.engine, "_is_inactive_company_status", None)
+        inactive_company = bool(inactive_checker(company_status)) if callable(inactive_checker) else False
+        compact_company = has_company and not has_leader
 
-        rows.append(("\u0412\u044b\u0440\u0443\u0447\u043a\u0430", revenue_line))
-        rows.append(("\u041f\u0440\u0438\u0431\u044b\u043b\u044c", profit_line))
-        rows.append(("\u0421\u0442\u0430\u0442\u0443\u0441", self.engine._normalize_spaces(str(status))))
+        if inactive_company:
+            field_layout: list[tuple[str, str]] = [
+                ("ИНН", "inn"),
+                ("Организация", "ru_org"),
+                ("Organization", "en_org"),
+                ("Статус", "company_status"),
+            ]
+        elif compact_company:
+            field_layout = [
+                ("ИНН", "inn"),
+                ("Организация", "ru_org"),
+                ("Organization", "en_org"),
+                ("Статус", "company_status"),
+                ("Должность", "ru_position"),
+                ("Position", "en_position"),
+            ]
+        else:
+            field_layout = list(self.CARD_FIELDS)
+
+        rows: list[tuple[str, str]] = []
+        for label, key in field_layout:
+            value = self.engine._normalize_spaces(str(normalized_profile.get(key, "")))
+            if key == "company_status" and has_company and not value and not inactive_company:
+                value = "Не указан"
+            if compact_company and not value and key in {"en_org", "company_status", "ru_position", "en_position"}:
+                continue
+            rows.append((label, value))
+
+        if not inactive_company:
+            rows.append(("Выручка", revenue_line))
+            rows.append(("Прибыль", profit_line))
 
         cleaned_sources: list[str] = []
         seen: set[str] = set()
@@ -978,7 +1127,7 @@ class NativeNadinApp(tk.Tk):
             seen.add(key)
             cleaned_sources.append(src)
 
-        rows.append(("\u0418\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0438", ", ".join(cleaned_sources) if cleaned_sources else "\u2014"))
+        rows.append(("Источники", ", ".join(cleaned_sources) if cleaned_sources else "—"))
         return rows
 
     def _merge_profile_with_source_hits(self, profile: dict[str, Any], source_hits: list[dict[str, Any]]) -> dict[str, str]:
@@ -1069,10 +1218,11 @@ class NativeNadinApp(tk.Tk):
         return self.engine._format_financial_line(best_amount, year)
 
     def _show_card(self, card_id: int) -> None:
+        self._current_card_id = card_id
         with self.engine._connect() as db:
             row = db.execute("SELECT id, status, source, data_json FROM cards WHERE id=?", (card_id,)).fetchone()
         if row is None:
-            messagebox.showerror("Nadin", f"\u041a\u0430\u0440\u0442\u043e\u0447\u043a\u0430 #{card_id} \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u0430")
+            messagebox.showerror("Nadin", f"Карточка #{card_id} не найдена")
             return
 
         payload = json.loads(row["data_json"] or "{}")
@@ -1105,12 +1255,17 @@ class NativeNadinApp(tk.Tk):
         profit_line = self._resolve_metric_line(
             profile,
             source_hits,
-            metric_keys=("profit", "net_profit", "clean_profit", "profit_clean", "\u0447\u0438\u0441\u0442\u0430\u044f_\u043f\u0440\u0438\u0431\u044b\u043b\u044c", "\u0447\u0438\u0441\u0442\u0430\u044f_\u043f\u0440\u0438\u0431\u044b\u043b\u044c_\u0443\u0431\u044b\u0442\u043e\u043a"),
+            metric_keys=("profit", "net_profit", "clean_profit", "profit_clean", "чистая_прибыль", "чистая_прибыль_убыток"),
             year_keys=("profit_year", "financial_year", "year", "report_year"),
         )
 
         primary_source = self.engine._normalize_spaces(str(row["source"] or ""))
         source_names = self._extract_source_names(payload, primary_source=primary_source)
+        base_source_url = self._extract_source_url(payload, fallback_url=self._pending_source_url)
+        sanitized_rusprofile_url = self._sanitize_rusprofile_detail_url(base_source_url)
+        if sanitized_rusprofile_url:
+            base_source_url = sanitized_rusprofile_url
+            self._append_source_name(source_names, 'rusprofile.ru')
 
         rows = self._compose_card_rows(
             {k: self.engine._normalize_spaces(str(v)) for k, v in profile.items()},
@@ -1119,15 +1274,17 @@ class NativeNadinApp(tk.Tk):
             revenue_line=revenue_line,
             profit_line=profit_line,
         )
-        self._render_card_rows(rows, f"\u041a\u0430\u0440\u0442\u043e\u0447\u043a\u0430 #{card_id}")
+        self._render_card_rows(rows, f"Карточка #{card_id}")
         self._last_profile_inn = self.engine._normalize_spaces(str(profile.get("inn", "")))
         self._last_profile_ogrn = self.engine._normalize_spaces(str(profile.get("ogrn", "")))
         self._last_profile_org = self.engine._normalize_spaces(str(profile.get("ru_org", "")))
         self._last_source_names = list(source_names)
-        base_source_url = self._extract_source_url(payload, fallback_url=self._pending_source_url)
         self._last_source_url = base_source_url
         self._pending_source_url = ""
-        self.source_url_var.set(f"URL \u0438\u0441\u0442\u043e\u0447\u043d\u0438\u043a\u0430: {self._last_source_url or chr(8212)}")
+        self.source_url_var.set(f"URL источника: {self._last_source_url or chr(8212)}")
+
+        if self._needs_rusprofile_enrichment(card_id, profile, source_hits, source_names, self._last_source_url):
+            self._schedule_rusprofile_enrichment(card_id, self._last_source_url)
 
     def _render_card_rows(self, rows: list[tuple[str, str]], title: str) -> None:
         self.card_title_var.set(title)
@@ -1136,7 +1293,7 @@ class NativeNadinApp(tk.Tk):
             self.card_tree.delete(iid)
 
         if not rows:
-            rows = [("\u0421\u0442\u0430\u0442\u0443\u0441", "\u041d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445 \u0434\u043b\u044f \u043e\u0442\u043e\u0431\u0440\u0430\u0436\u0435\u043d\u0438\u044f")]
+            rows = [("Состояние", "Нет данных для отображения")]
             self._current_card_rows = list(rows)
 
         for label, value in rows:
@@ -1250,6 +1407,233 @@ class NativeNadinApp(tk.Tk):
         if best_score < 0:
             return ""
         return best_url
+
+    def _append_source_name(self, source_names: list[str], source_name: str) -> list[str]:
+        normalized = self.engine._normalize_spaces(str(source_name))
+        if not normalized:
+            return source_names
+        seen = {self.engine._normalize_spaces(str(item)).lower() for item in source_names}
+        if normalized.lower() not in seen:
+            source_names.append(normalized)
+        return source_names
+
+    def _has_rusprofile_source(self, source_hits: list[dict[str, Any]], source_names: list[str] | None = None) -> bool:
+        names = source_names or []
+        for source_name in names:
+            if self.engine._normalize_spaces(str(source_name)).lower() == 'rusprofile.ru':
+                return True
+        for hit in source_hits:
+            if not isinstance(hit, dict):
+                continue
+            source_name = self.engine._normalize_spaces(str(hit.get('source', ''))).lower()
+            if source_name == 'rusprofile.ru':
+                return True
+        return False
+
+    def _has_rusprofile_payload(self, source_hits: list[dict[str, Any]]) -> bool:
+        meaningful_keys = {
+            'ru_org', 'en_org', 'inn', 'ogrn', 'surname_ru', 'name_ru', 'middle_name_ru',
+            'ru_position', 'en_position', 'company_status', 'revenue', 'profit',
+        }
+        for hit in source_hits:
+            if not isinstance(hit, dict):
+                continue
+            if self.engine._normalize_spaces(str(hit.get('source', ''))).lower() != 'rusprofile.ru':
+                continue
+            data = hit.get('data', {})
+            if not isinstance(data, dict):
+                continue
+            for key in meaningful_keys:
+                if self._profile_has_value(data.get(key, '')):
+                    return True
+        return False
+
+    def _profile_has_value(self, value: Any) -> bool:
+        normalized = self.engine._normalize_spaces(str(value))
+        return bool(normalized and normalized != chr(8212))
+
+    def _needs_rusprofile_enrichment(self, card_id: int, profile: dict[str, Any], source_hits: list[dict[str, Any]], source_names: list[str], source_url: str) -> bool:
+        if card_id in self._card_enrichment_inflight:
+            return False
+
+        has_rusprofile_source = self._has_rusprofile_source(source_hits, source_names)
+        has_rusprofile_payload = self._has_rusprofile_payload(source_hits)
+        has_rusprofile_url = bool(self._sanitize_rusprofile_detail_url(source_url))
+        lookup_query = self._get_rusprofile_lookup_query()
+        if not has_rusprofile_url and not lookup_query:
+            return False
+        if has_rusprofile_payload:
+            return False
+
+        important_keys = ('surname_ru', 'name_ru', 'middle_name_ru', 'ru_position', 'en_position', 'company_status')
+        missing_important = any(not self._profile_has_value(profile.get(key, '')) for key in important_keys)
+
+        revenue_value = self.engine._parse_financial_amount(profile.get('revenue', 0))
+        if revenue_value == 0:
+            for hit in source_hits:
+                data = hit.get('data', {}) if isinstance(hit, dict) else {}
+                if isinstance(data, dict) and self.engine._parse_financial_amount(data.get('revenue', 0)) != 0:
+                    revenue_value = 1
+                    break
+
+        return missing_important or revenue_value == 0 or not has_rusprofile_source
+
+    def _merge_rusprofile_profile(self, current_profile: dict[str, Any], rusprofile_profile: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(current_profile)
+        for key, value in rusprofile_profile.items():
+            if key in {'url', 'source'}:
+                continue
+            if isinstance(value, str):
+                normalized_value = self.engine._normalize_spaces(value)
+            else:
+                normalized_value = value
+
+            if key in {'revenue', 'profit'}:
+                current_amount = self.engine._parse_financial_amount(merged.get(key, 0))
+                new_amount = self.engine._parse_financial_amount(normalized_value)
+                if current_amount == 0 and new_amount != 0:
+                    merged[key] = normalized_value
+                continue
+
+            if key.endswith('_year') or key in {'financial_year', 'year', 'report_year'}:
+                current_year = self.engine._parse_financial_year(merged.get(key, ''))
+                new_year = self.engine._parse_financial_year(normalized_value)
+                if current_year == 0 and new_year != 0:
+                    merged[key] = normalized_value
+                continue
+
+            if not self._profile_has_value(merged.get(key, '')) and self._profile_has_value(normalized_value):
+                merged[key] = normalized_value
+        return merged
+
+    def _upsert_rusprofile_hit(self, source_hits: list[dict[str, Any]], source_url: str, rusprofile_profile: dict[str, Any]) -> list[dict[str, Any]]:
+        cleaned_hits = [hit for hit in source_hits if isinstance(hit, dict)]
+        hit_type = 'person' if self.engine._normalize_spaces(str(rusprofile_profile.get('surname_ru', ''))) else 'company'
+        new_hit = {
+            'source': 'rusprofile.ru',
+            'url': source_url,
+            'type': hit_type,
+            'data': dict(rusprofile_profile),
+        }
+        for idx, hit in enumerate(cleaned_hits):
+            source_name = self.engine._normalize_spaces(str(hit.get('source', ''))).lower()
+            if source_name == 'rusprofile.ru':
+                cleaned_hits[idx] = new_hit
+                return cleaned_hits
+        cleaned_hits.append(new_hit)
+        return cleaned_hits
+
+    def _ensure_rusprofile_source_hit(self, card_id: int, source_url: str) -> bool:
+        resolved_url = self._sanitize_rusprofile_detail_url(source_url)
+        if not card_id or not resolved_url:
+            return False
+
+        with self.engine._connect() as db:
+            row = db.execute('SELECT data_json FROM cards WHERE id=?', (card_id,)).fetchone()
+            if row is None:
+                return False
+            payload = json.loads(row['data_json'] or '{}')
+            if not isinstance(payload, dict):
+                payload = {}
+            source_hits = payload.get('source_hits', [])
+            if not isinstance(source_hits, list):
+                source_hits = []
+
+            updated = False
+            placeholder = {
+                'source': 'rusprofile.ru',
+                'url': resolved_url,
+                'type': 'company' if self._last_profile_org else 'person',
+                'data': {},
+            }
+            for hit in source_hits:
+                if not isinstance(hit, dict):
+                    continue
+                if self.engine._normalize_spaces(str(hit.get('source', ''))).lower() != 'rusprofile.ru':
+                    continue
+                if self.engine._normalize_spaces(str(hit.get('url', ''))) != resolved_url:
+                    hit['url'] = resolved_url
+                    updated = True
+                break
+            else:
+                source_hits.append(placeholder)
+                updated = True
+
+            if updated:
+                payload['source_hits'] = source_hits
+                db.execute('UPDATE cards SET data_json=? WHERE id=?', (json.dumps(payload, ensure_ascii=False), card_id))
+            return updated
+
+    def _schedule_rusprofile_enrichment(self, card_id: int, source_url: str) -> None:
+        if card_id in self._card_enrichment_inflight:
+            return
+
+        self._card_enrichment_inflight.add(card_id)
+        if self._current_card_id == card_id:
+            self.status_var.set('Карточка показана. Уточняем данные из rusprofile...')
+
+        def worker() -> None:
+            error = ''
+            updated = False
+            resolved_url = ''
+            try:
+                resolved_url = self._resolve_rusprofile_source_url(source_url) or self._resolve_rusprofile_source_url('')
+                resolved_url = self._sanitize_rusprofile_detail_url(resolved_url)
+                if not resolved_url:
+                    raise RuntimeError('rusprofile_url_not_found')
+
+                rusprofile_profile = self.engine._parse_rusprofile(resolved_url)
+                if not isinstance(rusprofile_profile, dict) or not rusprofile_profile:
+                    raise RuntimeError('rusprofile_profile_empty')
+
+                with self.engine._connect() as db:
+                    row = db.execute('SELECT data_json FROM cards WHERE id=?', (card_id,)).fetchone()
+                    if row is None:
+                        raise RuntimeError('card_not_found')
+                    payload = json.loads(row['data_json'] or '{}')
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    profile = payload.get('profile', {})
+                    if not isinstance(profile, dict):
+                        profile = {}
+                    source_hits = payload.get('source_hits', [])
+                    if not isinstance(source_hits, list):
+                        source_hits = []
+
+                    merged_profile = self._merge_rusprofile_profile(profile, rusprofile_profile)
+                    merged_hits = self._upsert_rusprofile_hit(source_hits, resolved_url, rusprofile_profile)
+
+                    if merged_profile != profile or merged_hits != source_hits:
+                        payload['profile'] = merged_profile
+                        payload['source_hits'] = merged_hits
+                        db.execute('UPDATE cards SET data_json=? WHERE id=?', (json.dumps(payload, ensure_ascii=False), card_id))
+                        updated = True
+            except Exception as exc:  # noqa: BLE001
+                logger.exception('RusProfile enrichment failed for card %s', card_id)
+                error = str(exc)
+
+            self.after(0, lambda: self._on_rusprofile_enrichment_done(card_id, resolved_url, updated, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_rusprofile_enrichment_done(self, card_id: int, source_url: str, updated: bool, error: str) -> None:
+        self._card_enrichment_inflight.discard(card_id)
+        if error:
+            if self._current_card_id == card_id and not self._busy and not self._screenshot_busy:
+                self.status_var.set('Карточка сформирована')
+            return
+        if not updated:
+            if self._current_card_id == card_id and not self._busy and not self._screenshot_busy:
+                self.status_var.set('Карточка сформирована')
+            return
+        if self._current_card_id != card_id:
+            return
+        self._pending_source_url = source_url
+        self._show_card(card_id)
+        if not self._screenshot_busy:
+            self.after(120, lambda: self._capture_source_screenshot(auto=True))
+        else:
+            self.status_var.set('Данные rusprofile добавлены')
 
     def _score_source_url_for_screenshot(self, source_url: str, *, is_fallback: bool = False) -> int:
         normalized = self.engine._normalize_spaces(source_url)
@@ -1509,10 +1893,21 @@ class NativeNadinApp(tk.Tk):
         if not source_url:
             source_url = self._resolve_rusprofile_source_url("")
         if not source_url:
+            self.screenshot_meta_var.set("Скриншот: источник не найден")
+            self.source_url_var.set(f"URL источника: {chr(8212)}")
+            if not self._last_screenshot_path:
+                self._screenshot_preview_image = None
+                self.screenshot_preview_label.configure(image="", text="Превью отсутствует")
             return
 
         self._screenshot_busy = True
         self.download_screenshot_button.configure(state=tk.DISABLED)
+        if not self._busy:
+            self.progress.start(12)
+        self.screenshot_meta_var.set("Скриншот: создается...")
+        self.source_url_var.set(f"URL источника: {source_url}")
+        self._screenshot_preview_image = None
+        self.screenshot_preview_label.configure(image="", text="Создается превью...")
         self.status_var.set("Создание скриншота rusprofile...")
 
         def worker() -> None:
@@ -1899,8 +2294,15 @@ $web.Dispose()
 
     def _on_source_screenshot_done(self, saved_path: str, preview_path: str, captured_at: str, source_url: str, error: str, auto: bool) -> None:
         self._screenshot_busy = False
+        if not self._busy:
+            self.progress.stop()
         if error:
-            self.status_var.set("Ошибка создания скриншота")
+            self.screenshot_meta_var.set("Скриншот: ошибка")
+            self.source_url_var.set(f"URL источника: {source_url or chr(8212)}")
+            if not self._last_screenshot_path:
+                self._screenshot_preview_image = None
+                self.screenshot_preview_label.configure(image="", text="Превью отсутствует")
+            self.status_var.set("Скриншот источника не создан")
             if not self._busy and self._last_screenshot_path:
                 self.download_screenshot_button.configure(state=tk.NORMAL)
             return
@@ -1910,6 +2312,19 @@ $web.Dispose()
         self._update_screenshot_preview(preview_path or saved_path)
         self.screenshot_meta_var.set(f"Скриншот: {captured_at}")
         self.source_url_var.set(f"URL источника: {source_url}")
+
+        sanitized_rusprofile = self._sanitize_rusprofile_detail_url(source_url)
+        refresh_card = False
+        if self._current_card_id and sanitized_rusprofile:
+            had_rusprofile_source = 'rusprofile.ru' in {item.lower() for item in self._last_source_names}
+            self._append_source_name(self._last_source_names, 'rusprofile.ru')
+            refresh_card = self._ensure_rusprofile_source_hit(self._current_card_id, sanitized_rusprofile) or not had_rusprofile_source
+
+        if refresh_card and self._current_card_id:
+            self._pending_source_url = sanitized_rusprofile
+            self._show_card(self._current_card_id)
+        elif self._current_card_id and sanitized_rusprofile:
+            self._schedule_rusprofile_enrichment(self._current_card_id, sanitized_rusprofile)
 
         if not self._busy:
             self.download_screenshot_button.configure(state=tk.NORMAL)
@@ -1929,6 +2344,62 @@ $web.Dispose()
             image = image.subsample(factor, factor)
         self._screenshot_preview_image = image
         self.screenshot_preview_label.configure(image=image, text="")
+        self._update_screenshot_viewer_image()
+
+    def _open_screenshot_viewer(self, _event: tk.Event | None = None) -> str:
+        if not self._last_screenshot_path or not Path(self._last_screenshot_path).exists():
+            return "break"
+
+        if self._screenshot_viewer is None or not self._screenshot_viewer.winfo_exists():
+            viewer = tk.Toplevel(self)
+            viewer.title("Просмотр скриншота")
+            viewer.geometry("1200x780")
+            viewer.minsize(720, 520)
+            viewer.protocol("WM_DELETE_WINDOW", self._close_screenshot_viewer)
+            viewer.bind("<Escape>", lambda _evt: self._close_screenshot_viewer())
+
+            top_bar = ttk.Frame(viewer, padding=(10, 8))
+            top_bar.pack(fill=tk.X)
+            ttk.Label(top_bar, textvariable=self.screenshot_meta_var).pack(side=tk.LEFT)
+            ttk.Button(top_bar, text="Закрыть", command=self._close_screenshot_viewer).pack(side=tk.RIGHT)
+
+            body = ttk.Frame(viewer, padding=(10, 0, 10, 10))
+            body.pack(fill=tk.BOTH, expand=True)
+            self._screenshot_viewer_label = ttk.Label(body, anchor="center")
+            self._screenshot_viewer_label.pack(fill=tk.BOTH, expand=True)
+            self._screenshot_viewer = viewer
+
+        self._update_screenshot_viewer_image()
+        self._screenshot_viewer.deiconify()
+        self._screenshot_viewer.lift()
+        self._screenshot_viewer.focus_force()
+        return "break"
+
+    def _close_screenshot_viewer(self) -> None:
+        if self._screenshot_viewer is not None and self._screenshot_viewer.winfo_exists():
+            self._screenshot_viewer.destroy()
+        self._screenshot_viewer = None
+        self._screenshot_viewer_label = None
+        self._screenshot_viewer_image = None
+
+    def _update_screenshot_viewer_image(self) -> None:
+        if self._screenshot_viewer is None or not self._screenshot_viewer.winfo_exists() or self._screenshot_viewer_label is None:
+            return
+        if not self._last_screenshot_path or not Path(self._last_screenshot_path).exists():
+            return
+
+        image = tk.PhotoImage(file=self._last_screenshot_path)
+        max_w = max(self.winfo_screenwidth() - 120, 800)
+        max_h = max(self.winfo_screenheight() - 180, 520)
+        ratio = max(image.width() / max_w, image.height() / max_h, 1.0)
+        if ratio > 1:
+            factor = int(ratio)
+            if factor < ratio:
+                factor += 1
+            image = image.subsample(factor, factor)
+
+        self._screenshot_viewer_image = image
+        self._screenshot_viewer_label.configure(image=image, text="")
 
     def _download_screenshot(self) -> None:
         if not self._last_screenshot_path or not Path(self._last_screenshot_path).exists():
@@ -2015,6 +2486,7 @@ $web.Dispose()
         self.trace_text.configure(state=tk.DISABLED)
 
     def _on_close(self) -> None:
+        self._close_screenshot_viewer()
         self.destroy()
 
 
