@@ -777,6 +777,8 @@ class NativeNadinApp(tk.Tk):
 
     def _fetch_rusprofile_full_info(self, url: str) -> dict[str, Any]:
         html = self._fetch_rusprofile_html_loose(url)
+        if self._looks_like_rusprofile_error_page(html):
+            return {}
         profile = self._parse_rusprofile_dom_html(url, html) if html else {}
         needs_dom_fallback = (
             not self._has_meaningful_rusprofile_profile(profile)
@@ -790,11 +792,28 @@ class NativeNadinApp(tk.Tk):
         except Exception:
             logger.exception("RusProfile DOM fetch via headless browser failed")
             return profile
+        if self._looks_like_rusprofile_error_page(dom_html):
+            return profile
 
         dom_profile = self._parse_rusprofile_dom_html(url, dom_html) if dom_html else {}
         if dom_profile:
             return self._merge_rusprofile_profile(profile, dom_profile) if profile else dom_profile
         return profile
+
+    def _looks_like_rusprofile_error_page(self, html: str) -> bool:
+        raw_html = str(html or "")
+        if not raw_html:
+            return False
+        collapsed = self.engine._normalize_spaces(raw_html)
+        lowered = collapsed.lower()
+        error_markers = (
+            "страница не найдена",
+            "проверьте правильность url",
+            "информация о российских юридических лицах и предпринимателях 404",
+        )
+        if any(marker in lowered for marker in error_markers):
+            return True
+        return bool(re.search(r"\b404\b", lowered) and "rusprofile" in lowered and "страница не найдена" in lowered)
 
     def _parse_rusprofile_dom_html(self, url: str, html: str) -> dict[str, Any]:
         raw_html = str(html or "")
@@ -808,6 +827,8 @@ class NativeNadinApp(tk.Tk):
 
         soup = BeautifulSoup(raw_html, "lxml")
         page_text = self.engine._normalize_spaces(soup.get_text(" ", strip=True))
+        if self._looks_like_rusprofile_error_page(page_text):
+            return {}
         profile: dict[str, Any] = {"source": "rusprofile.ru", "url": url}
 
         org_text = ""
@@ -1042,8 +1063,28 @@ class NativeNadinApp(tk.Tk):
             self.clipboard_append(selected)
         return "break"
 
+    def _copy_specific_text_widget(self, widget: tk.Text) -> str:
+        if not isinstance(widget, tk.Text):
+            return "break"
+        try:
+            selected = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            selected = widget.get("1.0", tk.END).strip()
+        if selected:
+            self.clipboard_clear()
+            self.clipboard_append(selected)
+        return "break"
+
     def _select_all_text_widget(self, event: tk.Event | None = None) -> str:
         widget = event.widget if event is not None else self.focus_get()
+        if not isinstance(widget, tk.Text):
+            return "break"
+        widget.tag_add("sel", "1.0", tk.END)
+        widget.mark_set("insert", "1.0")
+        widget.see("insert")
+        return "break"
+
+    def _select_all_specific_text_widget(self, widget: tk.Text) -> str:
         if not isinstance(widget, tk.Text):
             return "break"
         widget.tag_add("sel", "1.0", tk.END)
@@ -1054,22 +1095,12 @@ class NativeNadinApp(tk.Tk):
     def _copy_trace_text(self, _event: tk.Event | None = None) -> str:
         if not hasattr(self, "trace_text"):
             return "break"
-        try:
-            selected = self.trace_text.get("sel.first", "sel.last")
-        except tk.TclError:
-            selected = self.trace_text.get("1.0", tk.END).strip()
-        if selected:
-            self.clipboard_clear()
-            self.clipboard_append(selected)
-        return "break"
+        return self._copy_specific_text_widget(self.trace_text)
 
     def _select_all_trace_text(self, _event: tk.Event | None = None) -> str:
         if not hasattr(self, "trace_text"):
             return "break"
-        self.trace_text.tag_add("sel", "1.0", tk.END)
-        self.trace_text.mark_set("insert", "1.0")
-        self.trace_text.see("insert")
-        return "break"
+        return self._select_all_specific_text_widget(self.trace_text)
 
     def _bind_entry_shortcuts(self, entry: ttk.Entry) -> None:
         shortcuts = [
@@ -1206,10 +1237,10 @@ class NativeNadinApp(tk.Tk):
         widget.focus_set()
         state = str(widget.cget("state")).lower()
         menu = tk.Menu(self, tearoff=False)
-        menu.add_command(label="Копировать", command=lambda: self._copy_trace_text())
+        menu.add_command(label="Копировать", command=lambda w=widget: self._copy_specific_text_widget(w))
         menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"), state=(tk.NORMAL if state == "normal" else tk.DISABLED))
         menu.add_separator()
-        menu.add_command(label="Выделить всё", command=lambda: self._select_all_trace_text())
+        menu.add_command(label="Выделить всё", command=lambda w=widget: self._select_all_specific_text_widget(w))
         return self._popup_context_menu(menu, event)
 
     def _show_card_tree_context_menu(self, event: tk.Event) -> str:
@@ -2582,19 +2613,24 @@ class NativeNadinApp(tk.Tk):
             variants.append(html_unescape(variants[-1]))
             variants.append(unquote(variants[-1]))
 
-        patterns = (
-            r'https?://(?:www\.)?rusprofile\.ru(?P<path>/id/\d+)',
-            r'(?P<path>/id/\d+)',
-        )
-
         for text_variant in variants:
-            for pattern in patterns:
-                match = re.search(pattern, text_variant, flags=re.IGNORECASE)
-                if not match:
+            candidate = self.engine._normalize_spaces(text_variant)
+            if not candidate:
+                continue
+            if candidate.startswith(("http://", "https://")):
+                parsed = urlparse(candidate)
+                if not parsed.netloc.lower().endswith("rusprofile.ru"):
                     continue
-                path = match.groupdict().get("path", "")
-                if path:
-                    return f"https://www.rusprofile.ru{path}"
+                path = parsed.path or ""
+            else:
+                path = candidate
+            match = re.match(r"/id/(?P<rid>\d+)", path, flags=re.IGNORECASE)
+            if not match:
+                continue
+            record_id = match.group("rid")
+            if len(record_id) >= 10:
+                continue
+            return f"https://www.rusprofile.ru/id/{record_id}"
         return ""
 
     def _extract_rusprofile_detail_url_from_html(self, html: str) -> str:

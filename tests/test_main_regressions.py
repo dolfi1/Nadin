@@ -939,6 +939,24 @@ def test_native_app_sanitize_rusprofile_detail_url_strips_tracking():
     assert resolved == "https://www.rusprofile.ru/id/76374"
 
 
+def test_native_app_sanitize_rusprofile_detail_url_does_not_rewrite_external_id_url():
+    app = _make_native_app()
+
+    resolved = app._sanitize_rusprofile_detail_url(
+        "https://companies.rbc.ru/id/1027739609391-pao-bank-vtb/"
+    )
+
+    assert resolved == ""
+
+
+def test_native_app_sanitize_rusprofile_detail_url_rejects_ogrn_shaped_id():
+    app = _make_native_app()
+
+    resolved = app._sanitize_rusprofile_detail_url("https://www.rusprofile.ru/id/1027739609391")
+
+    assert resolved == ""
+
+
 def test_native_app_lookup_rusprofile_url_ignores_cached_search_url():
     app = _make_native_app()
     app._rusprofile_url_cache["7702070139"] = "https://www.rusprofile.ru/search?query=7702070139"
@@ -1048,3 +1066,22 @@ def test_native_app_parse_rusprofile_dom_html_extracts_company_summary_and_statu
     assert profile["en_org"] == "Rusagrotrans JSC"
     assert profile.get("ru_position", "") == ""
     assert profile.get("surname_ru", "") == ""
+
+
+def test_native_app_parse_rusprofile_dom_html_ignores_404_page():
+    app = _make_native_app()
+
+    html = """
+    <html>
+      <head><title>404 \u0421\u0442\u0440\u0430\u043d\u0438\u0446\u0430 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u0430 | Rusprofile</title></head>
+      <body>
+        <div>404</div>
+        <div>\u0421\u0442\u0440\u0430\u043d\u0438\u0446\u0430 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u0430!</div>
+        <div>\u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u043f\u0440\u0430\u0432\u0438\u043b\u044c\u043d\u043e\u0441\u0442\u044c URL \u0438\u043b\u0438 \u043f\u0435\u0440\u0435\u0439\u0434\u0438\u0442\u0435 \u043d\u0430 \u0413\u043b\u0430\u0432\u043d\u0443\u044e \u0441\u0442\u0440\u0430\u043d\u0438\u0446\u0443.</div>
+      </body>
+    </html>
+    """
+
+    profile = app._parse_rusprofile_dom_html("https://www.rusprofile.ru/id/1027739609391", html)
+
+    assert profile == {}

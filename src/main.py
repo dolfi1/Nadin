@@ -13254,18 +13254,6 @@ $web.Dispose()
         profiles: list[dict[str, Any]] = []
 
 
-        if not hits and input_type == INPUT_TYPE_INN:
-
-
-            inn = self._extract_inn(query)
-
-
-            direct_urls = [f"https://www.rusprofile.ru/id/{inn}", f"https://www.rusprofile.ru/ip/{inn}"] if inn else []
-
-
-            hits = [{"url": url} for url in direct_urls]
-
-
 
 
 
