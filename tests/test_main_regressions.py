@@ -1,4 +1,4 @@
-﻿import csv
+import csv
 import io
 import json
 from urllib.parse import parse_qs, urlparse
@@ -226,6 +226,12 @@ def test_normalize_en_org_reads_opf_from_prefix(app):
     en, _ = app.normalize_en_org("", "ООО ПЯТЕРОЧКА")
     assert en == "Pyaterochka LLC"
 
+
+
+
+def test_normalize_en_org_known_mapping_keeps_legal_form(app):
+    en, _ = app.normalize_en_org("", "ПАО СБЕРБАНК")
+    assert en == "Sberbank PJSC"
 
 
 def test_score_org_relevance_prefers_public_company_over_small_llc(app):
@@ -1085,3 +1091,268 @@ def test_native_app_parse_rusprofile_dom_html_ignores_404_page():
     profile = app._parse_rusprofile_dom_html("https://www.rusprofile.ru/id/1027739609391", html)
 
     assert profile == {}
+
+
+def test_native_app_truncate_company_summary_text_keeps_expanded_block_and_cuts_tail():
+    app = _make_native_app()
+
+    text = (
+        "Главное о компании за 1 минуту "
+        "ПАО Сбербанк основано в 1991 году. Управление компанией с 2009 года осуществляет Греф Герман Оскарович. "
+        "Учредители Лицензии Связи Выводы "
+        "ПАО Сбербанк представляет собой системообразующий финансовый институт. "
+        "По организации найдено более 3219058 изменений. Исторические сведения"
+    )
+
+    summary = app._truncate_company_summary_text(text)
+
+    assert "Учредители" in summary
+    assert "Выводы ПАО Сбербанк представляет собой системообразующий финансовый институт." in summary
+    assert "По организации найдено более" not in summary
+
+
+
+def test_native_app_parse_rusprofile_dom_html_prefers_current_org_summary():
+    app = _make_native_app()
+    app.engine._clean_ru_org_name = lambda value: " ".join(str(value).split())
+    app.engine._normalize_company_status_label = lambda value: "Действующая" if "действ" in str(value).lower() else ""
+    app.engine._is_inactive_company_status = lambda value: False
+    app.engine.normalize_en_org = lambda _en, ru: ("Sberbank PJSC" if "СБЕРБАНК" in str(ru).upper() else "", "")
+
+    html = """
+    <html>
+      <head><title>ПАО СБЕРБАНК | Rusprofile</title></head>
+      <body>
+        <h1>ПАО СБЕРБАНК</h1>
+        <section>
+          <div>Главное о компании за 1 минуту</div>
+          <div>АО "Статус" действует с 1997 года и специализируется на ведении реестров владельцев ценных бумаг. Показать</div>
+        </section>
+        <section>
+          <div>Главное о компании за 1 минуту</div>
+          <div>
+            ПАО Сбербанк, основанное в 1991 году, является крупнейшим финансовым институтом страны.
+            Учредители Лицензии Связи Финансовая устойчивость
+            Выводы ПАО Сбербанк представляет собой системообразующий финансовый институт.
+            По организации найдено более 3219058 изменений. Исторические сведения
+          </div>
+        </section>
+      </body>
+    </html>
+    """
+
+    profile = app._parse_rusprofile_dom_html("https://www.rusprofile.ru/id/2770356", html)
+
+    assert "Сбербанк" in profile["company_summary"]
+    assert "?? \"??????\"" not in profile["company_summary"]
+    assert "Выводы" in profile["company_summary"]
+    assert "По организации найдено более" not in profile["company_summary"]
+
+
+def test_native_app_open_screenshot_viewer_uses_label_image_path(tmp_path, monkeypatch):
+    app = _make_native_app()
+    image_path = tmp_path / "preview.png"
+    image_path.write_bytes(b"fake")
+    app._last_screenshot_path = ""
+    app.screenshot_preview_label = type("LabelStub", (), {"_image_path": str(image_path)})()
+    app.screenshot_meta_var = type("VarStub", (), {"get": lambda self: "meta"})()
+    called = {}
+    monkeypatch.setattr(app, "_open_image_viewer", lambda path, meta: called.update({"path": path, "meta": meta}))
+
+    result = app._open_screenshot_viewer()
+
+    assert result == "break"
+    assert called == {"path": str(image_path), "meta": "meta"}
+
+def test_native_app_parse_rusprofile_dom_html_ignores_placeholder_leader_text():
+    app = _make_native_app()
+    app.engine._clean_ru_org_name = lambda value: " ".join(str(value).split())
+    app.engine._normalize_company_status_label = lambda value: "Действующая" if "действ" in str(value).lower() else ""
+    app.engine._is_inactive_company_status = lambda value: False
+    app.engine.normalize_en_org = lambda _en, ru: (ru, "")
+
+    html = """
+    <html>
+      <head><title>JSC STATUS | Rusprofile</title></head>
+      <body>
+        <h1>JSC STATUS</h1>
+        <div>Статус компании Действующая</div>
+        <div>Руководитель: Данные По Руководителю</div>
+      </body>
+    </html>
+    """
+
+    profile = app._parse_rusprofile_dom_html("https://www.rusprofile.ru/id/555", html)
+
+    assert profile.get("surname_ru", "") == ""
+    assert profile.get("name_ru", "") == ""
+
+
+def test_native_app_extract_rusprofile_detail_url_from_html_prefers_matching_company_context():
+    app = _make_native_app()
+    app._last_profile_inn = "7707083893"
+    app._last_profile_org = "SBERBANK"
+
+    html = """
+    <html>
+      <body>
+        <a href="/id/2770356">STATUS REGISTRAR</a>
+        <div>INN 7707179242</div>
+        <a href="/id/2835629">SBERBANK</a>
+        <div>INN 7707083893</div>
+      </body>
+    </html>
+    """
+
+    resolved = app._extract_rusprofile_detail_url_from_html(html, query="7707083893")
+
+    assert resolved == "https://www.rusprofile.ru/id/2835629"
+
+
+def test_native_app_merge_rusprofile_profile_replaces_less_relevant_summary():
+    app = _make_native_app()
+    current_profile = {
+        "ru_org": "SBERBANK",
+        "company_summary": "STATUS registrar has operated since 1997 and maintains securities registers.",
+    }
+    rusprofile_profile = {
+        "ru_org": "SBERBANK",
+        "company_summary": "SBERBANK is a systemically important financial institution. ?????? SBERBANK remains central to the banking sector.",
+    }
+
+    merged = app._merge_rusprofile_profile(current_profile, rusprofile_profile)
+
+    assert "SBERBANK" in merged["company_summary"]
+    assert "STATUS registrar" not in merged["company_summary"]
+
+
+def test_native_app_extract_company_summary_candidates_from_text_handles_expanded_block():
+    app = _make_native_app()
+
+    text = (
+        "Главное о компании за 1 минуту "
+        "ПАО Сбербанк является крупнейшим финансовым институтом. "
+        "Финансовая устойчивость "
+        "Юридическая активность "
+        "Выводы ПАО Сбербанк остается системообразующим банком. "
+        "По организации найдено более 10 изменений"
+    )
+
+    candidates = app._extract_company_summary_candidates_from_text(text)
+
+    assert candidates
+    assert "Выводы" in candidates[0]
+    assert "По организации найдено более" not in candidates[0]
+
+
+def test_native_app_fetch_rusprofile_full_info_prefers_browser_expanded_summary(monkeypatch):
+    app = _make_native_app()
+    app.engine._clean_ru_org_name = lambda value: " ".join(str(value).split())
+    app.engine._normalize_company_status_label = lambda value: ""
+    app.engine._is_inactive_company_status = lambda value: False
+    app._last_profile_org = "ПАО СБЕРБАНК"
+
+    collapsed_html = """
+    <html>
+      <head><title>ПАО СБЕРБАНК | Rusprofile</title></head>
+      <body>
+        <h1>ПАО СБЕРБАНК</h1>
+        <div>Главное о компании за 1 минуту ПАО Сбербанк является крупнейшим банком. Показать</div>
+        <div>ОГРН 1027700132195 ИНН/КПП 7707083893 773601001</div>
+      </body>
+    </html>
+    """
+    expanded_summary = (
+        "ПАО Сбербанк является крупнейшим финансовым институтом. "
+        "Финансовая устойчивость "
+        "Юридическая активность "
+        "Выводы ПАО Сбербанк остается системообразующим банком."
+    )
+
+    monkeypatch.setattr(app, "_fetch_rusprofile_html_loose", lambda url: collapsed_html)
+    monkeypatch.setattr(app, "_fetch_dom_with_headless_browser", lambda url: collapsed_html)
+    monkeypatch.setattr(app, "_fetch_rusprofile_expanded_summary_with_browser", lambda url: expanded_summary)
+
+    profile = app._fetch_rusprofile_full_info("https://www.rusprofile.ru/id/2835629")
+
+    assert "Выводы" in profile["company_summary"]
+    assert "ОГРН" not in profile["company_summary"]
+    assert profile["ru_org"] == "ПАО СБЕРБАНК"
+
+
+
+def test_native_app_finalize_company_summary_text_rejects_collapsed_intro():
+    app = _make_native_app()
+
+    raw_text = (
+        "Главное о компании за 1 минуту "
+        "ПАО Сбербанк является крупнейшим банком. Показать"
+    )
+
+    assert app._finalize_company_summary_text(raw_text, "ПАО СБЕРБАНК") == ""
+
+
+
+def test_native_app_finalize_company_summary_text_keeps_full_expanded_modal():
+    app = _make_native_app()
+
+    raw_text = (
+        "Главное о компании за 1 минуту "
+        "ПАО Сбербанк, основанное в 1991 году, является крупнейшим банком России. "
+        "Учредители Лицензии Связи "
+        "Финансовая устойчивость "
+        "Финансовые показатели компании за последние годы в предоставленных данных отсутствуют. "
+        "Юридическая активность "
+        "Юридическая активность ПАО Сбербанк исключительно высока. "
+        "Надежность Риски неисполнения обязательств: Незначительные Признаки однодневки: Отсутствуют Налоговые риски: Незначительные Подробнее "
+        "Выводы ПАО Сбербанк представляет собой системообразующий финансовый институт. "
+        "По организации найдено более 3219058 изменений. Исторические сведения"
+    )
+
+    summary = app._finalize_company_summary_text(raw_text, "ПАО СБЕРБАНК")
+
+    assert "Финансовая устойчивость" in summary
+    assert "Юридическая активность" in summary
+    assert "Надежность" in summary
+    assert "Выводы" in summary
+    assert "По организации найдено более" not in summary
+
+def test_native_app_parse_company_summary_sections_splits_titles_links_and_reliability_body():
+    app = _make_native_app()
+
+    summary = (
+        "ПАО Сбербанк, основанное в 1991 году, является крупнейшим банком России. "
+        "Учредители Лицензии Связи "
+        "Финансовая устойчивость "
+        "Финансовые показатели компании за последние годы отсутствуют. "
+        "Юридическая активность "
+        "Юридическая активность ПАО Сбербанк исключительно высока. "
+        "Арбитраж Суды общей юрисдикции Исполнительные производства "
+        "Надежность "
+        "Риски неисполнения обязательств: Незначительные Признаки однодневки: Отсутствуют Налоговые риски: Незначительные Подробнее "
+        "Выводы ПАО Сбербанк представляет собой системообразующий финансовый институт."
+    )
+
+    sections = app._parse_company_summary_sections(summary)
+
+    assert [section["title"] for section in sections] == [
+        "Главное о компании за 1 минуту",
+        "Финансовая устойчивость",
+        "Юридическая активность",
+        "Надежность",
+        "Выводы",
+    ]
+    assert sections[0]["links"] == ["Учредители", "Лицензии", "Связи"]
+    assert sections[2]["links"] == ["Арбитраж", "Суды общей юрисдикции", "Исполнительные производства"]
+    assert "\nПризнаки однодневки:" in sections[3]["body"]
+    assert sections[3]["links"] == ["Подробнее"]
+def test_native_app_get_screenshot_viewer_geometry_prefers_large_window():
+    app = _make_native_app()
+    app.winfo_screenwidth = lambda: 1920
+    app.winfo_screenheight = lambda: 1080
+
+    geometry, min_width, min_height = app._get_screenshot_viewer_geometry()
+
+    assert geometry.startswith("1804x993+")
+    assert min_width >= 980
+    assert min_height >= 640

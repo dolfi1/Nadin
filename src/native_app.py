@@ -1,6 +1,7 @@
-﻿
+
 from __future__ import annotations
 
+import asyncio
 import json
 import io
 import ctypes
@@ -9,6 +10,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -19,7 +21,9 @@ from datetime import datetime
 from html import unescape as html_unescape
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
 from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.request import urlopen
 
 
 _OPTIONAL_DEPS_DIR = Path(__file__).resolve().parents[1] / ".deps"
@@ -40,17 +44,15 @@ if _USER_SITE_EXISTS and _USER_SITE not in sys.path:
     site.addsitedir(_USER_SITE)
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
 except Exception:  # noqa: BLE001
     Image = None
     ImageDraw = None
     ImageFont = None
+    ImageTk = None
 
 
 def _configure_tk_env_for_frozen() -> None:
-    if not getattr(sys, "frozen", False):
-        return
-
     roots: list[Path] = []
     meipass = getattr(sys, "_MEIPASS", "")
     if meipass:
@@ -59,9 +61,16 @@ def _configure_tk_env_for_frozen() -> None:
     exe_dir = Path(sys.executable).resolve().parent
     roots.append(exe_dir / "_internal")
     roots.append(exe_dir)
+    roots.append(exe_dir / "lib")
+    roots.append(exe_dir.parent / "lib")
 
-    tcl_dirs = ("_tcl_data", "tcl8.6", "tcl8", "tcl")
-    tk_dirs = ("_tk_data", "tk8.6", "tk8", "tk")
+    if not getattr(sys, "frozen", False):
+        source_dir = Path(__file__).resolve().parent
+        roots.append(source_dir)
+        roots.append(source_dir.parent)
+
+    tcl_dirs = ("_tcl_data", "lib/tcl8.6", "tcl8.6", "tcl8", "tcl")
+    tk_dirs = ("_tk_data", "lib/tk8.6", "tk8.6", "tk8", "tk")
 
     tcl_candidate: Path | None = None
     tk_candidate: Path | None = None
@@ -89,6 +98,7 @@ def _configure_tk_env_for_frozen() -> None:
 
     if tcl_candidate is not None:
         os.environ["TCL_LIBRARY"] = str(tcl_candidate)
+        os.environ["TCLLIBPATH"] = str(tcl_candidate)
     if tk_candidate is not None:
         os.environ["TK_LIBRARY"] = str(tk_candidate)
 
@@ -96,7 +106,7 @@ def _configure_tk_env_for_frozen() -> None:
 _configure_tk_env_for_frozen()
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from app_paths import configure_runtime_env
 from logging_setup import setup_logging
@@ -181,6 +191,7 @@ class NativeNadinApp(tk.Tk):
         self.card_title_var = tk.StringVar(value="Карточка")
         self.screenshot_meta_var = tk.StringVar(value="Скриншот: —")
         self.source_url_var = tk.StringVar(value="URL источника: —")
+        self.viewer_meta_var = tk.StringVar(value="")
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -316,6 +327,8 @@ class NativeNadinApp(tk.Tk):
         self.screenshot_preview_label = ttk.Label(screenshot_frame, text="Превью отсутствует", anchor="center", width=44, cursor="hand2")
         self.screenshot_preview_label.pack(side=tk.LEFT, padx=(0, 10))
         self.screenshot_preview_label.bind("<Button-1>", self._open_screenshot_viewer, add="+")
+        self.screenshot_preview_label.bind("<Double-Button-1>", self._open_screenshot_viewer, add="+")
+        self.screenshot_preview_label._image_path = ""
 
         screenshot_info = ttk.Frame(screenshot_frame)
         screenshot_info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -360,6 +373,7 @@ class NativeNadinApp(tk.Tk):
         self.trace_text.bind("<Control-C>", self._copy_trace_text)
         self.trace_text.bind("<Control-a>", self._select_all_trace_text)
         self.trace_text.bind("<Control-A>", self._select_all_trace_text)
+        self.trace_text.bind("<Control-KeyPress>", self._text_handle_ctrl_key, add="+")
         self.trace_text.bind("<Button-3>", self._show_text_context_menu, add="+")
 
         status = ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, anchor="w", padding=(8, 4))
@@ -504,6 +518,8 @@ class NativeNadinApp(tk.Tk):
         self.screenshot_tab_preview_label = ttk.Label(preview_frame, text="Превью отсутствует", anchor="center", cursor="hand2")
         self.screenshot_tab_preview_label.pack(fill=tk.BOTH, expand=True)
         self.screenshot_tab_preview_label.bind("<Button-1>", self._open_tab_screenshot_viewer, add="+")
+        self.screenshot_tab_preview_label.bind("<Double-Button-1>", self._open_tab_screenshot_viewer, add="+")
+        self.screenshot_tab_preview_label._image_path = ""
 
         self._last_tab_screenshot_path = ""
         self._screenshot_tab_preview_image = None
@@ -518,13 +534,15 @@ class NativeNadinApp(tk.Tk):
             font=("TkDefaultFont", 12, "bold"),
         ).pack(anchor="w", pady=(0, 10))
 
-        self.company_summary_text = tk.Text(info_frame, wrap=tk.WORD, height=30)
+        self.company_summary_text = tk.Text(info_frame, wrap=tk.WORD, height=30, relief=tk.FLAT, borderwidth=0)
         self.company_summary_text.pack(fill=tk.BOTH, expand=True)
         self.company_summary_text.bind("<Control-c>", self._copy_text_widget_selection)
         self.company_summary_text.bind("<Control-C>", self._copy_text_widget_selection)
         self.company_summary_text.bind("<Control-a>", self._select_all_text_widget)
         self.company_summary_text.bind("<Control-A>", self._select_all_text_widget)
+        self.company_summary_text.bind("<Control-KeyPress>", self._text_handle_ctrl_key, add="+")
         self.company_summary_text.bind("<Button-3>", self._show_text_context_menu, add="+")
+        self._configure_company_summary_text_tags()
         self.company_summary_text.insert("1.0", "Выберите компанию из списка для отображения информации")
 
     def _capture_screenshot_from_tab(self) -> None:
@@ -569,12 +587,15 @@ class NativeNadinApp(tk.Tk):
         self.screenshot_capture_btn.configure(state=tk.NORMAL)
 
         if error:
+            self._last_tab_screenshot_path = ""
+            self.screenshot_tab_preview_label._image_path = ""
             self.screenshot_tab_status_var.set(f"Ошибка: {error}")
             self.screenshot_copy_btn.configure(state=tk.DISABLED)
             self.screenshot_save_btn.configure(state=tk.DISABLED)
             return
 
         self._last_tab_screenshot_path = saved_path
+        self.screenshot_tab_preview_label._image_path = saved_path
         self.screenshot_tab_status_var.set(f"Скриншот: {captured_at}")
         self.screenshot_copy_btn.configure(state=tk.NORMAL)
         self.screenshot_save_btn.configure(state=tk.NORMAL)
@@ -589,11 +610,11 @@ class NativeNadinApp(tk.Tk):
                 if w > max_width or h > max_height:
                     ratio = min(max_width / w, max_height / h)
                     image = image.subsample(int(1/ratio) if ratio < 1 else 1)
-                self.screenshot_tab_preview_label.configure(image=image, text="")
+                self.screenshot_tab_preview_label.configure(image=image, text="", cursor="hand2")
                 self._screenshot_tab_preview_image = image
             except Exception as exc:
                 logger.exception("Failed to load screenshot preview")
-                self.screenshot_tab_preview_label.configure(image="", text="Ошибка загрузки превью")
+                self.screenshot_tab_preview_label.configure(image="", text="Не удалось загрузить превью")
 
     def _copy_screenshot_from_tab(self) -> None:
         if not self._last_tab_screenshot_path or not Path(self._last_tab_screenshot_path).exists():
@@ -717,27 +738,172 @@ class NativeNadinApp(tk.Tk):
             messagebox.showerror("Nadin", f"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u043a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u0441\u043a\u0440\u0438\u043d\u0448\u043e\u0442: {exc}")
 
     def _open_tab_screenshot_viewer(self, _event: tk.Event | None = None) -> str:
-        if not self._last_tab_screenshot_path or not Path(self._last_tab_screenshot_path).exists():
+        image_path = self._last_tab_screenshot_path or str(getattr(self.screenshot_tab_preview_label, "_image_path", ""))
+        if not image_path or not Path(image_path).exists():
             return "break"
-        self._open_image_viewer(self._last_tab_screenshot_path, self.screenshot_tab_status_var.get())
+        self._open_image_viewer(image_path, self.screenshot_tab_status_var.get())
         return "break"
 
+    def _configure_company_summary_text_tags(self) -> None:
+        widget = getattr(self, "company_summary_text", None)
+        if widget is None or getattr(widget, "_nadin_summary_tags_ready", False):
+            return
+
+        base_font = tkfont.nametofont("TkDefaultFont").copy()
+        base_size = max(int(base_font.cget("size")), 10)
+
+        body_font = base_font.copy()
+        body_font.configure(size=base_size + 1)
+
+        heading_font = body_font.copy()
+        heading_font.configure(size=base_size + 3, weight="bold")
+
+        title_font = body_font.copy()
+        title_font.configure(size=base_size + 5, weight="bold")
+
+        link_font = body_font.copy()
+        link_font.configure(weight="bold")
+
+        widget.configure(font=body_font, padx=10, pady=10, insertwidth=0)
+        widget.tag_configure("summary_title", font=title_font, spacing1=2, spacing3=10)
+        widget.tag_configure("summary_heading", font=heading_font, spacing1=4, spacing3=6)
+        widget.tag_configure("summary_body", font=body_font, spacing1=0, spacing3=10)
+        widget.tag_configure("summary_links", font=link_font, foreground="#2f6fed", spacing1=0, spacing3=10)
+        widget.tag_configure("summary_message", font=body_font, foreground="#444444")
+        widget._nadin_summary_tags_ready = True
+
+    def _set_company_summary_message(self, message: str) -> None:
+        self._configure_company_summary_text_tags()
+        self.company_summary_text.delete("1.0", tk.END)
+        self.company_summary_text.insert("1.0", message, ("summary_message",))
+
+    def _extract_trailing_summary_links(self, text: str, labels: list[str]) -> tuple[str, list[str]]:
+        remaining = self.engine._normalize_spaces(str(text or ""))
+        found: list[str] = []
+        for label in reversed(labels):
+            pattern = rf"(?:^|\s){re.escape(label)}\s*$"
+            match = re.search(pattern, remaining, flags=re.IGNORECASE)
+            if not match:
+                continue
+            found.append(label)
+            remaining = remaining[:match.start()].rstrip(" ,;:")
+        ordered = [label for label in labels if label in set(found)]
+        return self.engine._normalize_spaces(remaining), ordered
+
+    def _format_reliability_summary_body(self, text: str) -> str:
+        normalized = self.engine._normalize_spaces(str(text or ""))
+        if not normalized:
+            return ""
+        markers = (
+            "Риски неисполнения обязательств:",
+            "Признаки однодневки:",
+            "Налоговые риски:",
+        )
+        for marker in markers:
+            normalized = re.sub(rf"\s+(?={re.escape(marker)})", "\n", normalized, flags=re.IGNORECASE)
+        return normalized
+
+    def _parse_company_summary_sections(self, summary_text: str) -> list[dict[str, Any]]:
+        text = self.engine._normalize_spaces(str(summary_text or ""))
+        if not text:
+            return []
+
+        ordered_titles = [
+            "Финансовая устойчивость",
+            "Юридическая активность",
+            "Надежность",
+            "Выводы",
+        ]
+
+        positions: list[tuple[str, int]] = []
+        cursor = 0
+        for title in ordered_titles:
+            match = re.search(re.escape(title), text[cursor:], flags=re.IGNORECASE)
+            if not match:
+                continue
+            start = cursor + match.start()
+            positions.append((title, start))
+            cursor = start + len(title)
+
+        sections: list[dict[str, Any]] = []
+        intro_end = positions[0][1] if positions else len(text)
+        intro_body, intro_links = self._extract_trailing_summary_links(
+            text[:intro_end].strip(),
+            ["Учредители", "Лицензии", "Связи"],
+        )
+        if intro_body or intro_links:
+            sections.append(
+                {
+                    "title": "Главное о компании за 1 минуту",
+                    "body": intro_body,
+                    "links": intro_links,
+                }
+            )
+
+        for index, (title, start) in enumerate(positions):
+            body_end = positions[index + 1][1] if index + 1 < len(positions) else len(text)
+            body = text[start + len(title):body_end].strip()
+            links: list[str] = []
+            if title == "Юридическая активность":
+                body, links = self._extract_trailing_summary_links(
+                    body,
+                    ["Арбитраж", "Суды общей юрисдикции", "Исполнительные производства"],
+                )
+            elif title == "Надежность":
+                body, links = self._extract_trailing_summary_links(body, ["Подробнее"])
+                body = self._format_reliability_summary_body(body)
+            sections.append({"title": title, "body": body, "links": links})
+
+        return [section for section in sections if section.get("title") or section.get("body") or section.get("links")]
+
+    def _render_company_summary_sections(self, sections: list[dict[str, Any]]) -> None:
+        self._configure_company_summary_text_tags()
+        self.company_summary_text.delete("1.0", tk.END)
+        if not sections:
+            self.company_summary_text.insert("1.0", "Нет данных о компании", ("summary_message",))
+            return
+
+        for index, section in enumerate(sections):
+            title = self.engine._normalize_spaces(str(section.get("title", "")))
+            body = str(section.get("body", "") or "").strip()
+            links = [self.engine._normalize_spaces(str(item)) for item in section.get("links", []) if self.engine._normalize_spaces(str(item))]
+
+            if title:
+                tag = "summary_title" if index == 0 else "summary_heading"
+                self.company_summary_text.insert(tk.END, f"{title}\n", (tag,))
+
+            if body:
+                paragraphs = [part.strip() for part in re.split(r"\n+", body) if part.strip()]
+                for paragraph in paragraphs:
+                    self.company_summary_text.insert(tk.END, f"{paragraph}\n", ("summary_body",))
+
+            if links:
+                self.company_summary_text.insert(tk.END, f"{'  '.join(links)}\n", ("summary_links",))
+
+            if index != len(sections) - 1:
+                self.company_summary_text.insert(tk.END, "\n")
     def _update_company_summary(self, rusprofile_url: str) -> None:
         if not rusprofile_url:
             self._last_company_summary = ""
             self.company_summary_button.configure(state=tk.DISABLED)
-            self.company_summary_text.delete("1.0", tk.END)
-            self.company_summary_text.insert("1.0", "Выберите компанию из списка для отображения информации")
+            self._set_company_summary_message("Выберите компанию из списка для отображения информации")
             return
 
-        self.company_summary_text.delete("1.0", tk.END)
-        self.company_summary_text.insert("1.0", f"Загрузка данных с {rusprofile_url}...")
+        self._set_company_summary_message(f"Загрузка данных с {rusprofile_url}...")
         self.company_summary_button.configure(state=tk.NORMAL)
 
         def worker() -> None:
             try:
+                final_url = rusprofile_url
                 profile = self._load_rusprofile_company_info(rusprofile_url)
-                self.after(0, lambda: self._display_company_summary(profile))
+                if not self._rusprofile_profile_matches_current_card(profile):
+                    refreshed_url = self._lookup_rusprofile_url(self._get_rusprofile_lookup_query(), force_refresh=True)
+                    if refreshed_url and refreshed_url != rusprofile_url:
+                        refreshed_profile = self._load_rusprofile_company_info(refreshed_url)
+                        if self._rusprofile_profile_matches_current_card(refreshed_profile):
+                            final_url = refreshed_url
+                            profile = refreshed_profile
+                self.after(0, lambda profile=profile, final_url=final_url: self._apply_company_summary_profile(final_url, profile))
             except Exception as exc:
                 logger.exception("Failed to load company summary")
                 self.after(0, lambda: self._display_company_summary_error(str(exc)))
@@ -785,20 +951,39 @@ class NativeNadinApp(tk.Tk):
             or not self.engine._normalize_spaces(str(profile.get("company_summary", "")))
         )
         if not needs_dom_fallback:
-            return profile
+            current_summary = self.engine._normalize_spaces(str(profile.get("company_summary", "")))
+            if self._summary_contains_expanded_sections(current_summary) and not self._summary_contains_requisites_tail(current_summary):
+                return profile
 
         try:
             dom_html = self._fetch_dom_with_headless_browser(url)
         except Exception:
             logger.exception("RusProfile DOM fetch via headless browser failed")
-            return profile
+            dom_html = ""
         if self._looks_like_rusprofile_error_page(dom_html):
-            return profile
+            dom_html = ""
 
         dom_profile = self._parse_rusprofile_dom_html(url, dom_html) if dom_html else {}
-        if dom_profile:
-            return self._merge_rusprofile_profile(profile, dom_profile) if profile else dom_profile
-        return profile
+        merged_profile = self._merge_rusprofile_profile(profile, dom_profile) if dom_profile and profile else (dom_profile or profile)
+
+        current_summary = self.engine._normalize_spaces(str(merged_profile.get("company_summary", "")))
+        needs_expanded_summary = (
+            not current_summary
+            or not self._summary_contains_expanded_sections(current_summary)
+            or self._summary_contains_requisites_tail(current_summary)
+        )
+        if needs_expanded_summary:
+            try:
+                expanded_summary = self._fetch_rusprofile_expanded_summary_with_browser(url)
+            except Exception:
+                logger.exception("RusProfile expanded summary fetch via browser failed")
+                expanded_summary = ""
+            if expanded_summary:
+                merged_profile = self._merge_rusprofile_profile(
+                    merged_profile,
+                    {"company_summary": expanded_summary},
+                )
+        return merged_profile
 
     def _looks_like_rusprofile_error_page(self, html: str) -> bool:
         raw_html = str(html or "")
@@ -814,6 +999,282 @@ class NativeNadinApp(tk.Tk):
         if any(marker in lowered for marker in error_markers):
             return True
         return bool(re.search(r"\b404\b", lowered) and "rusprofile" in lowered and "страница не найдена" in lowered)
+    def _truncate_company_summary_text(self, value: str) -> str:
+        text = self.engine._normalize_spaces(str(value or ""))
+        if not text:
+            return ""
+
+        header = "Главное о компании"
+        header_with_suffix = "Главное о компании за 1 минуту"
+        show_more = "Показать"
+        stop_markers = [
+            "По организации найдено более",
+            "Исторические сведения",
+            "Данные актуальны на",
+        ]
+
+        lowered = text.lower()
+        for marker in (header_with_suffix, header):
+            pos = lowered.find(marker.lower())
+            if pos != -1:
+                text = text[pos + len(marker):].strip()
+                lowered = text.lower()
+                break
+
+        text = text.replace(show_more, " ")
+        lowered = text.lower()
+        cut_positions = [lowered.find(marker.lower()) for marker in stop_markers if lowered.find(marker.lower()) != -1]
+        if cut_positions:
+            text = text[:min(cut_positions)]
+
+        return self.engine._normalize_spaces(text)
+
+    def _summary_contains_expanded_sections(self, value: str) -> bool:
+        normalized = self.engine._normalize_spaces(str(value or ""))
+        if not normalized:
+            return False
+        lowered = normalized.lower()
+        markers = (
+            "выводы",
+            "финансовая устойчивость",
+            "юридическая активность",
+            "риски неисполнения обязательств",
+            "признаки однодневки",
+            "налоговые риски",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _summary_contains_requisites_tail(self, value: str) -> bool:
+        normalized = self.engine._normalize_spaces(str(value or ""))
+        if not normalized:
+            return False
+        lowered = normalized.lower()
+        markers = (
+            "огрн ",
+            "дата регистрации",
+            "инн/кпп",
+            "уставный капитал",
+            "все реквизиты",
+            "юридический адрес",
+            "контакты",
+            "налоговый орган",
+            "коды статистики",
+            "держатель реестра",
+            "основной вид деятельности",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _finalize_company_summary_text(self, raw_text: str, org_text: str) -> str:
+        normalized = self.engine._normalize_spaces(str(raw_text or ""))
+        if not normalized:
+            return ""
+
+        summary = self._extract_best_company_summary_from_text(normalized, org_text)
+        if not summary:
+            summary = self._truncate_company_summary_text(normalized)
+        summary = self.engine._normalize_spaces(summary)
+        if not summary or not self._summary_contains_expanded_sections(summary):
+            return ""
+        return summary
+
+    def _extract_company_summary_candidates_from_text(self, page_text: str) -> list[str]:
+        normalized_text = self.engine._normalize_spaces(str(page_text or ""))
+        if not normalized_text:
+            return []
+
+        candidates: list[str] = []
+        patterns = (
+            "Главное о компании(?:\s+за\s+1\s+минуту)?\s*(.+?выводы\s+.+?)(?=\bПо организации найдено более\b|\bИсторические сведения\b|\bДанные актуальны на\b|$)",
+            "Главное о компании(?:\s+за\s+1\s+минуту)?\s*(.+?выводы\s+.+)",
+            "Главное о компании(?:\s+за\s+1\s+минуту)?\s*(.+?)(?=\bПоказать\b|$)",
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, normalized_text, flags=re.IGNORECASE):
+                candidate = self._truncate_company_summary_text(match.group(1))
+                if candidate:
+                    candidates.append(candidate)
+        return candidates
+
+    def _extract_best_company_summary_from_text(self, page_text: str, org_text: str) -> str:
+        candidates = self._extract_company_summary_candidates_from_text(page_text)
+        if not candidates:
+            return ""
+
+        unique_candidates: list[str] = []
+        seen_candidates: set[str] = set()
+        for candidate in candidates:
+            normalized_candidate = self.engine._normalize_spaces(candidate)
+            if not normalized_candidate or normalized_candidate in seen_candidates:
+                continue
+            seen_candidates.add(normalized_candidate)
+            unique_candidates.append(normalized_candidate)
+
+        if not unique_candidates:
+            return ""
+
+        return max(
+            unique_candidates,
+            key=lambda item: self._score_company_summary_candidate(item, org_text),
+        )
+
+    def _extract_org_relevance_tokens(self, org_text: str) -> list[str]:
+        normalized = self.engine._normalize_spaces(str(org_text or "")).lower()
+        if not normalized:
+            return []
+        tokens = re.findall(r"[a-zа-яё0-9-]+", normalized)
+        stop_tokens = {
+            "ооо",
+            "ао",
+            "пао",
+            "зао",
+            "оао",
+            "ип",
+            "нко",
+            "банк",
+            "public",
+            "joint",
+            "stock",
+            "company",
+            "limited",
+            "liability",
+            "corporation",
+        }
+        result: list[str] = []
+        for token in tokens:
+            compact = token.strip("-")
+            if len(compact) < 3 or compact in stop_tokens:
+                continue
+            if compact not in result:
+                result.append(compact)
+        return result
+
+    def _score_company_summary_candidate(self, candidate: str, org_text: str) -> tuple[int, int]:
+        normalized = self.engine._normalize_spaces(str(candidate or ""))
+        lowered = normalized.lower()
+        score = 0
+        if "выводы" in lowered:
+            score += 700
+        if "финансовая устойчивость" in lowered:
+            score += 320
+        if "юридическая активность" in lowered:
+            score += 320
+        if "риски неисполнения обязательств" in lowered:
+            score += 240
+        if "признаки однодневки" in lowered:
+            score += 180
+        if "налоговые риски" in lowered:
+            score += 180
+        if "подробнее" in lowered:
+            score += 40
+
+        org_tokens = self._extract_org_relevance_tokens(org_text)
+        if org_tokens:
+            matched = sum(1 for token in org_tokens if token in lowered)
+            score += matched * 250
+            if matched == 0:
+                score -= 400
+
+        score -= sum(180 for marker in ('огрн ', 'дата регистрации', 'инн/кпп', 'уставный капитал', 'все реквизиты', 'юридический адрес', 'контакты', 'налоговый орган', 'коды статистики', 'держатель реестра', 'основной вид деятельности', 'для просмотра контактов оформите профессиональный доступ') if marker in lowered)
+        return score, len(normalized)
+
+    def _rusprofile_profile_matches_current_card(self, profile: dict[str, Any]) -> bool:
+        if not isinstance(profile, dict):
+            return False
+
+        current_inn = self.engine._normalize_spaces(self._last_profile_inn)
+        current_ogrn = self.engine._normalize_spaces(self._last_profile_ogrn)
+        current_org = self.engine._normalize_spaces(self._last_profile_org)
+        profile_inn = self.engine._normalize_spaces(str(profile.get("inn", "")))
+        profile_ogrn = self.engine._normalize_spaces(str(profile.get("ogrn", "")))
+        profile_org = self.engine._normalize_spaces(str(profile.get("ru_org", "")))
+
+        if current_inn and profile_inn and current_inn != profile_inn:
+            return False
+        if current_ogrn and profile_ogrn and current_ogrn != profile_ogrn:
+            return False
+        if current_org and profile_org:
+            current_tokens = self._extract_org_relevance_tokens(current_org)
+            profile_lower = profile_org.lower()
+            if current_tokens and not any(token in profile_lower for token in current_tokens):
+                return False
+        return True
+
+    def _is_placeholder_leader_text(self, value: str) -> bool:
+        normalized = self.engine._normalize_spaces(str(value or "")).lower()
+        if not normalized:
+            return True
+        placeholder_markers = (
+            "данные по руководителю",
+            "данные о руководителе",
+            "данные отсутствуют",
+            "не указано",
+            "неизвестно",
+        )
+        return any(marker in normalized for marker in placeholder_markers)
+
+    def _is_valid_person_name_candidate(self, value: str) -> bool:
+        normalized = self.engine._normalize_spaces(str(value or ""))
+        if not normalized or self._is_placeholder_leader_text(normalized):
+            return False
+        tokens = re.findall("[A-Za-z\u0410-\u042f\u0430-\u044f\u0401\u0451-]+", normalized)
+        lowered_tokens = [token.lower() for token in tokens]
+        stop_tokens = {
+            "статус",
+            "компании",
+            "организации",
+            "действующая",
+            "ликвидирована",
+            "ликвидировано",
+            "руководитель",
+            "директор",
+            "президент",
+            "данные",
+        }
+        if len(lowered_tokens) < 2 or len(lowered_tokens) > 3:
+            return False
+        if any(token in stop_tokens for token in lowered_tokens):
+            return False
+        return True
+
+    def _get_browser_user_agent(self) -> str:
+        default_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        )
+        generator = getattr(self.engine, "_get_random_user_agent", None)
+        candidate = self.engine._normalize_spaces(generator() if callable(generator) else default_ua)
+        lowered = candidate.lower()
+        if not candidate or "windows nt" not in lowered or "chrome/" not in lowered:
+            return default_ua
+        return candidate
+
+    def _build_browser_proxy_arg(self) -> str:
+        proxy_type, proxy_url = self._get_proxy_settings()
+        normalized_proxy = self.engine._normalize_spaces(proxy_url)
+        if not normalized_proxy:
+            return ""
+
+        if ";" in normalized_proxy or "=" in normalized_proxy:
+            parts = []
+            for chunk in normalized_proxy.split(";"):
+                chunk = self.engine._normalize_spaces(chunk)
+                if not chunk:
+                    continue
+                if "=" in chunk:
+                    key, value = chunk.split("=", 1)
+                    parts.append((key.strip().lower(), value.strip()))
+                else:
+                    parts.append(("default", chunk))
+            preferred = dict(parts)
+            normalized_proxy = preferred.get("https") or preferred.get("http") or preferred.get("default") or parts[0][1]
+
+        scheme = "http"
+        if proxy_type == "socks5":
+            scheme = "socks5"
+        elif proxy_type == "socks4":
+            scheme = "socks4"
+        return f"--proxy-server={scheme}://{normalized_proxy}"
 
     def _parse_rusprofile_dom_html(self, url: str, html: str) -> dict[str, Any]:
         raw_html = str(html or "")
@@ -851,33 +1312,45 @@ class NativeNadinApp(tk.Tk):
             match = re.search(pattern, page_text, flags=re.IGNORECASE)
             if match:
                 profile[key] = match.group(1)
-
         summary_text = ""
+        summary_candidates = self._extract_company_summary_candidates_from_text(page_text)
+
         summary_extractor = getattr(self.engine, "_extract_rusprofile_company_summary", None)
-        if callable(summary_extractor):
+        if callable(summary_extractor) and not summary_candidates:
             try:
-                summary_text = self.engine._normalize_spaces(summary_extractor(soup, page_text))
+                extracted_summary = self._truncate_company_summary_text(summary_extractor(soup, page_text))
+                if extracted_summary:
+                    summary_candidates.append(extracted_summary)
             except Exception:
-                summary_text = ""
-        if not summary_text:
-            match = re.search(r"Главное о компании(?: за 1 минуту)?\s*(.+?)\s*Показать", page_text, flags=re.IGNORECASE)
+                pass
+
+        if not summary_candidates:
+            match = re.search("\u0413\u043b\u0430\u0432\u043d\u043e\u0435 \u043e \u043a\u043e\u043c\u043f\u0430\u043d\u0438\u0438(?:\\s+\u0437\u0430\\s+1\\s+\u043c\u0438\u043d\u0443\u0442\u0443)?\\s*(.+?)\\s*\u041f\u043e\u043a\u0430\u0437\u0430\u0442\u044c", page_text, flags=re.IGNORECASE)
             if match:
-                summary_text = self.engine._normalize_spaces(match.group(1))
-        if not summary_text:
-            marker = soup.find(string=re.compile(r"Главное о компании", re.IGNORECASE))
-            if marker is not None:
-                container = getattr(marker, "parent", None)
-                for _ in range(4):
-                    if container is None:
-                        break
-                    candidate = self.engine._normalize_spaces(container.get_text(" ", strip=True))
-                    candidate = re.sub(r"^.*?Главное о компании(?: за 1 минуту)?", "", candidate, flags=re.IGNORECASE)
-                    candidate = re.sub(r"\bПоказать\b.*$", "", candidate, flags=re.IGNORECASE)
-                    candidate = self.engine._normalize_spaces(candidate)
-                    if len(candidate) >= 30:
-                        summary_text = candidate
-                        break
-                    container = getattr(container, "parent", None)
+                candidate = self._truncate_company_summary_text(match.group(1))
+                if candidate:
+                    summary_candidates.append(candidate)
+
+        for marker in soup.find_all(string=re.compile(r"Главное о компании", re.IGNORECASE)):
+            container = getattr(marker, "parent", None)
+            for _ in range(5):
+                if container is None:
+                    break
+                candidate = self.engine._normalize_spaces(container.get_text(" ", strip=True))
+                candidate = self._truncate_company_summary_text(candidate)
+                if len(candidate) >= 30:
+                    summary_candidates.append(candidate)
+                container = getattr(container, "parent", None)
+
+        if summary_candidates:
+            summary_text = self._extract_best_company_summary_from_text(
+                " ".join(summary_candidates),
+                profile.get("ru_org", org_text),
+            ) or max(
+                summary_candidates,
+                key=lambda item: self._score_company_summary_candidate(item, profile.get("ru_org", org_text)),
+            )
+
         if summary_text:
             profile["company_summary"] = summary_text
 
@@ -923,20 +1396,22 @@ class NativeNadinApp(tk.Tk):
                 else:
                     raw_fio = self.engine._normalize_spaces(leader_match.group(1))
                     raw_position = self.engine._normalize_spaces(leader_match.group(2))
-                normalize_position = getattr(self.engine, "_normalize_position_ru", None)
-                profile["ru_position"] = normalize_position(raw_position) if callable(normalize_position) else raw_position
-                split_fio = getattr(self.engine, "_split_fio_ru", None)
-                if callable(split_fio):
-                    surname_ru, name_ru, middle_name_ru = split_fio(raw_fio)
-                else:
-                    parts = raw_fio.split()
-                    surname_ru, name_ru, middle_name_ru = (parts + ["", "", ""])[:3]
-                profile["surname_ru"] = surname_ru
-                profile["name_ru"] = name_ru
-                profile["middle_name_ru"] = middle_name_ru
-                infer_gender = getattr(self.engine, "_infer_gender", None)
-                if callable(infer_gender):
-                    profile["gender"] = infer_gender(middle_name_ru, profile.get("ru_position", ""), name_ru)
+                if self._is_valid_person_name_candidate(raw_fio):
+                    normalize_position = getattr(self.engine, "_normalize_position_ru", None)
+                    profile["ru_position"] = normalize_position(raw_position) if callable(normalize_position) else raw_position
+                    split_fio = getattr(self.engine, "_split_fio_ru", None)
+                    if callable(split_fio):
+                        surname_ru, name_ru, middle_name_ru = split_fio(raw_fio)
+                    else:
+                        parts = raw_fio.split()
+                        surname_ru, name_ru, middle_name_ru = (parts + ["", "", ""])[:3]
+                    profile["surname_ru"] = surname_ru
+                    profile["name_ru"] = name_ru
+                    profile["middle_name_ru"] = middle_name_ru
+                    infer_gender = getattr(self.engine, "_infer_gender", None)
+                    if callable(infer_gender):
+                        profile["gender"] = infer_gender(middle_name_ru, profile.get("ru_position", ""), name_ru)
+
 
 
         if profile.get("ru_org"):
@@ -963,22 +1438,24 @@ class NativeNadinApp(tk.Tk):
                     flags=re.IGNORECASE,
                 )
                 raw_position = self.engine._normalize_spaces(position_match.group(1)) if position_match else ""
-                split_fio = getattr(self.engine, "_split_fio_ru", None)
-                if callable(split_fio):
-                    surname_ru, name_ru, middle_name_ru = split_fio(raw_fio)
-                else:
-                    parts = raw_fio.split()
-                    surname_ru, name_ru, middle_name_ru = (parts + ["", "", ""])[:3]
-                if surname_ru and name_ru:
-                    profile["surname_ru"] = surname_ru
-                    profile["name_ru"] = name_ru
-                    profile["middle_name_ru"] = middle_name_ru
-                    if raw_position and not profile.get("ru_position"):
-                        normalize_position = getattr(self.engine, "_normalize_position_ru", None)
-                        profile["ru_position"] = normalize_position(raw_position) if callable(normalize_position) else raw_position
-                    infer_gender = getattr(self.engine, "_infer_gender", None)
-                    if callable(infer_gender):
-                        profile["gender"] = infer_gender(middle_name_ru, profile.get("ru_position", ""), name_ru)
+                if self._is_valid_person_name_candidate(raw_fio):
+                    split_fio = getattr(self.engine, "_split_fio_ru", None)
+                    if callable(split_fio):
+                        surname_ru, name_ru, middle_name_ru = split_fio(raw_fio)
+                    else:
+                        parts = raw_fio.split()
+                        surname_ru, name_ru, middle_name_ru = (parts + ["", "", ""])[:3]
+                    if surname_ru and name_ru:
+                        profile["surname_ru"] = surname_ru
+                        profile["name_ru"] = name_ru
+                        profile["middle_name_ru"] = middle_name_ru
+                        if raw_position and not profile.get("ru_position"):
+                            normalize_position = getattr(self.engine, "_normalize_position_ru", None)
+                            profile["ru_position"] = normalize_position(raw_position) if callable(normalize_position) else raw_position
+                        infer_gender = getattr(self.engine, "_infer_gender", None)
+                        if callable(infer_gender):
+                            profile["gender"] = infer_gender(middle_name_ru, profile.get("ru_position", ""), name_ru)
+
 
         if profile.get("ru_position"):
             try:
@@ -1001,18 +1478,26 @@ class NativeNadinApp(tk.Tk):
             profile = self._merge_rusprofile_profile(profile, dom_profile) if profile else dict(dom_profile)
         return profile
 
-    def _display_company_summary(self, profile: dict[str, Any]) -> None:
-        self.company_summary_text.delete("1.0", tk.END)
+    def _apply_company_summary_profile(self, rusprofile_url: str, profile: dict[str, Any]) -> None:
+        sanitized = self._sanitize_rusprofile_detail_url(rusprofile_url)
+        if sanitized:
+            self._last_rusprofile_url = sanitized
+        self._display_company_summary(profile)
 
+    def _display_company_summary(self, profile: dict[str, Any]) -> None:
         summary_text = self.engine._normalize_spaces(str(profile.get("company_summary", "")))
         self._last_company_summary = summary_text
 
-        lines: list[str] = []
         if summary_text:
-            lines.append("Главное о компании за 1 минуту")
-            lines.append(summary_text)
-            lines.append("")
+            sections = self._parse_company_summary_sections(summary_text)
+            self.company_summary_button.configure(state=tk.NORMAL if sections else tk.DISABLED)
+            if sections:
+                self._render_company_summary_sections(sections)
+            else:
+                self._set_company_summary_message("Нет данных о компании")
+            return
 
+        lines: list[str] = []
         if profile.get("ru_org"):
             lines.append(f"Организация: {profile.get('ru_org')}")
         if profile.get("company_status"):
@@ -1026,7 +1511,17 @@ class NativeNadinApp(tk.Tk):
         if profile.get("ru_position"):
             lines.append(f"Должность: {profile.get('ru_position')}")
         if profile.get("surname_ru") or profile.get("name_ru"):
-            fio = self.engine._normalize_spaces(" ".join(part for part in [profile.get("surname_ru", ""), profile.get("name_ru", ""), profile.get("middle_name_ru", "")] if part))
+            fio = self.engine._normalize_spaces(
+                " ".join(
+                    part
+                    for part in [
+                        profile.get("surname_ru", ""),
+                        profile.get("name_ru", ""),
+                        profile.get("middle_name_ru", ""),
+                    ]
+                    if part
+                )
+            )
             if fio:
                 lines.append(f"Руководитель: {fio}")
         if profile.get("address"):
@@ -1037,15 +1532,16 @@ class NativeNadinApp(tk.Tk):
         has_visible_content = bool(lines)
         self.company_summary_button.configure(state=tk.NORMAL if has_visible_content else tk.DISABLED)
         if has_visible_content:
-            self.company_summary_text.insert("1.0", "\n".join(lines))
+            self._configure_company_summary_text_tags()
+            self.company_summary_text.delete("1.0", tk.END)
+            self.company_summary_text.insert("1.0", "\n".join(lines), ("summary_body",))
         else:
-            self.company_summary_text.insert("1.0", "Нет данных о компании")
+            self._set_company_summary_message("Нет данных о компании")
 
     def _display_company_summary_error(self, error: str) -> None:
         self._last_company_summary = ""
         self.company_summary_button.configure(state=tk.NORMAL if self._last_rusprofile_url else tk.DISABLED)
-        self.company_summary_text.delete("1.0", tk.END)
-        self.company_summary_text.insert("1.0", f"Ошибка загрузки: {error}")
+        self._set_company_summary_message(f"Ошибка загрузки: {error}")
 
     def _open_company_summary_tab(self) -> None:
         self.notebook.select(self.tab_company)
@@ -1091,6 +1587,21 @@ class NativeNadinApp(tk.Tk):
         widget.mark_set("insert", "1.0")
         widget.see("insert")
         return "break"
+
+    def _text_handle_ctrl_key(self, event: tk.Event) -> str | None:
+        widget = event.widget if event is not None else self.focus_get()
+        if not isinstance(widget, tk.Text):
+            return None
+
+        keycode = int(getattr(event, "keycode", -1))
+        char = str(getattr(event, "char", "")).lower()
+        keysym = str(getattr(event, "keysym", "")).lower()
+
+        if keycode == 67 or keysym == "c" or char == "c":
+            return self._copy_specific_text_widget(widget)
+        if keycode == 65 or keysym == "a" or char == "a":
+            return self._select_all_specific_text_widget(widget)
+        return None
 
     def _copy_trace_text(self, _event: tk.Event | None = None) -> str:
         if not hasattr(self, "trace_text"):
@@ -2302,6 +2813,9 @@ class NativeNadinApp(tk.Tk):
 
     def _merge_rusprofile_profile(self, current_profile: dict[str, Any], rusprofile_profile: dict[str, Any]) -> dict[str, Any]:
         merged = dict(current_profile)
+        summary_reference_org = self.engine._normalize_spaces(
+            str(merged.get('ru_org') or rusprofile_profile.get('ru_org') or self._last_profile_org)
+        )
         for key, value in rusprofile_profile.items():
             if key in {'url', 'source'}:
                 continue
@@ -2321,6 +2835,17 @@ class NativeNadinApp(tk.Tk):
                 current_year = self.engine._parse_financial_year(merged.get(key, ''))
                 new_year = self.engine._parse_financial_year(normalized_value)
                 if current_year == 0 and new_year != 0:
+                    merged[key] = normalized_value
+                continue
+
+            if key == 'company_summary' and self._profile_has_value(normalized_value):
+                current_summary = self.engine._normalize_spaces(str(merged.get(key, '')))
+                if not current_summary:
+                    merged[key] = normalized_value
+                    continue
+                current_score = self._score_company_summary_candidate(current_summary, summary_reference_org)
+                new_score = self._score_company_summary_candidate(normalized_value, summary_reference_org)
+                if new_score > current_score:
                     merged[key] = normalized_value
                 continue
 
@@ -2633,39 +3158,118 @@ class NativeNadinApp(tk.Tk):
             return f"https://www.rusprofile.ru/id/{record_id}"
         return ""
 
-    def _extract_rusprofile_detail_url_from_html(self, html: str) -> str:
+    def _score_rusprofile_detail_candidate(self, snippet: str, query: str) -> tuple[int, int]:
+        normalized_snippet = self.engine._normalize_spaces(str(snippet or ""))
+        lowered_snippet = normalized_snippet.lower()
+        normalized_query = self.engine._normalize_spaces(str(query or ""))
+        lowered_query = normalized_query.lower()
+        score = 0
+
+        if lowered_query:
+            if lowered_query.isdigit():
+                if lowered_query in lowered_snippet:
+                    score += 900
+            else:
+                for token in self._extract_org_relevance_tokens(lowered_query):
+                    if token in lowered_snippet:
+                        score += 220
+
+        for numeric_value, boost in ((self._last_profile_inn, 700), (self._last_profile_ogrn, 450)):
+            normalized_numeric = self.engine._normalize_spaces(str(numeric_value or ""))
+            if normalized_numeric and normalized_numeric in lowered_snippet:
+                score += boost
+
+        for token in self._extract_org_relevance_tokens(self._last_profile_org):
+            if token in lowered_snippet:
+                score += 180
+
+        if "действующая" in lowered_snippet:
+            score += 15
+        return score, len(normalized_snippet)
+
+    def _extract_rusprofile_detail_candidates_from_html(self, html: str, query: str = "") -> list[str]:
         raw_html = str(html or "")
+        if not raw_html:
+            return []
+
+        candidates: dict[str, tuple[tuple[int, int], str]] = {}
+
+        def register(candidate_value: str, snippet_value: str) -> None:
+            sanitized = self._sanitize_rusprofile_detail_url(candidate_value)
+            if not sanitized:
+                return
+            normalized_snippet = self.engine._normalize_spaces(str(snippet_value or ""))
+            rank = self._score_rusprofile_detail_candidate(normalized_snippet, query)
+            current = candidates.get(sanitized)
+            if current is None or rank > current[0]:
+                candidates[sanitized] = (rank, normalized_snippet)
+
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(raw_html, "lxml")
+        except Exception:
+            soup = None
+
+        if soup is not None:
+            for anchor in soup.find_all("a", href=True):
+                href = self.engine._normalize_spaces(str(anchor.get("href", "")))
+                if not href:
+                    continue
+                candidate_value = href
+                if href.startswith("/"):
+                    candidate_value = f"https://www.rusprofile.ru{href}"
+                snippet_parts = [anchor.get_text(" ", strip=True)]
+                sibling = anchor.next_sibling
+                sibling_steps = 0
+                while sibling is not None and sibling_steps < 3:
+                    sibling_text = getattr(sibling, "get_text", None)
+                    if callable(sibling_text):
+                        snippet_parts.append(sibling_text(" ", strip=True))
+                    else:
+                        snippet_parts.append(str(sibling).strip())
+                    sibling = getattr(sibling, "next_sibling", None)
+                    sibling_steps += 1
+                parent = anchor.parent
+                if parent is not None:
+                    snippet_parts.append(parent.get_text(" ", strip=True))
+                register(candidate_value, " ".join(part for part in snippet_parts if part))
+
         variants = [raw_html]
         for _ in range(2):
             variants.append(html_unescape(variants[-1]))
             variants.append(unquote(variants[-1]))
 
         patterns = (
-            r'href=[\'"](?P<path>/id/\d+[^\'"]*)[\'"]',
-            r'https?://(?:www\.)?rusprofile\.ru/id/\d+[^"\'\s<]*',
+            r"href=['\"](?P<path>/id/\d+[^'\"]*)['\"]",
+            r"https?://(?:www\.)?rusprofile\.ru/id/\d+[^\"'\s<]*",
         )
 
         for text_variant in variants:
             for pattern in patterns:
-                match = re.search(pattern, text_variant, flags=re.IGNORECASE)
-                if not match:
-                    continue
-                path = match.groupdict().get("path", "")
-                candidate = f"https://www.rusprofile.ru{path}" if path else match.group(0)
-                sanitized = self._sanitize_rusprofile_detail_url(candidate)
-                if sanitized:
-                    return sanitized
-        return ""
+                for match in re.finditer(pattern, text_variant, flags=re.IGNORECASE):
+                    path = match.groupdict().get("path", "")
+                    candidate_value = f"https://www.rusprofile.ru{path}" if path else match.group(0)
+                    snippet_start = max(0, match.start() - 80)
+                    snippet_end = min(len(text_variant), match.end() + 80)
+                    register(candidate_value, text_variant[snippet_start:snippet_end])
 
-    def _lookup_rusprofile_url(self, query: str) -> str:
+        ranked = sorted(candidates.items(), key=lambda item: item[1][0], reverse=True)
+        return [candidate for candidate, _meta in ranked]
+
+    def _extract_rusprofile_detail_url_from_html(self, html: str, query: str = "") -> str:
+        candidates = self._extract_rusprofile_detail_candidates_from_html(html, query=query)
+        return candidates[0] if candidates else ""
+
+    def _lookup_rusprofile_url(self, query: str, force_refresh: bool = False) -> str:
         normalized_query = self.engine._normalize_spaces(query)
         if not normalized_query:
             return ""
 
         cache_key = normalized_query.lower()
-        cached = self._sanitize_rusprofile_detail_url(self._rusprofile_url_cache.get(cache_key, ""))
-        if cached:
-            return cached
+        if not force_refresh:
+            cached = self._sanitize_rusprofile_detail_url(self._rusprofile_url_cache.get(cache_key, ""))
+            if cached:
+                return cached
 
         search_url = f"https://www.rusprofile.ru/search?query={quote(normalized_query)}"
         resolved = ""
@@ -2676,7 +3280,7 @@ class NativeNadinApp(tk.Tk):
             html = ""
 
         if html:
-            resolved_from_html = self._extract_rusprofile_detail_url_from_html(html)
+            resolved_from_html = self._extract_rusprofile_detail_url_from_html(html, query=normalized_query)
             if resolved_from_html:
                 resolved = resolved_from_html
 
@@ -2686,7 +3290,7 @@ class NativeNadinApp(tk.Tk):
                 if session is not None:
                     response = session.get(search_url, timeout=12)
                     if getattr(response, "status_code", 0) == 200:
-                        resolved_from_cloud = self._extract_rusprofile_detail_url_from_html(getattr(response, "text", ""))
+                        resolved_from_cloud = self._extract_rusprofile_detail_url_from_html(getattr(response, "text", ""), query=normalized_query)
                         if resolved_from_cloud:
                             resolved = resolved_from_cloud
             except Exception:  # noqa: BLE001
@@ -2699,7 +3303,7 @@ class NativeNadinApp(tk.Tk):
                 ddg_html = self.engine._fetch_page(ddg_url, timeout=8, max_retries=1)
             except Exception:  # noqa: BLE001
                 ddg_html = ""
-            resolved_from_ddg = self._extract_rusprofile_detail_url_from_html(ddg_html)
+            resolved_from_ddg = self._extract_rusprofile_detail_url_from_html(ddg_html, query=normalized_query)
             if resolved_from_ddg:
                 resolved = resolved_from_ddg
 
@@ -2995,11 +3599,308 @@ class NativeNadinApp(tk.Tk):
                 return Path(resolved)
         return None
 
+    def _reserve_debug_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    def _read_local_json(self, url: str, timeout: float = 3.0) -> Any:
+        with urlopen(url, timeout=timeout) as response:
+            body = response.read()
+        return json.loads(body.decode("utf-8", errors="ignore"))
+
+    def _wait_for_cdp_target(self, port: int, timeout: float = 10.0) -> str:
+        deadline = time.time() + timeout
+        last_error = ""
+        while time.time() < deadline:
+            try:
+                targets = self._read_local_json(f"http://127.0.0.1:{port}/json/list", timeout=2.0)
+                if isinstance(targets, list):
+                    for item in targets:
+                        if item.get("type") == "page" and item.get("webSocketDebuggerUrl"):
+                            return str(item["webSocketDebuggerUrl"])
+            except (URLError, OSError, json.JSONDecodeError, ValueError) as exc:
+                last_error = str(exc)
+            time.sleep(0.2)
+        raise RuntimeError(last_error or "cdp_target_not_found")
+
+    def _fetch_rusprofile_expanded_summary_with_browser(self, source_url: str) -> str:
+        browser_path = self._find_headless_browser()
+        if browser_path is None:
+            raise RuntimeError("headless_browser_not_found")
+
+        try:
+            import websockets
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"websockets_unavailable:{exc}") from exc
+
+        port = self._reserve_debug_port()
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        user_agent = self._get_browser_user_agent()
+        proxy_arg = self._build_browser_proxy_arg()
+
+        command = [
+            str(browser_path),
+            "--headless=new",
+            f"--remote-debugging-port={port}",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-allow-origins=*",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-breakpad",
+            "--disable-crash-reporter",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-component-update",
+            "--disable-domain-reliability",
+            "--disable-notifications",
+            "--disable-extensions",
+            "--window-size=1600,960",
+            "--lang=ru-RU",
+            "--force-device-scale-factor=1",
+            f"--user-agent={user_agent}",
+            "about:blank",
+        ]
+        if proxy_arg:
+            command.insert(-1, proxy_arg)
+
+        with tempfile.TemporaryDirectory(prefix="nadin_rusprofile_summary_") as profile_dir:
+            command.insert(-1, f"--user-data-dir={profile_dir}")
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=creationflags,
+            )
+            try:
+                ws_url = self._wait_for_cdp_target(port, timeout=12.0)
+
+                async def _run() -> str:
+                    async with websockets.connect(ws_url, open_timeout=15, close_timeout=5, max_size=None) as websocket:
+                        message_id = 0
+
+                        async def _send(method: str, params: dict[str, Any] | None = None, timeout: float = 15.0) -> dict[str, Any]:
+                            nonlocal message_id
+                            message_id += 1
+                            current_id = message_id
+                            payload: dict[str, Any] = {"id": current_id, "method": method}
+                            if params:
+                                payload["params"] = params
+                            await websocket.send(json.dumps(payload))
+                            while True:
+                                raw = await asyncio.wait_for(websocket.recv(), timeout=timeout)
+                                message = json.loads(raw)
+                                if message.get("id") != current_id:
+                                    continue
+                                if "error" in message:
+                                    raise RuntimeError(str(message["error"]))
+                                return message.get("result", {})
+
+                        async def _evaluate(expression: str, timeout: float = 15.0) -> Any:
+                            result = await _send(
+                                "Runtime.evaluate",
+                                {
+                                    "expression": expression,
+                                    "returnByValue": True,
+                                    "awaitPromise": True,
+                                },
+                                timeout=timeout,
+                            )
+                            remote = result.get("result", {})
+                            if "value" in remote:
+                                return remote.get("value")
+                            return remote.get("description", "")
+
+                        await _send("Page.enable")
+                        await _send("Runtime.enable")
+                        await _send("DOM.enable")
+                        await _send("Page.navigate", {"url": source_url})
+
+                        for _ in range(20):
+                            ready_state = str(await _evaluate("document.readyState")).lower()
+                            if ready_state == "complete":
+                                break
+                            await asyncio.sleep(0.5)
+                        await asyncio.sleep(2.0)
+
+                        click_script = r"""
+(() => {
+  const norm = (value) => (value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  const visible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const fireClick = (el) => {
+    try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch (_err) {}
+    for (const name of ['mouseover', 'mousedown', 'mouseup', 'click']) {
+      try {
+        el.dispatchEvent(new MouseEvent(name, {bubbles: true, cancelable: true, view: window}));
+      } catch (_err) {}
+    }
+    try { el.click(); } catch (_err) {}
+  };
+  const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,div,span,p,strong'))
+    .filter((el) => /^Главное о компании( за 1 минуту)?$/i.test(norm(el.textContent || '')));
+  for (const heading of headings) {
+    let node = heading;
+    for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+      const candidates = Array.from(node.querySelectorAll('button,a,span,div')).filter(
+        (el) => visible(el) && norm(el.innerText || el.textContent || '') === 'Показать'
+      );
+      if (!candidates.length) {
+        continue;
+      }
+      fireClick(candidates[0]);
+      return true;
+    }
+  }
+  const fallback = Array.from(document.querySelectorAll('button,a,span,div')).find(
+    (el) => visible(el) && norm(el.innerText || el.textContent || '') === 'Показать'
+  );
+  if (fallback) {
+    fireClick(fallback);
+    return true;
+  }
+  return false;
+})()
+"""
+
+                        extract_script = r"""
+(() => {
+  const norm = (value) => (value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  const visible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const sectionTitle = /^(Главное о компании(?: за 1 минуту)?|Финансовая устойчивость|Юридическая активность|Арбитраж|Суды общей юрисдикции|Исполнительные производства|Надежность|Выводы)$/i;
+  const rootSelectors = [
+    '[class*="company-description_text"]',
+    '[class*="company-description_wrapper"]',
+    '[class*="company-description_inner"]',
+    '[class*="company-description"]',
+  ];
+  const collectFromRoot = (root) => {
+    const roots = [];
+    for (const selector of rootSelectors) {
+      for (const node of Array.from(root.querySelectorAll(selector))) {
+        if (node && !roots.includes(node)) {
+          roots.push(node);
+        }
+      }
+    }
+    if (!roots.length) {
+      roots.push(root);
+    }
+    for (const textRoot of roots) {
+      const blocks = [];
+      for (const child of Array.from(textRoot.children || [])) {
+        const childText = norm(child.innerText || child.textContent || '');
+        if (!childText) {
+          continue;
+        }
+        const subtitle = Array.from(child.querySelectorAll('[class*="company-description_subtitle"]'))
+          .map((el) => norm(el.textContent || ''))
+          .find((value) => sectionTitle.test(value));
+        if (!subtitle && !sectionTitle.test(childText)) {
+          continue;
+        }
+        blocks.push(childText);
+        if (/^Выводы$/i.test(subtitle || '')) {
+          break;
+        }
+      }
+      if (blocks.length) {
+        return norm(blocks.join(' '));
+      }
+      const text = norm(textRoot.innerText || textRoot.textContent || '');
+      if (/Главное о компании/i.test(text) && /Выводы/i.test(text)) {
+        return text;
+      }
+    }
+    return '';
+  };
+
+  const candidates = [];
+  for (const modal of Array.from(document.querySelectorAll('.Modal,[class*="Modal"]'))) {
+    if (!visible(modal)) {
+      continue;
+    }
+    const text = collectFromRoot(modal);
+    if (text) {
+      candidates.push(text);
+    }
+  }
+
+  if (!candidates.length) {
+    const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,div,span,p,strong'))
+      .filter((el) => /^Главное о компании( за 1 минуту)?$/i.test(norm(el.textContent || '')));
+    for (const heading of headings) {
+      let node = heading;
+      for (let depth = 0; node && depth < 10; depth += 1, node = node.parentElement) {
+        const text = collectFromRoot(node);
+        if (text) {
+          candidates.push(text);
+          break;
+        }
+      }
+    }
+  }
+
+  if (!candidates.length) {
+    const fullPage = norm(document.body ? (document.body.innerText || document.body.textContent || '') : '');
+    if (/Главное о компании/i.test(fullPage)) {
+      candidates.push(fullPage);
+    }
+  }
+
+  candidates.sort((left, right) => right.length - left.length);
+  return candidates[0] || '';
+})()
+"""
+
+                        raw_summary = str(await _evaluate(extract_script))
+                        if not self._summary_contains_expanded_sections(raw_summary):
+                            await _evaluate(click_script)
+                            for _ in range(8):
+                                await asyncio.sleep(1.0)
+                                raw_summary = str(await _evaluate(extract_script))
+                                if self._summary_contains_expanded_sections(raw_summary):
+                                    break
+
+                        return self._finalize_company_summary_text(raw_summary, self._last_profile_org)
+
+                loop = asyncio.new_event_loop()
+                try:
+                    return loop.run_until_complete(_run())
+                finally:
+                    loop.close()
+            finally:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+
     def _capture_with_headless_browser(self, browser_path: Path, source_url: str, output_path: Path) -> tuple[bool, str]:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         attempts = ["--headless=new", "--headless"]
         last_details = ""
-        user_agent = self.engine._get_random_user_agent()
+        user_agent = self._get_browser_user_agent()
+        proxy_arg = self._build_browser_proxy_arg()
 
         for headless_flag in attempts:
             if output_path.exists():
@@ -3016,23 +3917,39 @@ class NativeNadinApp(tk.Tk):
                     "--disable-breakpad",
                     "--disable-crash-reporter",
                     "--disable-blink-features=AutomationControlled",
-                    "--hide-scrollbars",
-                    "--window-size=1600,900",
+                    "--disable-background-networking",
+                    "--disable-sync",
+                    "--disable-component-update",
+                    "--disable-domain-reliability",
+                    "--disable-notifications",
+                    "--disable-extensions",
+                    "--window-size=1536,960",
                     "--lang=ru-RU",
-                    "--virtual-time-budget=3000",
+                    "--force-device-scale-factor=1",
+                    "--virtual-time-budget=12000",
                     f"--user-data-dir={profile_dir}",
                     f"--user-agent={user_agent}",
                     f"--screenshot={output_path}",
                     source_url,
                 ]
-                completed = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    check=False,
-                    creationflags=creationflags,
-                )
+                if proxy_arg:
+                    command.insert(-2, proxy_arg)
+                try:
+                    completed = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        timeout=35,
+                        check=False,
+                        creationflags=creationflags,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    if output_path.exists() and output_path.stat().st_size > 0:
+                        return True, ""
+                    stderr = self.engine._normalize_spaces(str(exc.stderr or ""))
+                    stdout = self.engine._normalize_spaces(str(exc.stdout or ""))
+                    last_details = stderr or stdout or "headless_browser_timeout"
+                    continue
             if output_path.exists() and output_path.stat().st_size > 0:
                 return True, ""
             stderr = (completed.stderr or "").strip()
@@ -3048,7 +3965,8 @@ class NativeNadinApp(tk.Tk):
 
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         attempts = ["--headless=new", "--headless"]
-        user_agent = self.engine._get_random_user_agent()
+        user_agent = self._get_browser_user_agent()
+        proxy_arg = self._build_browser_proxy_arg()
         last_details = ""
 
         for headless_flag in attempts:
@@ -3064,25 +3982,41 @@ class NativeNadinApp(tk.Tk):
                     "--disable-breakpad",
                     "--disable-crash-reporter",
                     "--disable-blink-features=AutomationControlled",
-                    "--hide-scrollbars",
-                    "--window-size=1600,900",
+                    "--disable-background-networking",
+                    "--disable-sync",
+                    "--disable-component-update",
+                    "--disable-domain-reliability",
+                    "--disable-notifications",
+                    "--disable-extensions",
+                    "--window-size=1536,960",
                     "--lang=ru-RU",
-                    "--virtual-time-budget=5000",
+                    "--force-device-scale-factor=1",
+                    "--virtual-time-budget=15000",
                     f"--user-data-dir={profile_dir}",
                     f"--user-agent={user_agent}",
                     "--dump-dom",
                     source_url,
                 ]
-                completed = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="ignore",
-                    timeout=20,
-                    check=False,
-                    creationflags=creationflags,
-                )
+                if proxy_arg:
+                    command.insert(-2, proxy_arg)
+                try:
+                    completed = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="ignore",
+                        timeout=40,
+                        check=False,
+                        creationflags=creationflags,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    stdout = str(exc.stdout or "")
+                    if "<html" in stdout.lower():
+                        return stdout
+                    stderr = self.engine._normalize_spaces(str(exc.stderr or ""))
+                    last_details = stderr or self.engine._normalize_spaces(stdout) or "headless_dom_fetch_timeout"
+                    continue
             stdout = str(completed.stdout or "")
             if completed.returncode == 0 and "<html" in stdout.lower():
                 return stdout
@@ -3227,6 +4161,7 @@ $web.Dispose()
             return
 
         self._last_screenshot_path = saved_path
+        self.screenshot_preview_label._image_path = saved_path
         self._last_screenshot_preview_path = preview_path
         self._update_screenshot_preview(preview_path or saved_path)
         self.screenshot_meta_var.set(f"Скриншот: {captured_at}")
@@ -3256,6 +4191,8 @@ $web.Dispose()
     def _update_screenshot_preview(self, screenshot_path: str) -> None:
         if not screenshot_path:
             return
+        if hasattr(self, "screenshot_preview_label"):
+            self.screenshot_preview_label._image_path = self._last_screenshot_path or screenshot_path
         image = tk.PhotoImage(file=screenshot_path)
         max_w = 320
         max_h = 180
@@ -3266,44 +4203,88 @@ $web.Dispose()
                 factor += 1
             image = image.subsample(factor, factor)
         self._screenshot_preview_image = image
-        self.screenshot_preview_label.configure(image=image, text="")
+        self.screenshot_preview_label.configure(image=image, text="", cursor="hand2")
         self._update_screenshot_viewer_image()
 
     def _open_image_viewer(self, image_path: str, meta_text: str) -> None:
         if not image_path or not Path(image_path).exists():
             return
 
+        if not hasattr(self, "viewer_meta_var"):
+            self.viewer_meta_var = tk.StringVar(value="")
         self._viewer_image_path = image_path
         self.viewer_meta_var.set(meta_text)
 
         if self._screenshot_viewer is None or not self._screenshot_viewer.winfo_exists():
             viewer = tk.Toplevel(self)
             viewer.title("Просмотр скриншота")
-            viewer.geometry("1200x780")
-            viewer.minsize(720, 520)
+            geometry, min_width, min_height = self._get_screenshot_viewer_geometry()
+            viewer.geometry(geometry)
+            viewer.minsize(min_width, min_height)
+            viewer.transient(self)
             viewer.protocol("WM_DELETE_WINDOW", self._close_screenshot_viewer)
             viewer.bind("<Escape>", lambda _evt: self._close_screenshot_viewer())
+            viewer.bind("<Configure>", self._schedule_update_screenshot_viewer_image, add="+")
+            try:
+                viewer.state("zoomed")
+            except Exception:
+                pass
 
             top_bar = ttk.Frame(viewer, padding=(10, 8))
             top_bar.pack(fill=tk.X)
             ttk.Label(top_bar, textvariable=self.viewer_meta_var).pack(side=tk.LEFT)
             ttk.Button(top_bar, text="Закрыть", command=self._close_screenshot_viewer).pack(side=tk.RIGHT)
 
-            body = ttk.Frame(viewer, padding=(10, 0, 10, 10))
+            body = ttk.Frame(viewer, padding=(4, 0, 4, 4))
             body.pack(fill=tk.BOTH, expand=True)
-            self._screenshot_viewer_label = ttk.Label(body, anchor="center")
+            self._screenshot_viewer_label = tk.Label(body, anchor="center", bd=0, highlightthickness=0, bg="#d9dce1")
             self._screenshot_viewer_label.pack(fill=tk.BOTH, expand=True)
             self._screenshot_viewer = viewer
 
         self._update_screenshot_viewer_image()
+        self._screenshot_viewer.update_idletasks()
         self._screenshot_viewer.deiconify()
+        try:
+            self._screenshot_viewer.state("zoomed")
+        except Exception:
+            pass
         self._screenshot_viewer.lift()
+        self._screenshot_viewer.attributes("-topmost", True)
+        self._screenshot_viewer.after(200, lambda: self._screenshot_viewer and self._screenshot_viewer.winfo_exists() and self._screenshot_viewer.attributes("-topmost", False))
         self._screenshot_viewer.focus_force()
 
+    def _get_screenshot_viewer_geometry(self) -> tuple[str, int, int]:
+        screen_w = max(int(self.winfo_screenwidth()), 1280)
+        screen_h = max(int(self.winfo_screenheight()), 800)
+        width = min(max(int(screen_w * 0.94), 1380), screen_w)
+        height = min(max(int(screen_h * 0.92), 860), screen_h)
+        x = max((screen_w - width) // 2, 0)
+        y = max((screen_h - height) // 2, 0)
+        min_width = min(max(980, width // 2), width)
+        min_height = min(max(640, height // 2), height)
+        return f"{width}x{height}+{x}+{y}", min_width, min_height
+
+    def _schedule_update_screenshot_viewer_image(self, _event: tk.Event | None = None) -> None:
+        viewer = self._screenshot_viewer
+        if viewer is None or not viewer.winfo_exists():
+            return
+        job = getattr(self, "_screenshot_viewer_resize_job", None)
+        if job:
+            try:
+                viewer.after_cancel(job)
+            except Exception:
+                pass
+        self._screenshot_viewer_resize_job = viewer.after(60, self._update_screenshot_viewer_image)
+
     def _open_screenshot_viewer(self, _event: tk.Event | None = None) -> str:
-        if not self._last_screenshot_path or not Path(self._last_screenshot_path).exists():
+        image_path = (
+            self._last_screenshot_path
+            or str(getattr(self.screenshot_preview_label, "_image_path", ""))
+            or self._last_screenshot_preview_path
+        )
+        if not image_path or not Path(image_path).exists():
             return "break"
-        self._open_image_viewer(self._last_screenshot_path, self.screenshot_meta_var.get())
+        self._open_image_viewer(image_path, self.screenshot_meta_var.get())
         return "break"
 
     def _close_screenshot_viewer(self) -> None:
@@ -3313,6 +4294,7 @@ $web.Dispose()
         self._screenshot_viewer_label = None
         self._screenshot_viewer_image = None
         self._viewer_image_path = ""
+        self._screenshot_viewer_resize_job = None
 
     def _update_screenshot_viewer_image(self) -> None:
         if self._screenshot_viewer is None or not self._screenshot_viewer.winfo_exists() or self._screenshot_viewer_label is None:
@@ -3320,15 +4302,33 @@ $web.Dispose()
         if not self._viewer_image_path or not Path(self._viewer_image_path).exists():
             return
 
-        image = tk.PhotoImage(file=self._viewer_image_path)
-        max_w = max(self.winfo_screenwidth() - 120, 800)
-        max_h = max(self.winfo_screenheight() - 180, 520)
-        ratio = max(image.width() / max_w, image.height() / max_h, 1.0)
-        if ratio > 1:
-            factor = int(ratio)
-            if factor < ratio:
-                factor += 1
-            image = image.subsample(factor, factor)
+        self._screenshot_viewer.update_idletasks()
+        label_width = max(int(self._screenshot_viewer_label.winfo_width()), 0)
+        label_height = max(int(self._screenshot_viewer_label.winfo_height()), 0)
+        viewer_width = max(int(self._screenshot_viewer.winfo_width()), 0)
+        viewer_height = max(int(self._screenshot_viewer.winfo_height()), 0)
+        max_w = max(label_width - 8, viewer_width - 18, self.winfo_screenwidth() - 32, 1200)
+        max_h = max(label_height - 8, viewer_height - 74, self.winfo_screenheight() - 96, 760)
+
+        if Image is not None and ImageTk is not None:
+            with Image.open(self._viewer_image_path).convert("RGBA") as source:
+                width, height = source.size
+                if width <= 0 or height <= 0:
+                    return
+                scale = min(max_w / width, max_h / height)
+                if scale <= 0:
+                    scale = 1.0
+                target_w = max(1, int(width * scale))
+                target_h = max(1, int(height * scale))
+                if target_w != width or target_h != height:
+                    resampling = getattr(Image, "Resampling", None)
+                    lanczos = getattr(resampling, "LANCZOS", getattr(Image, "LANCZOS", getattr(Image, "ANTIALIAS", 1)))
+                    display = source.resize((target_w, target_h), lanczos)
+                else:
+                    display = source.copy()
+                image = ImageTk.PhotoImage(display)
+        else:
+            image = tk.PhotoImage(file=self._viewer_image_path)
 
         self._screenshot_viewer_image = image
         self._screenshot_viewer_label.configure(image=image, text="")

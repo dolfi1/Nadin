@@ -5933,10 +5933,22 @@ class CompanyWebApp:
         ru_exact_key = self._normalize_spaces(ru_org_normalized.lower())
 
 
-        opf_ru = "ФГАОУ ВО" if fallback_ru.upper().endswith("ФГАОУ ВО") else ""
+        opf_ru = "????? ??" if fallback_ru.upper().endswith("????? ??") else ""
+        if not opf_ru and ru_org_normalized:
+            ru_tokens = ru_org_normalized.split()
+            if len(ru_tokens) >= 2 and ru_tokens[-2:] == ["?????", "??"]:
+                opf_ru = "????? ??"
+            elif ru_tokens and ru_tokens[0] in RU_TO_EN_OPF_EXTENDED:
+                opf_ru = ru_tokens[0]
+            elif ru_tokens and ru_tokens[-1] in RU_TO_EN_OPF_EXTENDED:
+                opf_ru = ru_tokens[-1]
+            elif ru_tokens and ru_tokens[0].lower() in RU_LEGAL_TO_EN:
+                opf_ru = ru_tokens[0]
+            elif ru_tokens and ru_tokens[-1].lower() in RU_LEGAL_TO_EN:
+                opf_ru = ru_tokens[-1]
 
-
-        opf_en = RU_TO_EN_OPF_EXTENDED.get(opf_ru, "")
+        legal_en = RU_LEGAL_TO_EN.get(str(opf_ru).lower(), "")
+        opf_en = legal_en or RU_TO_EN_OPF_EXTENDED.get(opf_ru, "")
 
 
 
@@ -6101,36 +6113,10 @@ class CompanyWebApp:
         result = re.sub(r"^The\s+", "", result, flags=re.IGNORECASE)
 
 
-        if not opf and ru_org_normalized:
+        if not opf and ru_org_normalized and opf_en:
 
 
-            ru_tokens = ru_org_normalized.split()
-
-
-            ru_opf = ""
-
-
-            if len(ru_tokens) >= 2 and ru_tokens[-2:] == ["ФГАОУ", "ВО"]:
-
-
-                ru_opf = "фгаоу во"
-
-
-            elif ru_tokens:
-
-
-                ru_opf = ru_tokens[-1].lower()
-
-
-            legal_en = RU_LEGAL_TO_EN.get(ru_opf)
-
-
-            if legal_en:
-
-
-                result = self._normalize_spaces(f"{result} {legal_en}")
-
-
+            result = self._normalize_spaces(f"{result} {opf_en}")
         return result, notes
 
 
