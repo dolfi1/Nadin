@@ -1,4 +1,4 @@
-
+﻿
 from __future__ import annotations
 
 import asyncio
@@ -866,7 +866,7 @@ class NativeNadinApp(tk.Tk):
         for index, section in enumerate(sections):
             title = self.engine._normalize_spaces(str(section.get("title", "")))
             body = str(section.get("body", "") or "").strip()
-            links = [self.engine._normalize_spaces(str(item)) for item in section.get("links", []) if self.engine._normalize_spaces(str(item))]
+            links: list[str] = []
 
             if title:
                 tag = "summary_title" if index == 0 else "summary_heading"
@@ -4427,4 +4427,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

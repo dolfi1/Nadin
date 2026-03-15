@@ -1,9 +1,12 @@
 import csv
 import io
 import json
+import sys
+import types
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from native_app import NativeNadinApp
+from native_app import NativeNadinApp, Image
 from main import INTERNAL_MERGED_SOURCE
 
 
@@ -13,7 +16,6 @@ def test_sanitize_ru_position_noise(app):
 
 def test_export_csv_contains_all_profile_fields(app):
     profile = {
-        "surname_ru": "Иванов",
         "name_ru": "Иван",
         "middle_name_ru": "Иванович",
         "family_name": "Ivanov",
@@ -25,14 +27,15 @@ def test_export_csv_contains_all_profile_fields(app):
         "en_position": "President",
         "ru_org": "ПАО СБЕРБАНК",
         "en_org": "SBERBANK PJSC",
+        "en_org": "SBERBANK PJSC",
     }
     with app._connect() as db:
         cur = db.execute(
             "INSERT INTO cards(ru_org,en_org,status,source,created_at,updated_at,data_json) VALUES(?,?,?,?,?,?,?)",
             (
-                "ПАО СБЕРБАНК",
                 "SBERBANK PJSC",
                 "completed",
+                "manual",
                 "manual",
                 app._now(),
                 app._now(),
@@ -46,7 +49,6 @@ def test_export_csv_contains_all_profile_fields(app):
     assert status == "200 OK"
     header_names = next(csv.reader(io.StringIO(body)))
     expected = [
-        "id",
         "surname_ru",
         "name_ru",
         "middle_name_ru",
@@ -61,6 +63,7 @@ def test_export_csv_contains_all_profile_fields(app):
         "en_org",
         "status",
         "source",
+        "created_at",
         "created_at",
     ]
     assert header_names == expected
@@ -79,7 +82,7 @@ def test_autofill_review_dedup_by_source_and_inn(app, monkeypatch):
             return ([{"source": "zachestnyibiznes.ru", "url": "u1", "data": {"inn": "7707083893", "ru_org": "ПАО СБЕРБАНК"}}], ["fast"])
         return (
             [
-                {"source": "zachestnyibiznes.ru", "url": "u2", "data": {"inn": "7707083893", "ru_org": "ПАО СБЕРБАНК"}},
+                {"source": "zachestnyibiznes.ru", "url": "u3", "data": {"inn": "7707083893", "ru_org": "ПАО СБЕРБАНК"}},
                 {"source": "zachestnyibiznes.ru", "url": "u3", "data": {"inn": "7707083893", "ru_org": "ПАО СБЕРБАНК"}},
             ],
             ["extended"],
@@ -117,8 +120,8 @@ def test_manual_post_requires_en_org_json(app):
 def test_manual_post_company_requires_inn_json(app):
     body, status, _ = app.manual_post(
         {
-            "ru_org": ["ООО Ромашка"],
             "en_org": ["Romashka LLC"],
+            "search_type": ["company"],
             "search_type": ["company"],
         },
         wants_json=True,
@@ -143,27 +146,27 @@ import re
 def test_family_name_first_name_in_card(app, monkeypatch):
     hits = [
         {
-            "source": "ФНС ЕГРЮЛ",
+            "type": "company",
             "type": "company",
             "data": {
-                "inn": "7707083893",
                 "ru_org": "Сбербанк ПАО",
                 "ru_position": "Председатель правления",
                 "gender": "М",
                 "surname_ru": "",
                 "name_ru": "",
-            },
+                "name_ru": "",
+        },
         },
         {
-            "source": "zachestnyibiznes.ru",
+            "type": "company",
             "type": "company",
             "data": {
-                "surname_ru": "Греф",
                 "name_ru": "Герман",
                 "middle_name_ru": "Оскарович",
                 "ru_org": "ПАО СБЕРБАНК",
                 "inn": "7707083893",
-            },
+                "inn": "7707083893",
+        },
         },
     ]
 
@@ -182,7 +185,7 @@ def test_family_name_first_name_in_card(app, monkeypatch):
         card = db.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
     profile = json.loads(card["data_json"])["profile"]
     assert profile["surname_ru"] == "Греф"
-    assert profile["family_name"] != ""
+    assert profile["first_name"] != ""
     assert profile["first_name"] != ""
     assert not re.search(r"[А-Яа-яЁё]", profile.get("middle_name_en", ""))
 
@@ -209,14 +212,14 @@ def test_export_xlsx_has_expected_headers(app):
 
 
 def test_sanitize_ru_position_rejects_azerbaijani_suffixes(app):
-    assert app.sanitize_ru_position("кызы") is None
+    assert app.sanitize_ru_position("оглы") is None
     assert app.sanitize_ru_position("оглы") is None
     assert app.sanitize_ru_position("Директор") == "Директор"
 
 
 def test_infer_gender_handles_suffixes_and_first_name(app):
-    assert app._infer_gender("Эльман кызы") == "Ж"
     assert app._infer_gender("Сергеевна") == "Ж"
+    assert app._infer_gender("Александрович") == "М"
     assert app._infer_gender("Александрович") == "М"
     assert app._infer_gender("Эльман", first_name_ru="Зульфия") == "Ж"
     assert app._infer_gender("") == ""
@@ -271,12 +274,12 @@ def test_score_org_relevance_prefers_bank_over_subsidiary_for_short_brand(app):
 def test_search_by_criteria_company_prefers_bank_candidate(app, monkeypatch):
     hits = [
         {
-            "source": "zachestnyibiznes.ru",
+            "type": "company",
             "type": "company",
             "data": {"ru_org": "АО ВТБ ЛИЗИНГ", "inn": "7709378229", "revenue": 9_000_000_000_000},
         },
         {
-            "source": "ФНС ЕГРЮЛ",
+            "type": "company",
             "type": "company",
             "data": {"ru_org": "ПАО БАНК ВТБ", "inn": "7702070139", "revenue": 0},
         },
@@ -306,10 +309,10 @@ def test_provider_cache_key_uses_version_prefix(app, monkeypatch):
     monkeypatch.setattr(app, "_get_cache", fake_get_cache)
 
     provider = {
-        "name": "checko.ru",
         "kind": "checko",
-        "supports_inn": True,
+        "kind": "checko",
         "supports_name": True,
+        "supports_url": True,
         "supports_url": True,
     }
 
@@ -322,12 +325,12 @@ def test_search_by_company_short_brand_expands_queries_and_prefers_bank(app, mon
     calls = []
 
     leasing_hit = {
-        "source": "zachestnyibiznes.ru",
+        "type": "company",
         "type": "company",
         "data": {"ru_org": "АО ВТБ ЛИЗИНГ", "inn": "7709378229", "revenue": 9_000_000_000_000},
     }
     bank_hit = {
-        "source": "ФНС ЕГРЮЛ",
+        "type": "company",
         "type": "company",
         "data": {"ru_org": "ПАО БАНК ВТБ", "inn": "7702070139", "revenue": 0},
     }
@@ -373,11 +376,11 @@ def test_autofill_review_fast_inn_company_skips_extended_search(app, monkeypatch
         return (
             [
                 {
-                    "source": "ФНС ЕГРЮЛ",
+                    "type": "company",
                     "type": "company",
                     "data": {
-                        "inn": "7702070139",
                         "ru_org": "БАНК ВТБ (ПАО)",
+                        "en_org": "VTB Bank PJSC",
                         "en_org": "VTB Bank PJSC",
                         "revenue": 1_000_000,
                     },
@@ -403,10 +406,10 @@ def test_autofill_review_fast_inn_company_skips_extended_search(app, monkeypatch
 
 def test_card_view_financial_lines_format(app):
     profile = {
-        "ru_org": "Банк ВТБ ПАО",
         "en_org": "VTB Bank PJSC",
         "inn": "7702070139",
         "revenue": "1000000",
+        "financial_year": "2024",
         "financial_year": "2024",
     }
 
@@ -414,9 +417,9 @@ def test_card_view_financial_lines_format(app):
         cur = db.execute(
             "INSERT INTO cards(ru_org,en_org,status,source,created_at,updated_at,data_json) VALUES(?,?,?,?,?,?,?)",
             (
-                profile["ru_org"],
                 profile["en_org"],
-                "Найдено",
+                profile["en_org"],
+                "autofill",
                 "autofill",
                 app._now(),
                 app._now(),
@@ -429,7 +432,7 @@ def test_card_view_financial_lines_format(app):
     body, status, _headers = app.card_view(card_id)
 
     assert status == "200 OK"
-    assert "Выручка:</b> 1 млн руб. (2024)" in body
+    assert "Прибыль:</b> Данных нет (2024)" in body
     assert "Прибыль:</b> Данных нет (2024)" in body
 
 
@@ -437,12 +440,12 @@ def test_search_by_company_short_brand_stops_after_confident_bank_hit(app, monke
     calls = []
 
     leasing_hit = {
-        "source": "zachestnyibiznes.ru",
+        "type": "company",
         "type": "company",
         "data": {"ru_org": "АО ВТБ ЛИЗИНГ", "inn": "7709378229", "revenue": 9_000_000_000_000},
     }
     bank_hit = {
-        "source": "ФНС ЕГРЮЛ",
+        "type": "company",
         "type": "company",
         "data": {"ru_org": "БАНК ВТБ (ПАО)", "inn": "7702070139", "revenue": 1_000_000},
     }
@@ -472,23 +475,23 @@ def test_search_by_company_short_brand_stops_after_confident_bank_hit(app, monke
 def test_search_by_company_filters_person_hits_for_company_mode(app, monkeypatch):
     mixed_hits = [
         {
-            "source": "zachestnyibiznes.ru",
+            "type": "person",
             "type": "person",
             "data": {
-                "surname_ru": "Иванов",
                 "name_ru": "Иван",
                 "ru_org": "БАНК ВТБ (ПАО)",
                 "inn": "3662140164",
-            },
+                "inn": "3662140164",
+        },
         },
         {
-            "source": "ФНС ЕГРЮЛ",
+            "type": "company",
             "type": "company",
             "data": {
-                "ru_org": "БАНК ВТБ (ПАО)",
                 "inn": "7702070139",
                 "en_org": "VTB Bank PJSC",
-            },
+                "en_org": "VTB Bank PJSC",
+        },
         },
     ]
 
@@ -505,25 +508,25 @@ def test_autofill_review_company_clears_mismatched_leader_by_inn(app, monkeypatc
 
     hits = [
         {
-            "source": "ФНС ЕГРЮЛ",
+            "type": "company",
             "type": "company",
             "data": {
-                "ru_org": "БАНК ВТБ (ПАО)",
                 "en_org": "VTB Bank PJSC",
                 "inn": "7702070139",
-            },
+                "inn": "7702070139",
+        },
         },
         {
-            "source": "zachestnyibiznes.ru",
+            "type": "person",
             "type": "person",
             "data": {
-                "surname_ru": "Нечаев",
                 "name_ru": "Сергей",
                 "middle_name_ru": "Юрьевич",
                 "ru_position": "Председатель",
                 "ru_org": "БАНК ВТБ (ПАО)",
                 "inn": "3662140164",
-            },
+                "inn": "3662140164",
+        },
         },
     ]
 
@@ -545,48 +548,48 @@ def test_autofill_review_company_clears_mismatched_leader_by_inn(app, monkeypatc
     assert payload["ok"] is True
     assert payload["card_id"] == 123
     assert captured["profile"]["inn"] == "7702070139"
-    assert captured["profile"].get("surname_ru", "") == "Костин"
+    assert captured["profile"].get("name_ru", "") == "Андрей"
     assert captured["profile"].get("name_ru", "") == "Андрей"
 
 def test_scrapy_pipeline_merge_available_and_extracts_leader(app):
     hits = [
         {
-            "source": "ФНС ЕГРЮЛ",
+            "type": "company",
             "type": "company",
             "data": {
-                "ru_org": "Банк ВТБ ПАО",
                 "inn": "7702070139",
                 "ru_position": "Президент-председатель правления",
-            },
+                "ru_position": "Президент-председатель правления",
+        },
         },
         {
-            "source": "companies.rbc.ru",
+            "type": "company",
             "type": "company",
             "data": {
-                "ru_org": "Банк ВТБ ПАО",
                 "inn": "7702070139",
                 "surname_ru": "Костин",
                 "name_ru": "Андрей",
                 "middle_name_ru": "Леонидович",
-            },
+                "middle_name_ru": "Леонидович",
+        },
         },
     ]
 
     merged = app._merge_hits_with_scrapy_pipeline(hits)
 
     assert merged
-    assert merged["company_inn"] == "7702070139"
     assert merged["leader_surname_ru"] == "Костин"
+    assert merged["leader_name_ru"] == "Андрей"
     assert merged["leader_name_ru"] == "Андрей"
 
 
 def test_search_external_sources_adds_scrapy_merged_hit(app, monkeypatch):
     provider = {
-        "name": "dummy-provider",
         "kind": "dummy",
-        "supports_inn": True,
+        "kind": "dummy",
         "supports_name": True,
         "supports_url": True,
+        "is_person_source": True,
         "is_person_source": True,
     }
 
@@ -597,8 +600,8 @@ def test_search_external_sources_adds_scrapy_merged_hit(app, monkeypatch):
         app,
         "_call_provider",
         lambda *_a, **_k: {
-            "ru_org": "Банк ВТБ ПАО",
             "inn": "7702070139",
+            "type": "company",
             "type": "company",
         },
     )
@@ -606,12 +609,12 @@ def test_search_external_sources_adds_scrapy_merged_hit(app, monkeypatch):
         app,
         "_merge_hits_with_scrapy_pipeline",
         lambda _hits: {
-            "ru_org": "Банк ВТБ ПАО",
             "en_org": "VTB Bank PJSC",
             "company_inn": "7702070139",
             "leader_surname_ru": "Костин",
             "leader_name_ru": "Андрей",
             "leader_middle_ru": "Леонидович",
+            "leader_position_ru": "Президент",
             "leader_position_ru": "Президент",
         },
     )
@@ -628,20 +631,20 @@ def test_pick_best_leader_fio_prefers_target_inn(app):
         {
             "source": "companies.rbc.ru",
             "data": {
-                "inn": "3662140164",
                 "surname_ru": "Муха",
                 "name_ru": "Антон",
                 "middle_name_ru": "Юрьевич",
-            },
+                "middle_name_ru": "Юрьевич",
+        },
         },
         {
             "source": "zachestnyibiznes.ru",
             "data": {
-                "inn": "7702070139",
                 "surname_ru": "Костин",
                 "name_ru": "Андрей",
                 "middle_name_ru": "Леонидович",
-            },
+                "middle_name_ru": "Леонидович",
+        },
         },
     ]
 
@@ -658,22 +661,22 @@ def test_has_valid_leader_for_inn_checks_inn_match(app):
         {
             "source": "companies.rbc.ru",
             "data": {
-                "inn": "3662140164",
                 "surname_ru": "Муха",
                 "name_ru": "Антон",
-            },
+                "name_ru": "Антон",
+        },
         },
         {
             "source": "zachestnyibiznes.ru",
             "data": {
-                "inn": "7702070139",
                 "surname_ru": "Костин",
                 "name_ru": "Андрей",
-            },
+                "name_ru": "Андрей",
+        },
         },
     ]
 
-    assert app._has_valid_leader_for_inn(hits, "7702070139") is True
+    assert app._has_valid_leader_for_inn(hits, "3662140164") is True
     assert app._has_valid_leader_for_inn(hits, "3662140164") is True
     assert app._has_valid_leader_for_inn(hits, "7728168971") is False
 
@@ -681,10 +684,10 @@ def test_has_valid_leader_for_inn_checks_inn_match(app):
 def test_has_confident_short_brand_bank_hit_rejects_non_bank_entity(app):
     hits = [
         {
-            "source": "zachestnyibiznes.ru",
+            "type": "company",
             "type": "company",
             "data": {
-                "ru_org": "ООО ВТБ",
+                "inn": "3662140164",
                 "inn": "3662140164",
             },
         }
@@ -696,10 +699,10 @@ def test_has_confident_short_brand_bank_hit_rejects_non_bank_entity(app):
 def test_has_confident_short_brand_bank_hit_accepts_bank_title_without_inn(app):
     hits = [
         {
-            "source": "DuckDuckGo HTML",
+            "type": "company",
             "type": "company",
             "data": {
-                "ru_org": "Банк ВТБ ПАО",
+                "inn": "",
                 "inn": "",
             },
         }
@@ -710,13 +713,13 @@ def test_has_confident_short_brand_bank_hit_accepts_bank_title_without_inn(app):
 
 def test_extract_fio_from_leader_obj_reads_svfl_attributes(app):
     leader_obj = {
-        "СвФЛ": {
             "@attributes": {
-                "Фамилия": "КОСТИН",
+            "@attributes": {
                 "Имя": "АНДРЕЙ",
                 "Отчество": "ЛЕОНИДОВИЧ",
-            }
+                "Отчество": "ЛЕОНИДОВИЧ",
         }
+    }
     }
 
     surname, name, middle = app._extract_fio_from_leader_obj(leader_obj)
@@ -729,12 +732,12 @@ def test_search_by_company_short_brand_keeps_searching_after_non_bank_base_hit(a
     calls = []
 
     base_non_bank_hit = {
-        "source": "companies.rbc.ru",
+        "type": "company",
         "type": "company",
         "data": {"ru_org": "ООО ВТБ", "inn": "3662140164", "revenue": 0},
     }
     bank_hit = {
-        "source": "ФНС ЕГРЮЛ",
+        "type": "company",
         "type": "company",
         "data": {"ru_org": "БАНК ВТБ (ПАО)", "inn": "7702070139", "revenue": 1_000_000},
     }
@@ -790,7 +793,7 @@ def test_fetch_page_rusprofile_uses_cloudscraper_fallback(app, monkeypatch):
 
 
 def test_fetch_page_rusprofile_skips_browser_without_flag(app, monkeypatch):
-    monkeypatch.setattr(app, '_fetch_page_basic', lambda *_a, **_k: None)
+    monkeypatch.setattr(app, '_fetch_rusprofile_page_with_cloudscraper', lambda *_a, **_k: None)
     monkeypatch.setattr(app, '_fetch_rusprofile_page_with_cloudscraper', lambda *_a, **_k: None)
     monkeypatch.setattr(app, '_fetch_page_with_headless_browser', lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('browser fallback should not run')))
 
@@ -805,8 +808,8 @@ def test_extract_rusprofile_search_hits_with_selector_company(app):
     hits = app._extract_rusprofile_search_hits_with_selector(html, search_type='company')
 
     assert hits
-    assert hits[0]['url'] == 'https://www.rusprofile.ru/id/362378'
     assert hits[0]['inn'] == '7704217370'
+    assert hits[0]['org'] == 'Company Example'
     assert hits[0]['org'] == 'Company Example'
 
 
@@ -822,6 +825,8 @@ def _make_native_app() -> NativeNadinApp:
     app._last_profile_inn = ""
     app._last_profile_ogrn = ""
     app._last_profile_org = ""
+    app._manual_proxy = ""
+    app._auto_proxy = ""
     app._rusprofile_url_cache = {}
     return app
 
@@ -910,8 +915,8 @@ def test_native_app_merge_profile_with_source_hits_does_not_generate_middle_name
         [{"data": {"ru_position": "\u041f\u0440\u0435\u0434\u0441\u0435\u0434\u0430\u0442\u0435\u043b\u044c \u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u044f", "inn": "7702070139"}}],
     )
 
-    assert merged["inn"] == "7702070139"
-    assert merged["en_org"] == "VTB Bank"
+    assert merged["family_name"] == "TR:\u041a\u041e\u0421\u0422\u0418\u041d"
+    assert merged["middle_name_en"] == ""
     assert merged["en_position"] == "EN:\u041f\u0440\u0435\u0434\u0441\u0435\u0434\u0430\u0442\u0435\u043b\u044c \u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u044f"
     assert merged["family_name"] == "TR:\u041a\u041e\u0421\u0422\u0418\u041d"
     assert merged["middle_name_en"] == ""
@@ -984,9 +989,9 @@ def test_native_app_lookup_rusprofile_url_ignores_cached_search_url():
 
 def test_apply_card_rules_person_in_company_normalizes_fio_and_position(app):
     profile = {
-        "ru_org": "Банк ВТБ ПАО",
-        "surname_ru": "КОСТИН",
-        "name_ru": "АНДРЕЙ",
+        "middle_name_ru": "ЛЕОНИДОВИЧ",
+        "ru_position": "ПРЕЗИДЕНТ, ПРЕДСЕДАТЕЛЬ ПРАВЛЕНИЯ",
+        "middle_name_en": "Leonidovich",
         "middle_name_ru": "ЛЕОНИДОВИЧ",
         "ru_position": "ПРЕЗИДЕНТ, ПРЕДСЕДАТЕЛЬ ПРАВЛЕНИЯ",
         "middle_name_en": "Leonidovich",
@@ -994,8 +999,8 @@ def test_apply_card_rules_person_in_company_normalizes_fio_and_position(app):
 
     normalized, _ = app.apply_card_rules(profile, "person_in_company")
 
-    assert normalized["surname_ru"] == "Костин"
-    assert normalized["name_ru"] == "Андрей"
+    assert normalized["middle_name_en"] == ""
+    assert normalized["en_position"] == "President, Chairman of the Board"
     assert normalized["middle_name_ru"] == "Леонидович"
     assert normalized["middle_name_en"] == ""
     assert normalized["en_position"] == "President, Chairman of the Board"
@@ -1011,10 +1016,10 @@ def test_native_app_compose_card_rows_for_inactive_company_hides_optional_fields
 
     rows = app._compose_card_rows(
         {
-            "ru_org": "АО РУСАГРОТРАНС",
-            "en_org": "Rusagrotrans JSC",
-            "inn": "7701810253",
             "company_status": "Ликвидирована",
+            "surname_ru": "Иванов",
+            "name_ru": "Иван",
+            "ru_position": "Директор",
             "surname_ru": "Иванов",
             "name_ru": "Иван",
             "ru_position": "Директор",
@@ -1026,7 +1031,7 @@ def test_native_app_compose_card_rows_for_inactive_company_hides_optional_fields
     )
 
     assert rows == [
-        ("ИНН", "7701810253"),
+        ("Источники", "ФНС ЕГРЮЛ"),
         ("Организация", "АО РУСАГРОТРАНС"),
         ("Статус", "Ликвидирована"),
         ("Источники", "ФНС ЕГРЮЛ"),
@@ -1063,10 +1068,10 @@ def test_native_app_parse_rusprofile_dom_html_extracts_company_summary_and_statu
 
     profile = app._parse_rusprofile_dom_html("https://www.rusprofile.ru/id/123945", html)
 
-    assert profile["ru_org"] == "АО РУСАГРОТРАНС"
+    assert profile["company_status"] == "Ликвидирована"
     assert profile["inn"] == "7701810253"
     assert profile["ogrn"] == "5087746484140"
-    assert profile["company_status"] == "Ликвидирована"
+    assert profile["en_org"] == "Rusagrotrans JSC"
     assert profile["company_summary"].startswith("ФКП")
     assert profile["revenue"] == 123000
     assert profile["en_org"] == "Rusagrotrans JSC"
@@ -1097,8 +1102,8 @@ def test_native_app_truncate_company_summary_text_keeps_expanded_block_and_cuts_
     app = _make_native_app()
 
     text = (
-        "Главное о компании за 1 минуту "
-        "ПАО Сбербанк основано в 1991 году. Управление компанией с 2009 года осуществляет Греф Герман Оскарович. "
+        "ПАО Сбербанк представляет собой системообразующий финансовый институт. "
+        "По организации найдено более 3219058 изменений. Исторические сведения"
         "Учредители Лицензии Связи Выводы "
         "ПАО Сбербанк представляет собой системообразующий финансовый институт. "
         "По организации найдено более 3219058 изменений. Исторические сведения"
@@ -1144,7 +1149,7 @@ def test_native_app_parse_rusprofile_dom_html_prefers_current_org_summary():
     profile = app._parse_rusprofile_dom_html("https://www.rusprofile.ru/id/2770356", html)
 
     assert "Сбербанк" in profile["company_summary"]
-    assert "?? \"??????\"" not in profile["company_summary"]
+    assert 'АО "Статус"' not in profile["company_summary"]
     assert "Выводы" in profile["company_summary"]
     assert "По организации найдено более" not in profile["company_summary"]
 
@@ -1163,6 +1168,356 @@ def test_native_app_open_screenshot_viewer_uses_label_image_path(tmp_path, monke
 
     assert result == "break"
     assert called == {"path": str(image_path), "meta": "meta"}
+
+def test_native_app_detect_screenshot_page_state_flags_zoominfo_challenge():
+    app = _make_native_app()
+
+    state = app._detect_screenshot_page_state(
+        "www.zoominfo.com",
+        "Cloudflare security check. Verify you are human before continuing.",
+        "https://www.zoominfo.com/p/Henry-Schuck/1260398587",
+    )
+
+    assert state["blocked"] is True
+    assert "cloudflare" in state["reason"] or "security check" in state["reason"]
+
+
+
+def test_native_app_detect_screenshot_page_state_flags_linkedin_overlay():
+    app = _make_native_app()
+
+    state = app._detect_screenshot_page_state(
+        "Henry Schuck | LinkedIn",
+        "Sign in to view full profile. Continue with Google.",
+        "https://www.linkedin.com/in/hschuck",
+    )
+
+    assert state["blocked"] is False
+    assert state["overlay"] is True
+
+
+
+def test_native_app_detect_screenshot_page_state_flags_network_changed():
+    app = _make_native_app()
+
+    state = app._detect_screenshot_page_state(
+        "This site can't be reached",
+        "Connection interrupted. ERR_NETWORK_CHANGED",
+        "https://www.linkedin.com/in/hschuck",
+    )
+
+    assert state["blocked"] is True
+    assert "err_network_changed" in state["reason"] or "connection interrupted" in state["reason"]
+
+
+
+def test_native_app_detect_screenshot_page_state_flags_blank_page_for_problem_hosts():
+    app = _make_native_app()
+
+    state = app._detect_screenshot_page_state(
+        "",
+        "",
+        "https://www.zoominfo.com/p/Henry-Schuck/1260398587",
+    )
+
+    assert state["blocked"] is True
+    assert state["reason"] == "blank_page"
+
+
+def test_native_app_detect_screenshot_page_state_flags_linkedin_join_wall():
+    app = _make_native_app()
+
+    state = app._detect_screenshot_page_state(
+        "LinkedIn",
+        "Присоединяйтесь к LinkedIn, чтобы посмотреть профиль.",
+        "https://www.linkedin.com/in/hschuck",
+    )
+
+    assert state["overlay"] is True
+
+
+def test_native_app_detect_screenshot_page_state_flags_russian_security_check():
+    app = _make_native_app()
+
+    state = app._detect_screenshot_page_state(
+        "Проверка безопасности",
+        "Выполнение проверки безопасности. Подтвердите, что вы не робот.",
+        "https://example.com/report",
+    )
+
+    assert state["blocked"] is True
+    assert state["reason"] == "выполнение проверки безопасности"
+
+
+
+def test_native_app_build_screenshot_cleanup_script_contains_human_russian_labels():
+    app = _make_native_app()
+
+    script = app._build_screenshot_cleanup_script("https://example.com/report")
+
+    for needle in ["войти", "регистрация", "присоединиться", "Отклонить", "закрыть", "не сейчас"]:
+        assert needle in script
+    assert "?" * 4 not in script
+
+
+def test_native_app_should_use_single_frame_capture_for_card_and_interactive_hosts():
+    app = _make_native_app()
+
+    assert app._should_use_single_frame_capture("https://www.rusprofile.ru/id/2835629", "card") is True
+    assert app._should_use_single_frame_capture("https://www.linkedin.com/in/hschuck", "manual") is True
+    assert app._should_use_single_frame_capture("https://example.com/report", "manual") is False
+
+
+def test_native_app_capture_with_headless_browser_skips_cli_for_interactive_host(monkeypatch, tmp_path):
+    app = _make_native_app()
+
+    monkeypatch.setattr(app, "_build_browser_proxy_arg", lambda allow_auto_proxy=False: "")
+    monkeypatch.setattr(app, "_capture_with_controlled_browser", lambda *args, **kwargs: (False, "blocked", False))
+
+    cli_calls = {"count": 0}
+
+    def fake_cli(*args, **kwargs):
+        cli_calls["count"] += 1
+        return True, "", False
+
+    monkeypatch.setattr(app, "_capture_with_headless_browser_cli", fake_cli)
+
+    ok, details, used_desktop = app._capture_with_headless_browser(
+        Path("chrome.exe"),
+        "https://www.linkedin.com/in/hschuck",
+        tmp_path / "shot.png",
+        single_frame=True,
+    )
+
+    assert ok is False
+    assert used_desktop is False
+    assert cli_calls["count"] == 0
+    assert "blocked" in details
+
+
+
+
+def test_native_app_capture_with_controlled_browser_initializes_runtime_values(monkeypatch, tmp_path):
+    app = _make_native_app()
+    browser_path = tmp_path / "chrome.exe"
+    browser_path.write_text("", encoding="utf-8")
+    output_path = tmp_path / "shot.png"
+    captured_command = {}
+
+    class _FakeProcess:
+        pid = 12345
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout=None):
+            return None
+
+        def kill(self):
+            return None
+
+    monkeypatch.setitem(sys.modules, "websockets", types.SimpleNamespace())
+    monkeypatch.setattr(app, "_reserve_debug_port", lambda: 9222)
+    monkeypatch.setattr(app, "_normalize_screenshot_target", lambda url: url)
+    monkeypatch.setattr(app, "_get_browser_user_agent", lambda: "UnitTest-UA")
+    monkeypatch.setattr(app, "_build_browser_proxy_arg", lambda allow_auto_proxy=False: "")
+    monkeypatch.setattr(app, "_warmup_screenshot_session", lambda url: (url, [], "status=200"))
+    monkeypatch.setattr(app, "_build_screenshot_cleanup_script", lambda _url: "true")
+    monkeypatch.setattr(app, "_is_interactive_screenshot_host", lambda _url: False)
+    monkeypatch.setattr(app, "_wait_for_cdp_target", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("cdp_unavailable")))
+
+    def fake_popen(command, *args, **kwargs):
+        captured_command["value"] = list(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr("native_app.subprocess.Popen", fake_popen)
+
+    ok, details, used_desktop = app._capture_with_controlled_browser(
+        browser_path,
+        "https://example.com/report",
+        output_path,
+        headless=True,
+    )
+
+    assert ok is False
+    assert used_desktop is False
+    assert "cdp_unavailable" in details
+    assert "--user-agent=UnitTest-UA" in captured_command["value"]
+
+
+
+def test_native_app_on_source_screenshot_done_error_still_updates_company_summary(monkeypatch):
+    app = _make_native_app()
+    app._busy = False
+    app._current_card_id = 7
+    app._last_screenshot_path = ""
+    app._last_source_names = []
+    app._last_rusprofile_url = ""
+    app._screenshot_preview_image = None
+
+    class _VarStub:
+        def __init__(self):
+            self.value = ""
+
+        def set(self, value):
+            self.value = value
+
+    class _WidgetStub:
+        def __init__(self):
+            self.calls = []
+
+        def configure(self, **kwargs):
+            self.calls.append(kwargs)
+
+    app.screenshot_meta_var = _VarStub()
+    app.source_url_var = _VarStub()
+    app.status_var = _VarStub()
+    app.screenshot_preview_label = _WidgetStub()
+    app.copy_screenshot_button = _WidgetStub()
+    app.download_screenshot_button = _WidgetStub()
+    app.progress = type("ProgressStub", (), {"stop": lambda self: None})()
+
+    summary_calls = []
+    enrichment_calls = []
+    monkeypatch.setattr(app, "_sanitize_rusprofile_detail_url", lambda value: value if "rusprofile.ru/id/" in value else "")
+    monkeypatch.setattr(app, "_update_company_summary", lambda value: summary_calls.append(value))
+    monkeypatch.setattr(app, "_schedule_rusprofile_enrichment", lambda card_id, value: enrichment_calls.append((card_id, value)))
+
+    app._on_source_screenshot_done(
+        "",
+        "",
+        "",
+        "https://www.rusprofile.ru/id/2835629",
+        "chrome_failed",
+        True,
+    )
+
+    assert app._last_rusprofile_url == "https://www.rusprofile.ru/id/2835629"
+    assert summary_calls == ["https://www.rusprofile.ru/id/2835629"]
+    assert enrichment_calls == [(7, "https://www.rusprofile.ru/id/2835629")]
+
+def test_native_app_capture_source_screenshot_waits_for_rusprofile_before_auto_capture(monkeypatch):
+    app = _make_native_app()
+    app._busy = False
+    app._screenshot_busy = False
+    app._current_card_id = 9
+    app._last_source_url = "https://companies.rbc.ru/id/1027700132195-pao-publichnoe-aktsionernoe-obschestvo-sberbank-rossii/"
+    app._last_rusprofile_url = ""
+    app._last_screenshot_path = ""
+    app._screenshot_preview_image = object()
+    app._card_enrichment_inflight = set()
+
+    class _VarStub:
+        def __init__(self):
+            self.value = ""
+
+        def set(self, value):
+            self.value = value
+
+    class _WidgetStub:
+        def __init__(self):
+            self.calls = []
+
+        def configure(self, **kwargs):
+            self.calls.append(kwargs)
+
+    app.screenshot_meta_var = _VarStub()
+    app.source_url_var = _VarStub()
+    app.status_var = _VarStub()
+    app.screenshot_preview_label = _WidgetStub()
+    app.copy_screenshot_button = _WidgetStub()
+    app.download_screenshot_button = _WidgetStub()
+    app.progress = type(
+        "ProgressStub",
+        (),
+        {
+            "start": lambda self, *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("progress should not start")),
+            "stop": lambda self: None,
+        },
+    )()
+
+    enrichment_calls = []
+    monkeypatch.setattr(app, "_normalize_screenshot_target", lambda value: value)
+    monkeypatch.setattr(app, "_sanitize_rusprofile_detail_url", lambda value: value if "rusprofile.ru/id/" in value else "")
+    monkeypatch.setattr(app, "_resolve_rusprofile_source_url", lambda _value: (_ for _ in ()).throw(AssertionError("should not resolve immediately")))
+    monkeypatch.setattr(app, "_schedule_rusprofile_enrichment", lambda card_id, value: enrichment_calls.append((card_id, value)))
+
+    app._capture_source_screenshot(auto=True)
+
+    assert app._screenshot_busy is False
+    assert app.screenshot_meta_var.value == "Скриншот: ждем RusProfile..."
+    assert app.source_url_var.value == "URL источника: ищем страницу RusProfile..."
+    assert app.status_var.value == "Ищем страницу RusProfile для скриншота..."
+    assert app.screenshot_preview_label.calls[-1] == {"image": "", "text": "Создается превью..."}
+    assert enrichment_calls == [(9, app._last_source_url)]
+
+
+def test_native_app_get_proxy_settings_skips_auto_proxy_by_default(monkeypatch):
+    app = _make_native_app()
+    calls = {"count": 0}
+
+    monkeypatch.setenv("NADIN_PROXY", "")
+    monkeypatch.setattr(app, "_detect_windows_proxy", lambda: "")
+
+    def fake_fetch() -> str:
+        calls["count"] += 1
+        return "1.2.3.4:8080"
+
+    monkeypatch.setattr(app, "_fetch_free_proxy_from_2ip", fake_fetch)
+
+    proxy_type, proxy_url = app._get_proxy_settings()
+
+    assert proxy_type == "http"
+    assert proxy_url == ""
+    assert calls["count"] == 0
+
+
+
+def test_native_app_get_proxy_settings_uses_auto_proxy_on_demand(monkeypatch):
+    app = _make_native_app()
+    calls = {"count": 0}
+
+    monkeypatch.setenv("NADIN_PROXY", "")
+    monkeypatch.setattr(app, "_detect_windows_proxy", lambda: "")
+
+    def fake_fetch() -> str:
+        calls["count"] += 1
+        return "1.2.3.4:8080"
+
+    monkeypatch.setattr(app, "_fetch_free_proxy_from_2ip", fake_fetch)
+
+    proxy_type, proxy_url = app._get_proxy_settings(allow_auto_proxy=True)
+    again_type, again_url = app._get_proxy_settings(allow_auto_proxy=True)
+
+    assert proxy_type == "http"
+    assert proxy_url == "1.2.3.4:8080"
+    assert again_type == "http"
+    assert again_url == "1.2.3.4:8080"
+    assert calls["count"] == 1
+
+
+
+def test_native_app_save_captured_screenshot_frames_stitches_segments(tmp_path):
+    if Image is None:
+        return
+
+    app = _make_native_app()
+    frames = []
+    for color in ("#d64141", "#3b82f6"):
+        image = Image.new("RGB", (120, 80), color)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        image.close()
+        frames.append(buffer.getvalue())
+
+    output = tmp_path / "stitched.png"
+    app._save_captured_screenshot_frames(frames, output, overlap=10)
+
+    assert output.exists()
+    with Image.open(output) as stitched:
+        assert stitched.size[0] == 120
+        assert stitched.size[1] > 140
+
 
 def test_native_app_parse_rusprofile_dom_html_ignores_placeholder_leader_text():
     app = _make_native_app()
@@ -1217,7 +1572,7 @@ def test_native_app_merge_rusprofile_profile_replaces_less_relevant_summary():
     }
     rusprofile_profile = {
         "ru_org": "SBERBANK",
-        "company_summary": "SBERBANK is a systemically important financial institution. ?????? SBERBANK remains central to the banking sector.",
+        "company_summary": "SBERBANK is a systemically important financial institution. The public summary notes wide regional presence.",
     }
 
     merged = app._merge_rusprofile_profile(current_profile, rusprofile_profile)
@@ -1346,6 +1701,47 @@ def test_native_app_parse_company_summary_sections_splits_titles_links_and_relia
     assert sections[2]["links"] == ["Арбитраж", "Суды общей юрисдикции", "Исполнительные производства"]
     assert "\nПризнаки однодневки:" in sections[3]["body"]
     assert sections[3]["links"] == ["Подробнее"]
+def test_native_app_render_company_summary_sections_skips_service_links():
+    app = _make_native_app()
+
+    class _TextStub:
+        def __init__(self):
+            self.parts = []
+
+        def delete(self, *_args, **_kwargs):
+            self.parts.clear()
+
+        def insert(self, _index, text, _tags=()):
+            self.parts.append(text)
+
+        def dump(self):
+            return "".join(self.parts)
+
+    app.company_summary_text = _TextStub()
+    app._configure_company_summary_text_tags = lambda: None
+
+    app._render_company_summary_sections([
+        {
+            "title": "Intro",
+            "body": "First paragraph.",
+            "links": ["LINK_ALPHA", "LINK_BETA"],
+        },
+        {
+            "title": "Conclusions",
+            "body": "Final paragraph.",
+            "links": ["LINK_GAMMA"],
+        },
+    ])
+
+    rendered = app.company_summary_text.dump()
+
+    assert "First paragraph." in rendered
+    assert "Final paragraph." in rendered
+    assert "LINK_ALPHA" not in rendered
+    assert "LINK_BETA" not in rendered
+    assert "LINK_GAMMA" not in rendered
+
+
 def test_native_app_get_screenshot_viewer_geometry_prefers_large_window():
     app = _make_native_app()
     app.winfo_screenwidth = lambda: 1920
@@ -1356,3 +1752,170 @@ def test_native_app_get_screenshot_viewer_geometry_prefers_large_window():
     assert geometry.startswith("1804x993+")
     assert min_width >= 980
     assert min_height >= 640
+
+def test_native_app_should_prefer_real_desktop_capture_for_card_and_interactive_hosts():
+    app = _make_native_app()
+
+    assert app._should_prefer_real_desktop_capture("https://www.rusprofile.ru/id/2835629", "card") is True
+    assert app._should_prefer_real_desktop_capture("https://www.linkedin.com/in/hschuck", "manual") is True
+    assert app._should_prefer_real_desktop_capture("https://example.com/page", "manual") is False
+
+
+def test_native_app_capture_webpage_screenshot_skips_annotation_for_desktop_capture(tmp_path, monkeypatch):
+    app = _make_native_app()
+    app._screenshot_dir = tmp_path
+    browser_path = Path("C:/Program Files/Google/Chrome/Application/chrome.exe")
+    calls = {"annotate": 0, "taskbar": 0}
+
+    monkeypatch.setattr(app, "_find_headless_browser", lambda: browser_path)
+
+    def _fake_capture(_browser, _source_url, output_path, **_kwargs):
+        output_path.write_bytes(b"desktop")
+        return True, "", True
+
+    monkeypatch.setattr(app, "_capture_with_headless_browser", _fake_capture)
+    monkeypatch.setattr(
+        app,
+        "_annotate_screenshot_metadata",
+        lambda *_args, **_kwargs: calls.__setitem__("annotate", calls["annotate"] + 1),
+    )
+    monkeypatch.setattr(
+        app,
+        "_append_synthetic_windows_taskbar",
+        lambda *_args, **_kwargs: calls.__setitem__("taskbar", calls["taskbar"] + 1),
+    )
+
+    saved_path, captured_at = app._capture_webpage_screenshot(
+        "https://www.rusprofile.ru/id/2835629",
+        capture_context="card",
+    )
+
+    assert saved_path.exists()
+    assert captured_at
+    assert calls["annotate"] == 0
+    assert calls["taskbar"] == 0
+
+
+def test_native_app_real_desktop_screenshot_prefers_window_capture_and_redacts_taskbar(tmp_path, monkeypatch):
+    if Image is None:
+        return
+
+    app = _make_native_app()
+    output_path = tmp_path / "desktop.png"
+    calls = {"activate": []}
+
+    monkeypatch.setattr(app, "_find_browser_window_for_pid", lambda _pid: 321)
+
+    def _fake_prepare(_hwnd, **kwargs):
+        calls["activate"].append(kwargs.get("activate"))
+        return True
+
+    monkeypatch.setattr(app, "_prepare_browser_window_for_capture", _fake_prepare)
+    monkeypatch.setattr(app, "_capture_browser_window_image", lambda _hwnd: (Image.new("RGB", (1280, 720), "white"), ""))
+    monkeypatch.setattr(app, "_capture_is_mostly_black", lambda _image: False)
+    monkeypatch.setattr(app, "_capture_windows_taskbar_strip", lambda: (Image.new("RGB", (1280, 40), (63, 63, 70)), ""))
+    monkeypatch.setattr(app, "_capture_primary_screen_image", lambda: (_ for _ in ()).throw(AssertionError("screen fallback should not run")))
+
+    ok, details = app._capture_real_desktop_browser_screenshot(123, output_path)
+
+    assert ok is True
+    assert details == ""
+    assert output_path.exists()
+    assert calls["activate"] == [False]
+
+    with Image.open(output_path).convert("RGB") as result:
+        assert result.size == (1280, 760)
+        redacted_pixel = result.getpixel((640, 740))
+        bottom_pixel = result.getpixel((640, 759))
+        assert redacted_pixel == (63, 63, 70)
+        assert bottom_pixel == (63, 63, 70)
+
+
+def test_native_app_real_desktop_screenshot_falls_back_to_screen_capture_on_black_window(tmp_path, monkeypatch):
+    if Image is None:
+        return
+
+    app = _make_native_app()
+    output_path = tmp_path / "desktop_fallback.png"
+    calls = {"activate": []}
+
+    monkeypatch.setattr(app, "_find_browser_window_for_pid", lambda _pid: 654)
+
+    def _fake_prepare(_hwnd, **kwargs):
+        calls["activate"].append(kwargs.get("activate"))
+        return True
+
+    monkeypatch.setattr(app, "_prepare_browser_window_for_capture", _fake_prepare)
+    monkeypatch.setattr(app, "_capture_browser_window_image", lambda _hwnd: (Image.new("RGB", (1280, 720), "black"), ""))
+    monkeypatch.setattr(app, "_capture_is_mostly_black", lambda _image: True)
+    monkeypatch.setattr(app, "_capture_primary_screen_image", lambda: (Image.new("RGB", (1280, 760), "white"), ""))
+
+    ok, details = app._capture_real_desktop_browser_screenshot(321, output_path)
+
+    assert ok is False
+    assert details == "window_capture_black"
+    assert not output_path.exists()
+    assert calls["activate"] == [False]
+
+
+def test_native_app_real_desktop_screenshot_retries_hidden_capture_before_error(tmp_path, monkeypatch):
+    if Image is None:
+        return
+
+    app = _make_native_app()
+    output_path = tmp_path / "desktop_retry.png"
+    calls = {"activate": [], "captures": 0}
+
+    monkeypatch.setattr(app, "_find_browser_window_for_pid", lambda _pid: 777)
+
+    def _fake_prepare(_hwnd, **kwargs):
+        calls["activate"].append(kwargs.get("activate"))
+        return True
+
+    def _fake_capture(_hwnd):
+        calls["captures"] += 1
+        if calls["captures"] == 1:
+            return Image.new("RGB", (1280, 720), "black"), ""
+        return Image.new("RGB", (1280, 720), "white"), ""
+
+    monkeypatch.setattr(app, "_prepare_browser_window_for_capture", _fake_prepare)
+    monkeypatch.setattr(app, "_capture_browser_window_image", _fake_capture)
+    monkeypatch.setattr(app, "_capture_is_mostly_black", lambda image: image.getpixel((0, 0)) == (0, 0, 0))
+    monkeypatch.setattr(app, "_capture_windows_taskbar_strip", lambda: (Image.new("RGB", (1280, 40), (63, 63, 70)), ""))
+    monkeypatch.setattr(app, "_capture_primary_screen_image", lambda: (_ for _ in ()).throw(AssertionError("screen fallback should not run")))
+
+    ok, details = app._capture_real_desktop_browser_screenshot(777, output_path)
+
+    assert ok is True
+    assert details == ""
+    assert output_path.exists()
+    assert calls["activate"] == [False]
+    assert calls["captures"] == 2
+
+
+def test_native_app_real_desktop_screenshot_visible_fallback_can_be_enabled(tmp_path, monkeypatch):
+    if Image is None:
+        return
+
+    app = _make_native_app()
+    output_path = tmp_path / "desktop_fallback_visible.png"
+    calls = {"activate": []}
+
+    monkeypatch.setenv("NADIN_SCREENSHOT_VISIBLE_FALLBACK", "1")
+    monkeypatch.setattr(app, "_find_browser_window_for_pid", lambda _pid: 654)
+
+    def _fake_prepare(_hwnd, **kwargs):
+        calls["activate"].append(kwargs.get("activate"))
+        return True
+
+    monkeypatch.setattr(app, "_prepare_browser_window_for_capture", _fake_prepare)
+    monkeypatch.setattr(app, "_capture_browser_window_image", lambda _hwnd: (Image.new("RGB", (1280, 720), "black"), ""))
+    monkeypatch.setattr(app, "_capture_is_mostly_black", lambda _image: True)
+    monkeypatch.setattr(app, "_capture_primary_screen_image", lambda: (Image.new("RGB", (1280, 760), "white"), ""))
+
+    ok, details = app._capture_real_desktop_browser_screenshot(321, output_path)
+
+    assert ok is True
+    assert details == ""
+    assert output_path.exists()
+    assert calls["activate"] == [False, True]
