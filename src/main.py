@@ -2799,12 +2799,14 @@ class CompanyWebApp:
 
 
     def _strip_punct(self, text: str, russian: bool = False) -> str:
-
-
-        allowed = "A-Za-z0-9А-Яа-яЁё -" if russian else "A-Za-z0-9 -"
-
-
-        return re.sub(rf"[^{allowed}]", "", text)
+        if russian:
+            # Keep letters/digits from Unicode scripts plus plain separators.
+            return "".join(ch for ch in text if ch.isalnum() or ch in {" ", "-"})
+        return "".join(
+            ch
+            for ch in text
+            if ch.isdigit() or ("A" <= ch <= "Z") or ("a" <= ch <= "z") or ch in {" ", "-"}
+        )
 
 
 
